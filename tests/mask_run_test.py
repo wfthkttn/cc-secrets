@@ -3,8 +3,11 @@
 Usage: python3 -I tests/mask_run_test.py
 """
 import http.client
+import importlib.machinery
+import importlib.util
 import json
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -12,8 +15,24 @@ import sys
 import tempfile
 import time
 
-BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'bin')
+TESTS = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.join(TESTS, '..', 'bin')
 failures = []
+
+
+def load_mask_run():
+    loader = importlib.machinery.SourceFileLoader('mask_run', os.path.join(BIN, 'mask-run'))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader('mask_run', loader))
+    loader.exec_module(module)
+    return module
+
+
+def shared_cases():
+    """The cases in mask-cases.ts, which the hooks' tests run too: JSON after `export default`."""
+    with open(os.path.join(TESTS, 'mask-cases.ts'), encoding='utf-8') as f:
+        source = f.read()
+    start = '\nexport default'
+    return json.loads(source[source.index(start) + len(start):])
 
 
 def check(name, got, want):
@@ -47,6 +66,13 @@ def mask_run(sock_path, command, env_extra=None):
 
 
 def main():
+    module = load_mask_run()
+    for case in shared_cases():
+        masker = module.Masker(case['min'])
+        for value in case['values']:
+            masker.add(value)
+        check(f'shared case {case["input"]!r}', masker.mask(case['input'].encode()).decode(), case['output'])
+
     runtime = os.environ.get('XDG_RUNTIME_DIR', '/tmp')
     with tempfile.TemporaryDirectory(dir=runtime, prefix='mr-') as tmp:
         sock_path = os.path.join(tmp, 'r.sock')
@@ -79,6 +105,19 @@ def main():
             run = mask_run(sock_path, 'printf "hunt"')
             out, _ = run.communicate(timeout=10)
             check('a held-back tail comes out at the end', out, b'hunt')
+
+            run = mask_run(sock_path, 'printf "auth: %s\\n" "$(printf "alex:%s" hunter2 | base64)"')
+            out, _ = run.communicate(timeout=10)
+            check('an encoded form is masked', out, b'auth: [secret]\n')
+
+            run = mask_run(sock_path, 'printf "pw=hunter2;rest more\\n"')
+            out, _ = run.communicate(timeout=10)
+            check('the whole token around a value is masked', out, b'[secret] more\n')
+
+            run = mask_run(sock_path, 'printf "Enter: "; sleep 2; echo done')
+            ready, _, _ = select.select([run.stdout], [], [], 1)
+            check('a prompt without a newline comes out while the command waits', os.read(run.stdout.fileno(), 100) if ready else b'', b'Enter: ')
+            run.communicate(timeout=10)
 
             run = mask_run(sock_path, 'printf "\\x00\\xffbinary"')
             out, _ = run.communicate(timeout=10)

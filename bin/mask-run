@@ -3,43 +3,123 @@
 
 Runs the invocation with /bin/sh -c, or through $SECRETS_ORIG_PREFIX when set,
 copying its stdout and stderr with every value the relay at $SECRETS_RELAY
-knows replaced by [secret], skipping values shorter than $SECRETS_MASK_MIN
-characters. Exits with the command's status. Without a relay the command
+knows, in any of its encoded forms, masked: the whitespace-delimited token
+holding it becomes [secret]. Values shorter than $SECRETS_MASK_MIN characters
+are skipped. Exits with the command's status. Without a relay the command
 still runs; one line on stderr says its output is unmasked.
 """
+import base64
 import json
 import os
+import re
 import select
 import signal
 import socket
 import subprocess
 import sys
+from urllib.parse import quote, quote_plus
 
 MASK = b'[secret]'
+WHITESPACE = b' \t\n\r\f\v'
+IDLE_SECONDS = 0.05
+MAX_HOLD = 65536
+PERCENT = re.compile(r'%[0-9A-F]{2}')
 
 
-def watch(path):
-    """A socket streaming the relay's values, or None."""
-    if not path:
-        return None
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(path)
-        sock.sendall(b'GET /watch HTTP/1.0\r\n\r\n')
-    except OSError:
-        return None
-    sock.setblocking(False)
-    return sock
+def forms(value):
+    """The ways `value` turns up in output: raw, escaped, percent-, hex- and base64-encoded."""
+    raw = value.encode('utf-8')
+    texts = [
+        json.dumps(value)[1:-1],
+        json.dumps(value, ensure_ascii=False)[1:-1],
+        value.replace("'", "'\\''"),
+        value.replace("'", "'\"'\"'"),
+    ]
+    for encoded in (quote(value, safe=''), quote(value, safe="!~*'()"), quote_plus(value, safe='')):
+        texts += [encoded, PERCENT.sub(lambda m: m.group().lower(), encoded)]
+    found = {raw, raw.hex().encode(), raw.hex().upper().encode()}
+    found.update(text.encode('utf-8') for text in texts)
+    for encode in (base64.b64encode, base64.urlsafe_b64encode):
+        for offset in range(3):
+            # The characters fully determined by the value's bits, wherever it sits in the encoded run.
+            encoded = encode(b'\0' * offset + raw + b'\0\0\0')
+            found.add(encoded[-(-8 * offset // 6):(8 * (offset + len(raw))) // 6])
+    found.discard(b'')
+    return found
+
+
+class Masker:
+    def __init__(self, min_length):
+        self.min_length = min_length
+        self.patterns = set()
+
+    def add(self, value):
+        if len(value) >= self.min_length:
+            self.patterns |= forms(value)
+
+    def spans(self, data):
+        """Each token holding a form, as merged (start, end) ranges."""
+        found = []
+        for pattern in self.patterns:
+            at = data.find(pattern)
+            while at >= 0:
+                start, end = at, at + len(pattern)
+                while start > 0 and data[start - 1] not in WHITESPACE:
+                    start -= 1
+                while end < len(data) and data[end] not in WHITESPACE:
+                    end += 1
+                found.append((start, end))
+                at = data.find(pattern, at + 1)
+        merged = []
+        for start, end in sorted(found):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def mask(self, data):
+        out, at = [], 0
+        for start, end in self.spans(data):
+            out += [data[at:start], MASK]
+            at = end
+        out.append(data[at:])
+        return b''.join(out)
+
+    def partial(self, data):
+        """How many trailing bytes could still grow into a form."""
+        longest = 0
+        for pattern in self.patterns:
+            for size in range(min(len(pattern) - 1, len(data)), longest, -1):
+                if pattern.startswith(data[-size:]):
+                    longest = size
+                    break
+        return longest
+
+    def cut(self, data, idle):
+        """How much of `data` can be masked and written now: the rest may still grow into a token holding a form."""
+        if idle:
+            cut = len(data) - self.partial(data)
+        else:
+            last = max(data.rfind(bytes([c])) for c in WHITESPACE)
+            cut = min(last + 1, len(data) - self.partial(data))
+            if len(data) - cut > MAX_HOLD:
+                cut = len(data) - max((len(p) for p in self.patterns), default=0)
+        for start, end in self.spans(data):
+            if start < cut < end:
+                cut = start
+        return cut
 
 
 class Refused(Exception):
     pass
 
 
-class Values:
-    def __init__(self, min_length):
-        self.min_length = min_length
-        self.values = []
+class Watch:
+    """The relay's GET /watch stream: an HTTP head, then one JSON string per line."""
+
+    def __init__(self, masker):
+        self.masker = masker
         self.raw = b''
         self.in_body = False
 
@@ -56,25 +136,21 @@ class Values:
             self.in_body = True
         *lines, self.raw = self.raw.split(b'\n')
         for line in lines:
-            text = json.loads(line)
-            value = text.encode('utf-8')
-            if len(text) >= self.min_length and value not in self.values:
-                self.values.append(value)
+            self.masker.add(json.loads(line))
 
-    def mask(self, data):
-        for value in self.values:
-            data = data.replace(value, MASK)
-        return data
 
-    def held_back(self, data):
-        """How many trailing bytes could still become a value with more data."""
-        longest = 0
-        for value in self.values:
-            for size in range(min(len(value) - 1, len(data)), longest, -1):
-                if value.startswith(data[-size:]):
-                    longest = size
-                    break
-        return longest
+def connect(path):
+    """A socket streaming the relay's values, or None."""
+    if not path:
+        return None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        sock.sendall(b'GET /watch HTTP/1.0\r\n\r\n')
+    except OSError:
+        return None
+    sock.setblocking(False)
+    return sock
 
 
 def write_all(fd, data):
@@ -82,7 +158,7 @@ def write_all(fd, data):
         data = data[os.write(fd, data):]
 
 
-def drain(sock, values):
+def drain(sock, watch):
     while True:
         try:
             data = sock.recv(65536)
@@ -93,7 +169,7 @@ def drain(sock, values):
         if data == b'':
             return None
         try:
-            values.feed(data)
+            watch.feed(data)
         except Refused as refused:
             sys.stderr.write(f'mask-run: the secrets relay refused this process ({refused}); this output is not masked\n')
             sys.stderr.flush()
@@ -107,7 +183,7 @@ def main():
     prefix = os.environ.get('SECRETS_ORIG_PREFIX')
     argv = [prefix, invocation] if prefix else ['/bin/sh', '-c', invocation]
 
-    sock = watch(os.environ.get('SECRETS_RELAY'))
+    sock = connect(os.environ.get('SECRETS_RELAY'))
     if sock is None:
         sys.stderr.write('mask-run: no secrets relay; this output is not masked\n')
         sys.stderr.flush()
@@ -124,29 +200,45 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
 
-    values = Values(min_length)
-    pending = {child.stdout.fileno(): (b'', 1), child.stderr.fileno(): (b'', 2)}
-    while pending:
+    masker = Masker(min_length)
+    watch = Watch(masker)
+    held = {child.stdout.fileno(): b'', child.stderr.fileno(): b''}
+    sinks = {child.stdout.fileno(): 1, child.stderr.fileno(): 2}
+    # Held bytes an idle flush already kept back: only more output can change them.
+    settled = set()
+
+    def flush(fd, data, idle):
+        cut = masker.cut(data, idle)
+        write_all(sinks[fd], masker.mask(data[:cut]))
+        held[fd] = data[cut:]
+        if idle:
+            settled.add(fd)
+        else:
+            settled.discard(fd)
+
+    while held:
         watched = [sock] if sock is not None else []
-        readable, _, _ = select.select(list(pending) + watched, [], [])
+        waiting = any(data and fd not in settled for fd, data in held.items())
+        readable, _, _ = select.select(list(held) + watched, [], [], IDLE_SECONDS if waiting else None)
         if sock is not None:
-            sock = drain(sock, values)
+            sock = drain(sock, watch)
+        if not readable:
+            for fd, data in list(held.items()):
+                if data and fd not in settled:
+                    flush(fd, data, idle=True)
+            continue
         for fd in readable:
-            if fd not in pending:
+            if fd not in held:
                 continue
-            buffered, out = pending[fd]
             data = os.read(fd, 65536)
             if data == b'':
-                write_all(out, values.mask(buffered))
-                del pending[fd]
+                write_all(sinks[fd], masker.mask(held.pop(fd)))
                 continue
-            text = values.mask(buffered + data)
-            keep = values.held_back(text)
-            write_all(out, text[:len(text) - keep])
-            pending[fd] = (text[len(text) - keep:], out)
+            flush(fd, held[fd] + data, idle=False)
 
     status = child.wait()
     sys.exit(128 - status if status < 0 else status)
 
 
-main()
+if __name__ == '__main__':
+    main()

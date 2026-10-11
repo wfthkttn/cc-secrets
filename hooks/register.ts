@@ -1,7 +1,7 @@
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from 'sidebar'
 
-import { maskStrings, remember } from './mask'
+import { holdsMask, masksValues, maskStrings, remember } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
 import type { RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
@@ -18,6 +18,7 @@ const POPOUT_MS = 15000
 const NOTICE_MS = 10000
 const RELAY_START_MS = 5000
 const UNSEEN_PASTE = 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
+const WRITE_BACK = 'secrets: this would write [secret], a masked value, over the real one; edit around the masked span instead.'
 const ROW_COMPONENTS = [
   'UserMessage',
   'AssistantMessage',
@@ -132,6 +133,9 @@ export function register(on: On, options: PluginOptions) {
   })
 
   on('tool.call', async ($, e, next) => {
+    const written =
+      e.tool === 'Write' ? e.content : e.tool === 'Edit' ? e.new_string : e.tool === 'NotebookEdit' ? e.new_source : e.tool === 'Bash' ? e.command : null
+    if (written !== null && masksValues() && holdsMask(written)) return { deny: WRITE_BACK }
     if (e.tool !== 'Bash') return maskStrings(await next(e))
     running.push({ id: e.tool_use_id, command: e.command })
     try {
@@ -139,7 +143,7 @@ export function register(on: On, options: PluginOptions) {
     } finally {
       running.splice(running.findIndex(r => r.id === e.tool_use_id), 1)
     }
-  })
+  }).catch(() => ({ deny: 'secrets: masking this tool call failed, so its result is withheld' }))
 
   on('ui.message', async ($, e, next) => {
     if (e.element !== LIST_KEY && e.element !== POPOUT_KEY) return next(e)

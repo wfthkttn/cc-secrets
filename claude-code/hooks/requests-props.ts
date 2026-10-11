@@ -1,5 +1,9 @@
+import type { Tabs } from './tabs'
+
 export type RequestEntry = {
   id: string
+  /** `secret` and `unlock` take a typed value; `grant` asks whether a command gets a vault entry. */
+  kind: 'secret' | 'unlock' | 'grant'
   prompt: string
   /** The command the request came from, as far as the hooks could tell. */
   source: string
@@ -12,10 +16,12 @@ export type RequestEntry = {
 /** One change to a request's value, numbered per list instance. */
 export type Edit =
   | { seq: number; id: string; kind: 'append'; text: string }
-  | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' }
+  | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' | 'session' | 'once' }
 
 export type RequestsProps = {
   entries: RequestEntry[]
+  /** The drawer's tab row above the cards; null in the pop-out. */
+  tabs: Tabs | null
   /** A change drops the list's focused look. */
   focusEpoch: number
   /** The last edit number the hooks applied, per list instance. */
@@ -39,4 +45,6 @@ export type RequestsMessage = {
   edits: Edit[]
   /** The message's ✕ was clicked. */
   dismiss?: true
+  /** The Vault tab was clicked. */
+  tab?: 'vault'
 }

@@ -79,12 +79,23 @@ export class Masker {
 
 const masker = new Masker()
 let isRemembering = false
+/** Each remembered value's forms, under the name the user knows it by. */
+const tripwires = new Map<string, string[]>()
 
 /** A value shorter than `minLength` characters is left unmasked: it would turn up in ordinary text. */
-export function remember(value: string, minLength: number) {
+export function remember(value: string, minLength: number, label: string) {
   if ([...value].length < minLength) return
   masker.add(value)
   isRemembering = true
+  if (!tripwires.has(label)) tripwires.set(label, [])
+  const known = tripwires.get(label)!
+  for (const form of forms(value)) if (!known.includes(form)) known.push(form)
+}
+
+/** The label of a remembered value `text` carries in any of its forms, or null. */
+export function carried(text: string): string | null {
+  for (const [label, found] of tripwires) if (found.some(form => text.includes(form))) return label
+  return null
 }
 
 export function mask(text: string): string {
@@ -98,6 +109,12 @@ export function masksValues(): boolean {
 
 export function holdsMask(text: string): boolean {
   return text.includes(MASK)
+}
+
+export function stringsIn(value: unknown): string[] {
+  if (typeof value === 'string') return [value]
+  if (value === null || typeof value !== 'object') return []
+  return Object.values(value).flatMap(stringsIn)
 }
 
 /** Every string inside `value` masked, the shape kept. */

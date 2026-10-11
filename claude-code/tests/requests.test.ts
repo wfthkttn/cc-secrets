@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
-import { confirm, type Frame, geometry, initialState, type ListState, layout, listHeight, onClick, onKey, shownLength, view } from '../hooks/requests'
+import { confirm, type Frame, geometry, grantButtons, initialState, type ListState, layout, listHeight, onClick, onKey, shownLength, view } from '../hooks/requests'
 import type { RequestEntry } from '../hooks/requests-props'
 
-const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, prompt, source: 'echo', since: '04:00:00', length })
+const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length })
 const ENTRIES = [entry('a', '[sudo] password for alex'), entry('b', 'test token')]
 const START = initialState(0, 'i1')
 const FRAME: Frame = { columns: 60, rows: 100, message: null }
@@ -167,4 +167,22 @@ test('a message stays on top while the cards under it scroll', async () => {
   expect(rows.length).toBe(17)
   expect(rows.slice(0, 6).map(r => r.kind)).toEqual(['msgTop', 'msg', 'msg', 'msg', 'msgBottom', 'more'])
   expect(rows.at(-2)).toEqual({ id: 'e', kind: 'cardBottom' })
+})
+
+test('a grant card answers by its buttons and Enter gives once; typing does nothing to it', async () => {
+  const entries: RequestEntry[] = [{ ...entry('g', 'Prod DB · db'), kind: 'grant' }]
+  const rows = layout(entries, 60, null)
+  expect(rows.map(r => r.kind)).toEqual(['cardTop', 'what', 'from', 'grantTop', 'grant', 'grantBottom', 'cardBottom'])
+  const at = rows.findIndex(r => r.kind === 'grant')
+  const kinds = grantButtons(60).map(b => onClick(START, entries, FRAME, at, b.start + 1).post?.edits[0]?.kind)
+  expect(kinds).toEqual(['session', 'once', 'cancel'])
+  expect(onClick(START, entries, FRAME, at - 1, grantButtons(60)[0]!.start).post?.edits).toEqual([{ seq: 1, id: 'g', kind: 'session' }])
+  expect(onClick(START, entries, FRAME, at, grantButtons(60)[0]!.start - 2).post?.edits).toEqual([])
+  expect(onKey(START, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'g', kind: 'once' }])
+  expect(onKey(START, entries, FRAME, { key: 'x' }).post).toBe(undefined)
+})
+
+test('a card with no source command has no source row', async () => {
+  const entries: RequestEntry[] = [{ ...entry('u', 'Vault passphrase'), kind: 'unlock', source: '' }]
+  expect(layout(entries, 60, null).map(r => r.kind)).toEqual(['cardTop', 'what', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
 })

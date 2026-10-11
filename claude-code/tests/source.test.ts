@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { sourceOf } from '../hooks/source'
+import { sourceOf, vaultDecision } from '../hooks/source'
 
 const WRAPPER = (command: string, quote = `'"'"'`) =>
   `/run/current-system/sw/bin/zsh -c source /home/alex/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval '${command.split("'").join(quote)}' < /dev/null && pwd -P >| /tmp/claude-cwd`
@@ -33,4 +33,16 @@ test('a background call, no longer running: the command out of the Bash wrapper'
 
 test('no running call matches: the asking process\'s parent command line', async () => {
   expect(sourceOf('ssh host1', ['ls'])).toBe('ssh host1')
+})
+
+test("a subagent's vault get is refused; a main-loop one gets a session entry; anything else asks the person", async () => {
+  const command = 'psql "$($SECRETS_VAULT get db)"'
+  const allowed = { cmdline: WRAPPER(command), allowed: true, use: 'session' as const }
+  expect(vaultDecision(allowed, [{ command, agentId: 'a-1' }])).toBe('refuse')
+  expect(vaultDecision({ ...allowed, allowed: false }, [{ command, agentId: 'a-1' }])).toBe('refuse')
+  expect(vaultDecision(allowed, [{ command, agentId: undefined }])).toBe('give')
+  expect(vaultDecision({ ...allowed, use: 'each' }, [{ command, agentId: undefined }])).toBe('ask')
+  expect(vaultDecision({ ...allowed, allowed: false }, [{ command, agentId: undefined }])).toBe('ask')
+  expect(vaultDecision(allowed, [])).toBe('ask')
+  expect(vaultDecision({ ...allowed, cmdline: '' }, [{ command, agentId: undefined }])).toBe('ask')
 })

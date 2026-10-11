@@ -37,22 +37,40 @@ function draw(props: RequestsProps) {
 
 test('every row is exactly as wide as the list, before the surface has laid out too', async () => {
   const rows = draw({
-    focusEpoch: 0,
+    focusEpoch: 0, tabs: null,
     applied: {},
     columns: 60,
     rows: 40,
     message: 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.',
     entries: [
-      { id: 'a', prompt: '[sudo] password for alex', source: 'sudo -A systemctl restart foo', since: '04:00:00', length: 0 },
-      { id: 'b', prompt: 'token B', source: 'echo "B=$($ASK_SECRET \'token B\')" && ' + 'x'.repeat(90), since: '04:00:05', length: 5 },
+      { id: 'a', kind: 'secret', prompt: '[sudo] password for alex', source: 'sudo -A systemctl restart foo', since: '04:00:00', length: 0 },
+      { id: 'b', kind: 'secret', prompt: 'token B', source: 'echo "B=$($ASK_SECRET \'token B\')" && ' + 'x'.repeat(90), since: '04:00:05', length: 5 },
     ],
   })
   for (const row of rows) expect([...row].length).toBe(60)
 })
 
+test('a grant card draws its three buttons and an unlock card its passphrase field, each row as wide as the list', async () => {
+  const rows = draw({
+    focusEpoch: 0, tabs: null,
+    applied: {},
+    columns: 60,
+    rows: 40,
+    message: null,
+    entries: [
+      { id: 'g', kind: 'grant', prompt: 'Prod DB · db', source: 'psql "$($SECRETS_VAULT get db)"', since: '04:00:00', length: 0 },
+      { id: 'u', kind: 'unlock', prompt: 'Vault passphrase', source: '', since: '04:00:01', length: 0 },
+    ],
+  })
+  for (const row of rows) expect([...row].length).toBe(60)
+  expect(rows.some(r => r.includes('│ Session │ │ Once │ │ ✕ │'))).toBe(true)
+  expect(rows.some(r => r.includes('passphrase'))).toBe(true)
+  expect(rows.length).toBe(7 + 1 + 6)
+})
+
 test('an overflowing list draws exactly its rows, the markers included', async () => {
-  const entries = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, prompt: 'token ' + id, source: 'echo', since: '04:00:00', length: 0 }))
-  const rows = draw({ focusEpoch: 0, applied: {}, message: null, columns: 60, rows: 17, entries })
+  const entries = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, kind: 'secret' as const, prompt: 'token ' + id, source: 'echo', since: '04:00:00', length: 0 }))
+  const rows = draw({ focusEpoch: 0, tabs: null, applied: {}, message: null, columns: 60, rows: 17, entries })
   expect(rows.length).toBe(17)
   expect(rows[16]!.trim()).toBe('▼ 3 more')
   for (const row of rows) expect([...row].length).toBe(60)

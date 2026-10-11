@@ -1,6 +1,7 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
 import type { Edit, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
+import { drawTabs, TAB_ROWS, tabAt } from './tabs'
 
 export type ListState = {
   /** Tells this instance's edits apart from another's, the pop-out's and the list's. */
@@ -17,7 +18,7 @@ export type ListState = {
 
 /** One screen row of the list: a message row, a request card's row, a gap, or the empty note. */
 type Row =
-  | { id: string; kind: 'cardTop' | 'cardBottom' | 'fieldTop' | 'field' | 'fieldBottom' }
+  | { id: string; kind: 'cardTop' | 'cardBottom' | 'fieldTop' | 'field' | 'fieldBottom' | 'grantTop' | 'grant' | 'grantBottom' }
   | { id: string; kind: 'what'; text: string; since: string }
   | { id: string; kind: 'from'; text: string }
   | { id: null; kind: 'msgTop' | 'msgBottom' }
@@ -40,6 +41,12 @@ const CARD_EDGE = 2
 const FROM_MAX_ROWS = 4
 const MESSAGE_MAX_ROWS = 6
 const BUTTON_ROW_TEXT = [edge('top', BUTTON_COLUMNS), '│' + CANCEL_LABEL + '│', edge('bottom', BUTTON_COLUMNS)] as const
+/** A grant card's answers, left to right; ✕ refuses. */
+const GRANT_BUTTONS = [
+  { kind: 'session', label: ' Session ' },
+  { kind: 'once', label: ' Once ' },
+  { kind: 'cancel', label: CANCEL_LABEL },
+] as const
 const FIELD_BACKGROUND = '#1f2a3a'
 /** Names a `Client` gets for special keys; any other `key` is typed text, a burst arriving whole. */
 const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
@@ -134,6 +141,19 @@ export function geometry(columns: number) {
   return { inner, fieldColumns: inner - 1 - BUTTON_COLUMNS, buttonStart: CARD_EDGE + inner - BUTTON_COLUMNS }
 }
 
+/** The grant buttons, right-aligned in the card as the field's ✕ is, a column apart. */
+export function grantButtons(columns: number) {
+  const { inner } = geometry(columns)
+  const widths = GRANT_BUTTONS.map(b => [...b.label].length + 2)
+  const total = widths.reduce((sum, w) => sum + w, 0) + widths.length - 1
+  let start = CARD_EDGE + inner - total
+  return GRANT_BUTTONS.map((b, i) => {
+    const button = { ...b, start, width: widths[i]! }
+    start += widths[i]! + 1
+    return button
+  })
+}
+
 export function layout(entries: RequestEntry[], columns: number, message: string | null): Row[] {
   if (entries.length === 0 && message === null) return [{ id: null, kind: 'empty' }]
   const { inner, fieldColumns } = geometry(columns)
@@ -150,13 +170,10 @@ export function layout(entries: RequestEntry[], columns: number, message: string
     if (rows.length > 0) rows.push({ id: null, kind: 'gap' })
     rows.push({ id: entry.id, kind: 'cardTop' })
     rows.push({ id: entry.id, kind: 'what', text: entry.prompt, since: entry.since })
-    for (const text of wrap(entry.source, inner, FROM_MAX_ROWS)) rows.push({ id: entry.id, kind: 'from', text })
-    rows.push(
-      { id: entry.id, kind: 'fieldTop' },
-      { id: entry.id, kind: 'field' },
-      { id: entry.id, kind: 'fieldBottom' },
-      { id: entry.id, kind: 'cardBottom' },
-    )
+    if (entry.source !== '') for (const text of wrap(entry.source, inner, FROM_MAX_ROWS)) rows.push({ id: entry.id, kind: 'from', text })
+    const answer = entry.kind === 'grant' ? (['grantTop', 'grant', 'grantBottom'] as const) : (['fieldTop', 'field', 'fieldBottom'] as const)
+    for (const kind of answer) rows.push({ id: entry.id, kind })
+    rows.push({ id: entry.id, kind: 'cardBottom' })
   }
   return rows
 }
@@ -230,7 +247,9 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   const jumps: Record<string, number> = { up: at - 1, down: at + 1, home: 0, end: entries.length - 1 }
   const to = jumps[k.key]
   if (to !== undefined) return selectCard(state, entries, frame, entries[Math.max(0, Math.min(entries.length - 1, to))]!.id)
-  if (k.key === 'return' || k.key === '\n') return withEdit(state, selected, { id: selected, kind: 'submit' })
+  const isEnter = k.key === 'return' || k.key === '\n'
+  if (entries[at]!.kind === 'grant') return isEnter ? withEdit(state, selected, { id: selected, kind: 'once' }) : { state }
+  if (isEnter) return withEdit(state, selected, { id: selected, kind: 'submit' })
   if (k.key === 'backspace' || k.key === 'delete') return withEdit(state, selected, { id: selected, kind: 'back' })
   if (k.ctrl && k.key === 'u') return withEdit(state, selected, { id: selected, kind: 'clear' })
   const text = typedText(k)
@@ -257,6 +276,10 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   if ((row.kind === 'fieldTop' || row.kind === 'field' || row.kind === 'fieldBottom') && onButton) {
     return withEdit(state, current, { id: row.id, kind: 'cancel' })
   }
+  if (row.kind === 'grantTop' || row.kind === 'grant' || row.kind === 'grantBottom') {
+    const button = grantButtons(frame.columns).find(b => x >= b.start && x < b.start + b.width)
+    if (button !== undefined) return withEdit(state, current, { id: row.id, kind: button.kind })
+  }
   return { state: { ...focused, selected: row.id }, post: postOf(state, row.id) }
 }
 
@@ -264,9 +287,15 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   const { Box, Text } = surface.elements
   const { columns } = props
   const frame: Frame = { columns, rows: props.rows, message: props.message }
+  const tabRows = props.tabs === null ? 0 : TAB_ROWS
   surface.onPointer(p => {
     if (p.type !== 'down') return
-    const result = onClick(surface.state as ListState, props.entries, frame, p.y, p.x)
+    if (p.y < tabRows) {
+      const current = surface.state as ListState
+      if (p.y === 0 && props.tabs !== null && tabAt(props.tabs, p.x) === 'vault') surface.post({ ...postOf(current, selectedOf(current, props.entries)), tab: 'vault' })
+      return
+    }
+    const result = onClick(surface.state as ListState, props.entries, frame, p.y - tabRows, p.x)
     surface.setState(result.state)
     if (result.post) surface.post(result.post)
   })
@@ -336,7 +365,9 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
           ? (count + 1 > room ? '…' + '•'.repeat(room - 2) : '•'.repeat(count)) + '▏'
           : count > 0
             ? '•'.repeat(Math.min(count, room))
-            : 'password'
+            : entriesById.get(row.id)!.kind === 'unlock'
+              ? 'passphrase'
+              : 'password'
         return line(row.id, [
           Text({ ...look(row.id), children: ['│ '] }),
           Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: !active(row.id) && count === 0, children: [pad(shown, room)] }),
@@ -344,9 +375,24 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
           Text({ color: 'error', children: [BUTTON_ROW_TEXT[1]] }),
         ])
       }
+      case 'grantTop':
+      case 'grant':
+      case 'grantBottom': {
+        const buttons = grantButtons(columns)
+        const face = (label: string, width: number) =>
+          row.kind === 'grantTop' ? edge('top', width) : row.kind === 'grantBottom' ? edge('bottom', width) : '│' + label + '│'
+        const lead = buttons[0]!.start - CARD_EDGE
+        return line(row.id, [
+          Text({ children: [' '.repeat(lead)] }),
+          ...buttons.map((b, i) =>
+            Text({ ...(b.kind === 'cancel' ? { color: 'error' as const } : look(row.id)), children: [(i > 0 ? ' ' : '') + face(b.label, b.width)] }),
+          ),
+        ])
+      }
     }
   })
-  return Box({ flexDirection: 'column', width: columns, children: rows })
+  const tabs = props.tabs === null ? [] : drawTabs(surface.elements, props.tabs, columns)
+  return Box({ flexDirection: 'column', width: columns, children: [...tabs, ...rows] })
 }
 
 export default Requests

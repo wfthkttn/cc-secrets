@@ -13,13 +13,15 @@
         version = "0.1.0";
         src = self;
         cargoLock.lockFile = ./Cargo.lock;
+        # the ssh-agent tests sign and verify with ssh-keygen and forward to a real ssh-agent
+        nativeCheckInputs = [ pkgs.openssh ];
         # In the working copy claude-code/bin points at cargo's target dir; the package points it at the built helpers.
         postInstall = ''
           mkdir -p $out/share/secrets
           cp -r claude-code $out/share/secrets/claude-code
           rm $out/share/secrets/claude-code/bin
           mkdir $out/share/secrets/claude-code/bin
-          ln -s $out/bin/secrets-relay $out/bin/secrets-mask-run $out/bin/secrets-ask $out/share/secrets/claude-code/bin/
+          ln -s $out/bin/* $out/share/secrets/claude-code/bin/
         '';
       };
 

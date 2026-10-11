@@ -1,0 +1,4 @@
+{
+  "description": "secrets: password requests and their panel",
+  "modules": ["./register.ts"]
+}

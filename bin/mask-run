@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Usage: mask-run '<shell invocation>'   (as CLAUDE_CODE_SHELL_PREFIX)
+
+Runs the invocation with /bin/sh -c, or through $SECRETS_ORIG_PREFIX when set,
+copying its stdout and stderr with every value the relay at $SECRETS_RELAY
+knows replaced by [secret], skipping values shorter than $SECRETS_MASK_MIN
+characters. Exits with the command's status. Without a relay the command
+still runs; one line on stderr says its output is unmasked.
+"""
+import json
+import os
+import select
+import signal
+import socket
+import subprocess
+import sys
+
+MASK = b'[secret]'
+
+
+def watch(path):
+    """A socket streaming the relay's values, or None."""
+    if not path:
+        return None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        sock.sendall(b'GET /watch HTTP/1.0\r\n\r\n')
+    except OSError:
+        return None
+    sock.setblocking(False)
+    return sock
+
+
+class Values:
+    def __init__(self, min_length):
+        self.min_length = min_length
+        self.values = []
+        self.raw = b''
+        self.in_body = False
+
+    def feed(self, data):
+        self.raw += data
+        if not self.in_body:
+            end = self.raw.find(b'\r\n\r\n')
+            if end < 0:
+                return
+            self.raw = self.raw[end + 4:]
+            self.in_body = True
+        *lines, self.raw = self.raw.split(b'\n')
+        for line in lines:
+            text = json.loads(line)
+            value = text.encode('utf-8')
+            if len(text) >= self.min_length and value not in self.values:
+                self.values.append(value)
+
+    def mask(self, data):
+        for value in self.values:
+            data = data.replace(value, MASK)
+        return data
+
+    def held_back(self, data):
+        """How many trailing bytes could still become a value with more data."""
+        longest = 0
+        for value in self.values:
+            for size in range(min(len(value) - 1, len(data)), longest, -1):
+                if value.startswith(data[-size:]):
+                    longest = size
+                    break
+        return longest
+
+
+def write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def drain(sock, values):
+    while True:
+        try:
+            data = sock.recv(65536)
+        except BlockingIOError:
+            return sock
+        except OSError:
+            return None
+        if data == b'':
+            return None
+        values.feed(data)
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit('mask-run: usage: mask-run <shell invocation>')
+    invocation = sys.argv[1]
+    prefix = os.environ.get('SECRETS_ORIG_PREFIX')
+    argv = [prefix, invocation] if prefix else ['/bin/sh', '-c', invocation]
+
+    sock = watch(os.environ.get('SECRETS_RELAY'))
+    if sock is None:
+        sys.stderr.write('mask-run: no secrets relay; this output is not masked\n')
+        sys.stderr.flush()
+        os.execv(argv[0], argv)
+
+    try:
+        min_length = int(os.environ['SECRETS_MASK_MIN'])
+    except (KeyError, ValueError):
+        sys.stderr.write('mask-run: SECRETS_MASK_MIN is not a number; masking values of any length\n')
+        sys.stderr.flush()
+        min_length = 1
+
+    child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+
+    values = Values(min_length)
+    pending = {child.stdout.fileno(): (b'', 1), child.stderr.fileno(): (b'', 2)}
+    while pending:
+        watched = [sock] if sock is not None else []
+        readable, _, _ = select.select(list(pending) + watched, [], [])
+        if sock is not None:
+            sock = drain(sock, values)
+        for fd in readable:
+            if fd not in pending:
+                continue
+            buffered, out = pending[fd]
+            data = os.read(fd, 65536)
+            if data == b'':
+                write_all(out, values.mask(buffered))
+                del pending[fd]
+                continue
+            text = values.mask(buffered + data)
+            keep = values.held_back(text)
+            write_all(out, text[:len(text) - keep])
+            pending[fd] = (text[len(text) - keep:], out)
+
+    status = child.wait()
+    sys.exit(128 - status if status < 0 else status)
+
+
+main()

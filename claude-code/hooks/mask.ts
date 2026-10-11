@@ -18,7 +18,7 @@ function percent(bytes: Uint8Array, safe: string, plus: boolean): string {
   return out
 }
 
-/** The ways `value` turns up in output: raw, escaped, percent-, hex- and base64-encoded; `bin/mask-run` makes the same. */
+/** The ways `value` turns up in output: raw, escaped, percent-, hex- and base64-encoded; the Rust `secrets::mask` makes the same. */
 export function forms(value: string): Set<string> {
   const bytes = new TextEncoder().encode(value)
   const json = JSON.stringify(value).slice(1, -1)
@@ -91,7 +91,7 @@ export function mask(text: string): string {
   return masker.mask(text)
 }
 
-/** A value is masked this session, so `[secret]` in content may be a masked read (by the hooks or mask-run). */
+/** A value is masked this session, so `[secret]` in content may be a masked read (by the hooks or secrets-mask-run). */
 export function masksValues(): boolean {
   return isRemembering
 }

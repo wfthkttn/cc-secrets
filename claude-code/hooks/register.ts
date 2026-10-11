@@ -114,16 +114,16 @@ export function register(on: On, options: PluginOptions) {
     }
     const socket = `${runtimeDir}/claude-secrets-${randomId()}.sock`
     relaySocket = socket
-    // Commands see the relay only once it listens: before, mask-run would let their output through unmasked.
+    // Commands see the relay only once it listens: before, secrets-mask-run would let their output through unmasked.
     await startRelay($, socket)
-    const helper = $.plugin.root + '/bin/ask-secret'
+    const helper = $.plugin.root + '/bin/secrets-ask'
     await $.env.set('SECRETS_RELAY', socket)
     await $.env.set('ASK_SECRET', helper)
     await $.env.set('SUDO_ASKPASS', helper)
     await $.env.set('SSH_ASKPASS', helper)
     await $.env.set('SSH_ASKPASS_REQUIRE', 'force')
     await $.env.set('GIT_ASKPASS', helper)
-    const maskRun = $.plugin.root + '/bin/mask-run'
+    const maskRun = $.plugin.root + '/bin/secrets-mask-run'
     const prefix = await $.env.get('CLAUDE_CODE_SHELL_PREFIX')
     // On a reload the prefix is already ours; the one found first is the user's.
     if (prefix && prefix !== maskRun) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
@@ -272,7 +272,7 @@ function startRelay($: EngineInterface, socket: string): Promise<void> {
 }
 
 async function readRelay($: EngineInterface, socket: string, ready: () => void) {
-  const relay = $.process.spawn({ argv: ['python3', '-I', $.plugin.root + '/bin/relay.py', socket] })
+  const relay = $.process.spawn({ argv: [$.plugin.root + '/bin/secrets-relay', socket] })
   let buffered = ''
   for await (const chunk of relay) {
     if (chunk.stream === 'stderr') {

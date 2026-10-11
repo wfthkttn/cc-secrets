@@ -20,6 +20,12 @@ test('sudo -A asking: the Bash command that ran sudo', async () => {
   expect(sourceOf('sudo -A systemctl restart foo', [command])).toBe(command)
 })
 
+test('a shorter running command inside the asker\'s command line loses to the one that ran it', async () => {
+  expect(sourceOf('sudo -A make install', ['make', 'cd src && sudo -A make install'])).toBe('cd src && sudo -A make install')
+  const command = `make && echo "$($ASK_SECRET 'x')"`
+  expect(sourceOf(WRAPPER(command), ['make', command])).toBe(command)
+})
+
 test('a background call, no longer running: the command out of the Bash wrapper', async () => {
   const command = `echo "A=$($ASK_SECRET 'token A')"`
   expect(sourceOf(WRAPPER(command), [])).toBe(command)

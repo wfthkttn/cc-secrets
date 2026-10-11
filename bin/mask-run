@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """Usage: mask-run '<shell invocation>'   (as CLAUDE_CODE_SHELL_PREFIX)
 
 Runs the invocation with /bin/sh -c, or through $SECRETS_ORIG_PREFIX when set,
@@ -32,6 +32,10 @@ def watch(path):
     return sock
 
 
+class Refused(Exception):
+    pass
+
+
 class Values:
     def __init__(self, min_length):
         self.min_length = min_length
@@ -45,6 +49,9 @@ class Values:
             end = self.raw.find(b'\r\n\r\n')
             if end < 0:
                 return
+            status = self.raw.split(b'\r\n', 1)[0].split(b' ')[1]
+            if status != b'200':
+                raise Refused(status.decode('ascii', 'replace'))
             self.raw = self.raw[end + 4:]
             self.in_body = True
         *lines, self.raw = self.raw.split(b'\n')
@@ -85,7 +92,12 @@ def drain(sock, values):
             return None
         if data == b'':
             return None
-        values.feed(data)
+        try:
+            values.feed(data)
+        except Refused as refused:
+            sys.stderr.write(f'mask-run: the secrets relay refused this process ({refused}); this output is not masked\n')
+            sys.stderr.flush()
+            return None
 
 
 def main():

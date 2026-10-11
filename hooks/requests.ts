@@ -16,7 +16,7 @@ export type ListState = {
 }
 
 /** One screen row of the list: a message row, a request card's row, a gap, or the empty note. */
-export type Row =
+type Row =
   | { id: string; kind: 'cardTop' | 'cardBottom' | 'fieldTop' | 'field' | 'fieldBottom' }
   | { id: string; kind: 'what'; text: string; since: string }
   | { id: string; kind: 'from'; text: string }
@@ -25,7 +25,7 @@ export type Row =
   | { id: null; kind: 'gap' | 'empty' }
 
 /** A row on screen: a layout row, or a marker for the cards cut off above or below. */
-export type ViewRow = Row | { id: null; kind: 'more'; dir: 'up' | 'down'; count: number }
+type ViewRow = Row | { id: null; kind: 'more'; dir: 'up' | 'down'; count: number }
 
 /** The list's room, and the message pinned above its cards. */
 export type Frame = { columns: number; rows: number; message: string | null }
@@ -39,12 +39,25 @@ const BUTTON_COLUMNS = CANCEL_LABEL.length + 2
 const CARD_EDGE = 2
 const FROM_MAX_ROWS = 4
 const MESSAGE_MAX_ROWS = 6
-/** The ✕ button's height, which a message box is at least. */
-const BUTTON_ROWS = 3
-const BUTTON_ROW_TEXT = ['╭' + '─'.repeat(CANCEL_LABEL.length) + '╮', '│' + CANCEL_LABEL + '│', '╰' + '─'.repeat(CANCEL_LABEL.length) + '╯']
+const BUTTON_ROW_TEXT = [edge('top', BUTTON_COLUMNS), '│' + CANCEL_LABEL + '│', edge('bottom', BUTTON_COLUMNS)] as const
 const FIELD_BACKGROUND = '#1f2a3a'
 /** Names a `Client` gets for special keys; any other `key` is typed text, a burst arriving whole. */
 const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
+
+function edge(side: 'top' | 'bottom', width: number): string {
+  const [left, right] = side === 'top' ? ['╭', '╮'] : ['╰', '╯']
+  return left + '─'.repeat(width - 2) + right
+}
+
+/** `text` cut to `width` characters, the last one `…` when cut. */
+function clip(text: string, width: number): string {
+  const chars = [...text]
+  return chars.length <= width ? text : chars.slice(0, width - 1).join('') + '…'
+}
+
+function pad(text: string, width: number): string {
+  return text + ' '.repeat(Math.max(0, width - [...text].length))
+}
 
 export function initialState(focusEpoch: number, instance: string): ListState {
   return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0 }
@@ -57,9 +70,13 @@ function typedText(k: ClientKeyEvent): string | null {
   return k.key
 }
 
-export function selectedOf(state: ListState, entries: RequestEntry[]): string | null {
+function selectedOf(state: ListState, entries: RequestEntry[]): string | null {
   if (state.selected !== null && entries.some(e => e.id === state.selected)) return state.selected
   return entries[0]?.id ?? null
+}
+
+function postOf(state: ListState, selected: string | null, edits = state.pending, dismiss = false): RequestsMessage {
+  return { instance: state.instance, selected, edits, ...(dismiss ? { dismiss: true as const } : {}) }
 }
 
 /** Drops the edits the hooks confirmed; null when none were. */
@@ -84,7 +101,7 @@ function wrap(text: string, width: number, maxRows: number): string[] {
   const chars = [...text]
   const rows: string[] = []
   for (let i = 0; i < chars.length && rows.length < maxRows; i += width) rows.push(chars.slice(i, i + width).join(''))
-  if (chars.length > width * maxRows) rows[maxRows - 1] = rows[maxRows - 1]!.slice(0, -1) + '…'
+  if (chars.length > width * maxRows) rows[maxRows - 1] = clip(rows[maxRows - 1]! + '…', width)
   return rows.length === 0 ? [''] : rows
 }
 
@@ -107,7 +124,7 @@ function wrapWords(text: string, width: number, maxRows: number): string[] {
   if (row !== '') rows.push(row)
   if (rows.length <= maxRows) return rows
   const kept = rows.slice(0, maxRows)
-  kept[maxRows - 1] = [...kept[maxRows - 1]!].slice(0, width - 1).join('') + '…'
+  kept[maxRows - 1] = clip(kept[maxRows - 1]! + '…', width)
   return kept
 }
 
@@ -124,7 +141,7 @@ export function layout(entries: RequestEntry[], columns: number, message: string
   if (message !== null) {
     const lines = wrapWords(message, fieldColumns, MESSAGE_MAX_ROWS)
     rows.push({ id: null, kind: 'msgTop' })
-    for (let index = 0; index < Math.max(BUTTON_ROWS, lines.length); index++) {
+    for (let index = 0; index < Math.max(BUTTON_ROW_TEXT.length, lines.length); index++) {
       rows.push({ id: null, kind: 'msg', text: lines[index] ?? '', index })
     }
     rows.push({ id: null, kind: 'msgBottom' })
@@ -144,11 +161,15 @@ export function layout(entries: RequestEntry[], columns: number, message: string
   return rows
 }
 
-/** The rows the tallest card takes, with the gap before it. */
-export function tallestCard(entries: RequestEntry[], columns: number): number {
+/**
+ * The list's height in `rows` of room: a card and its gap short of it, since
+ * the room's bottom edge may be off screen or under the engine's pill.
+ */
+export function listHeight(entries: RequestEntry[], columns: number, message: string | null, rows: number): number {
   const counts = new Map<string, number>()
   for (const row of layout(entries, columns, null)) if (row.id !== null) counts.set(row.id, (counts.get(row.id) ?? 0) + 1)
-  return Math.max(0, ...counts.values()) + 1
+  const tallestCard = Math.max(0, ...counts.values()) + 1
+  return Math.min(layout(entries, columns, message).length, rows - tallestCard)
 }
 
 type Window = { head: Row[]; body: Row[]; top: number; room: number; fits: boolean }
@@ -188,11 +209,10 @@ function reveal(entries: RequestEntry[], frame: Frame, scroll: number, id: strin
   return w.top
 }
 
-function selectCard(state: ListState, entries: RequestEntry[], frame: Frame, id: string): Result {
+/** Selects the card and scrolls to it; tells the hooks when the selection changed, or always when `tell`. */
+function selectCard(state: ListState, entries: RequestEntry[], frame: Frame, id: string, tell = false): Result {
   const moved = { ...state, selected: id, isFocused: true, scroll: reveal(entries, frame, state.scroll, id) }
-  return id === selectedOf(state, entries)
-    ? { state: moved }
-    : { state: moved, post: { instance: state.instance, selected: id, edits: state.pending } }
+  return tell || id !== selectedOf(state, entries) ? { state: moved, post: postOf(state, id) } : { state: moved }
 }
 
 type EditBody = Edit extends infer E ? (E extends Edit ? Omit<E, 'seq'> : never) : never
@@ -200,8 +220,7 @@ type EditBody = Edit extends infer E ? (E extends Edit ? Omit<E, 'seq'> : never)
 function withEdit(state: ListState, selected: string | null, edit: EditBody): Result {
   const seq = state.seq + 1
   const pending = [...state.pending, { ...edit, seq } as Edit]
-  const next = { ...state, seq, pending, selected, isFocused: true }
-  return { state: next, post: { instance: state.instance, selected, edits: pending } }
+  return { state: { ...state, seq, pending, selected, isFocused: true }, post: postOf(state, selected, pending) }
 }
 
 export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k: ClientKeyEvent): Result {
@@ -223,32 +242,28 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   const row = view(entries, frame, state.scroll)[y]
   const current = selectedOf(state, entries)
   const { buttonStart } = geometry(frame.columns)
+  const onButton = x >= buttonStart && x < buttonStart + BUTTON_COLUMNS
+  const focused = { ...state, isFocused: true }
   if (row?.kind === 'more') {
     const w = windowOf(entries, frame, state.scroll)
     const id =
       row.dir === 'up'
         ? w.body.slice(0, w.top).filter(r => r.kind === 'cardTop').at(-1)?.id
         : w.body.slice(w.top + w.room).find(r => r.kind === 'cardBottom')?.id
-    if (id != null) {
-      const moved = selectCard(state, entries, frame, id)
-      return { state: moved.state, post: { instance: state.instance, selected: id, edits: state.pending } }
-    }
+    if (id != null) return selectCard(state, entries, frame, id, true)
   }
-  if (row?.kind === 'msg' && row.index < BUTTON_ROWS && x >= buttonStart && x < buttonStart + BUTTON_COLUMNS) {
-    return { state: { ...state, isFocused: true }, post: { instance: state.instance, selected: current, edits: state.pending, dismiss: true } }
+  if (row?.kind === 'msg' && row.index < BUTTON_ROW_TEXT.length && onButton) return { state: focused, post: postOf(state, current, state.pending, true) }
+  if (row?.id == null) return { state: focused, post: postOf(state, current) }
+  if ((row.kind === 'fieldTop' || row.kind === 'field' || row.kind === 'fieldBottom') && onButton) {
+    return withEdit(state, current, { id: row.id, kind: 'cancel' })
   }
-  if (row?.id == null) {
-    return { state: { ...state, isFocused: true }, post: { instance: state.instance, selected: current, edits: state.pending } }
-  }
-  const onButton = (row.kind === 'fieldTop' || row.kind === 'field' || row.kind === 'fieldBottom') && x >= buttonStart && x < buttonStart + BUTTON_COLUMNS
-  if (onButton) return withEdit(state, current, { id: row.id, kind: 'cancel' })
-  const selected = { ...state, selected: row.id, isFocused: true }
-  return { state: selected, post: { instance: state.instance, selected: row.id, edits: state.pending } }
+  return { state: { ...focused, selected: row.id }, post: postOf(state, row.id) }
 }
 
 const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   const { Box, Text } = surface.elements
-  const frame: Frame = { columns: surface.columns, rows: props.rows, message: props.message }
+  const { columns } = props
+  const frame: Frame = { columns, rows: props.rows, message: props.message }
   surface.onPointer(p => {
     if (p.type !== 'down') return
     const result = onClick(surface.state as ListState, props.entries, frame, p.y, p.x)
@@ -261,20 +276,18 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
     if (result.post) surface.post(result.post)
   })
   let state = surface.state ?? initialState(props.focusEpoch, Math.random().toString(36).slice(2))
-  // An instance from before the list scrolled keeps its state across a reload.
-  if (state.scroll === undefined) state = { ...state, scroll: 0 }
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.epoch !== props.focusEpoch) state = { ...state, isFocused: false, epoch: props.focusEpoch }
   if (state !== surface.state) surface.setState(state)
 
   const selected = selectedOf(state, props.entries)
-  const byId = new Map(props.entries.map(e => [e.id, e]))
-  const { inner, fieldColumns } = geometry(surface.columns)
+  const entriesById = new Map(props.entries.map(e => [e.id, e]))
+  const { inner, fieldColumns } = geometry(columns)
   const active = (id: string) => id === selected && state.isFocused
-  const edge = (id: string) => (active(id) ? { color: 'claude' as const, bold: true } : { dimColor: true })
+  const look = (id: string) => (active(id) ? { color: 'claude' as const, bold: true } : { dimColor: true })
   const line = (id: string, children: ReturnType<typeof Text>[]) =>
-    Box({ flexDirection: 'row', children: [Text({ ...edge(id), children: ['│ '] }), ...children, Text({ ...edge(id), children: [' │'] })] })
+    Box({ flexDirection: 'row', children: [Text({ ...look(id), children: ['│ '] }), ...children, Text({ ...look(id), children: [' │'] })] })
 
   const rows = view(props.entries, frame, state.scroll).map(row => {
     switch (row.kind) {
@@ -282,48 +295,42 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
         return Text({ dimColor: true, children: ['No requests'] })
       case 'more': {
         const label = row.count === 0 ? '' : `${row.dir === 'up' ? '▲' : '▼'} ${row.count} more`
-        const left = Math.floor((surface.columns - [...label].length) / 2)
-        return Text({ dimColor: true, children: [(' '.repeat(left) + label).padEnd(surface.columns)] })
+        return Text({ dimColor: true, children: [pad(' '.repeat(Math.floor((columns - [...label].length) / 2)) + label, columns)] })
       }
       case 'msgTop':
-      case 'msgBottom': {
-        const [left, right] = row.kind === 'msgTop' ? ['╭', '╮'] : ['╰', '╯']
-        return Text({ color: 'error', children: [left + '─'.repeat(surface.columns - 2) + right] })
-      }
+      case 'msgBottom':
+        return Text({ color: 'error', children: [edge(row.kind === 'msgTop' ? 'top' : 'bottom', columns)] })
       case 'msg':
         return Box({
           flexDirection: 'row',
           children: [
             Text({ color: 'error', children: ['│ '] }),
-            Text({ children: [row.text.padEnd(fieldColumns) + ' '] }),
-            Text({ color: 'error', children: [(BUTTON_ROW_TEXT[row.index] ?? '').padEnd(BUTTON_COLUMNS) + ' │'] }),
+            Text({ children: [pad(row.text, fieldColumns) + ' '] }),
+            Text({ color: 'error', children: [pad(BUTTON_ROW_TEXT[row.index] ?? '', BUTTON_COLUMNS) + ' │'] }),
           ],
         })
       case 'gap':
-        return Text({ children: [' '] })
+        return Text({ children: [' '.repeat(columns)] })
       case 'cardTop':
-      case 'cardBottom': {
-        const [left, right] = row.kind === 'cardTop' ? ['╭', '╮'] : ['╰', '╯']
-        return Text({ ...edge(row.id), children: [left + '─'.repeat(surface.columns - 2) + right] })
-      }
+      case 'cardBottom':
+        return Text({ ...look(row.id), children: [edge(row.kind === 'cardTop' ? 'top' : 'bottom', columns)] })
       case 'what': {
         const since = ' ' + row.since
         const room = inner - since.length
-        const what = [...row.text].length > room ? [...row.text].slice(0, room - 1).join('') + '…' : row.text.padEnd(room)
-        return line(row.id, [Text({ bold: true, children: [what] }), Text({ dimColor: true, children: [since] })])
+        return line(row.id, [Text({ bold: true, children: [pad(clip(row.text, room), room)] }), Text({ dimColor: true, children: [since] })])
       }
       case 'from':
-        return line(row.id, [Text({ children: [row.text.padEnd(inner)] })])
+        return line(row.id, [Text({ children: [pad(row.text, inner)] })])
       case 'fieldTop':
       case 'fieldBottom': {
-        const [left, right] = row.kind === 'fieldTop' ? ['╭', '╮'] : ['╰', '╯']
+        const side = row.kind === 'fieldTop' ? 'top' : 'bottom'
         return line(row.id, [
-          Text({ ...edge(row.id), children: [left + '─'.repeat(fieldColumns - 2) + right + ' '] }),
-          Text({ color: 'error', children: [left + '─'.repeat(BUTTON_COLUMNS - 2) + right] }),
+          Text({ ...look(row.id), children: [edge(side, fieldColumns) + ' '] }),
+          Text({ color: 'error', children: [BUTTON_ROW_TEXT[side === 'top' ? 0 : 2]] }),
         ])
       }
       case 'field': {
-        const count = shownLength(byId.get(row.id)!, state.pending)
+        const count = shownLength(entriesById.get(row.id)!, state.pending)
         const room = fieldColumns - 4
         const shown = active(row.id)
           ? (count + 1 > room ? '…' + '•'.repeat(room - 2) : '•'.repeat(count)) + '▏'
@@ -331,15 +338,15 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
             ? '•'.repeat(Math.min(count, room))
             : 'password'
         return line(row.id, [
-          Text({ ...edge(row.id), children: ['│ '] }),
-          Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: !active(row.id) && count === 0, children: [shown.padEnd(room).slice(0, room)] }),
-          Text({ ...edge(row.id), children: [' │ '] }),
-          Text({ color: 'error', children: ['│' + CANCEL_LABEL + '│'] }),
+          Text({ ...look(row.id), children: ['│ '] }),
+          Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: !active(row.id) && count === 0, children: [pad(shown, room)] }),
+          Text({ ...look(row.id), children: [' │ '] }),
+          Text({ color: 'error', children: [BUTTON_ROW_TEXT[1]] }),
         ])
       }
     }
   })
-  return Box({ flexDirection: 'column', width: surface.columns, children: rows })
+  return Box({ flexDirection: 'column', width: columns, children: rows })
 }
 
 export default Requests

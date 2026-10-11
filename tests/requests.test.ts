@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { confirm, type Frame, geometry, initialState, type ListState, layout, onClick, onKey, shownLength, tallestCard, view } from '../hooks/requests'
+import { confirm, type Frame, geometry, initialState, type ListState, layout, listHeight, onClick, onKey, shownLength, view } from '../hooks/requests'
 import type { RequestEntry } from '../hooks/requests-props'
 
 const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, prompt, source: 'echo', since: '04:00:00', length })
@@ -17,7 +17,7 @@ function type(state: ListState, ...keys: string[]) {
   return state
 }
 
-test('typing becomes numbered edits for the first request; nothing typed stays in the list', async () => {
+test('typing becomes numbered edits for the first request', async () => {
   const state = type(START, 'h', 'hunter2')
   expect(state.pending).toEqual([
     { seq: 1, id: 'a', kind: 'append', text: 'h' },
@@ -154,10 +154,11 @@ test('a click on a marker selects the next card cut off that way and scrolls to 
   expect(onClick(START, MANY, SHORT, 0, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [] })
 })
 
-test('the tallest card counts its gap; a long source makes a card taller', async () => {
-  expect(tallestCard(MANY, 60)).toBe(8)
-  expect(tallestCard([...MANY, { ...entry('f', 'p'), source: 'x'.repeat(300) }], 60)).toBe(11)
-  expect(tallestCard([], 60)).toBe(1)
+test('the list stays its tallest card and gap short of the room; a list that fits keeps its height', async () => {
+  expect(listHeight(MANY, 60, null, 30)).toBe(22)
+  expect(listHeight([...MANY, { ...entry('f', 'p'), source: 'x'.repeat(300) }], 60, null, 30)).toBe(19)
+  expect(listHeight(ENTRIES, 60, null, 100)).toBe(15)
+  expect(listHeight([], 60, null, 30)).toBe(1)
 })
 
 test('a message stays on top while the cards under it scroll', async () => {

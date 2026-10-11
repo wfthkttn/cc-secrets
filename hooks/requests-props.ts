@@ -22,6 +22,8 @@ export type RequestsProps = {
   applied: Record<string, number>
   /** Shown above the cards with a ✕ that dismisses it. */
   message: string | null
+  /** The list's width. */
+  columns: number
   /** The list's height; cards past it scroll. */
   rows: number
 }

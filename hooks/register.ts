@@ -1,21 +1,23 @@
-import type { EngineInterface, On, PluginOptions } from 'claude-code'
+import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
+import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from 'sidebar'
 
-import { mask, remember } from './mask'
+import { maskStrings, remember } from './mask'
 import { Popouts } from './popouts'
-import { layout, tallestCard } from './requests'
+import { listHeight } from './requests'
 import type { RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { fillSlot, hasSlot } from './slot'
 import { sourceOf } from './source'
 
 const SIDEBAR_ID = 'pass'
-const DRAWER_SLOT = 'sidebar-drawer:' + SIDEBAR_ID
-const POPOUT_SLOT = 'sidebar-popout:' + SIDEBAR_ID
+const DRAWER_SLOT: SidebarDrawerSlot = `sidebar-drawer:${SIDEBAR_ID}`
+const POPOUT_SLOT: SidebarPopoutSlot = `sidebar-popout:${SIDEBAR_ID}`
+const LIST_KEY = 'requests'
+const POPOUT_KEY = 'popout'
 const DRAWER_COLUMNS = 64
-/** The drawer's border and padding take these columns from the list. */
-const DRAWER_FRAME_COLUMNS = 4
 const POPOUT_MS = 15000
 const NOTICE_MS = 10000
-const UNSEEN_PASTE ='A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
+const RELAY_START_MS = 5000
+const UNSEEN_PASTE = 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
 const ROW_COMPONENTS = [
   'UserMessage',
   'AssistantMessage',
@@ -25,7 +27,7 @@ const ROW_COMPONENTS = [
   'CommandOutput',
   'TurnDuration',
   'InfoNotice',
-] as const
+] as const satisfies readonly SidebarRowComponent[]
 
 type Ask = { id: string; prompt: string; pid: number; cmdline: string }
 
@@ -37,7 +39,8 @@ type RelayEvent =
 type Request = Omit<RequestEntry, 'length'>
 
 /** Replaced, never changed in place: render props freeze what they're handed. */
-let asks: readonly Request[] = []
+let requests: readonly Request[] = []
+/** Bash calls in flight, for a request's source command. */
 const running: { id: string; command: string }[] = []
 let relaySocket: string | null = null
 /** The `maskMinLength` option, read once the module registers. */
@@ -55,29 +58,38 @@ let listSelected: string | null = null
 /** Made at session start, where the hooks first have `$` for its timers. */
 let popouts: Popouts | null = null
 /** Shown above the cards; a sticky one stays until its ✕, any other also goes on the next action or after `NOTICE_MS`. */
-let notice: { text: string; sticky: boolean; timer: { cancel(): void } | null } | null = null
+let notice: { text: string; sticky: boolean; timer: Timer | null } | null = null
 
-function popped(): Popouts {
+function randomId(): string {
+  return Math.random().toString(36).slice(2)
+}
+
+function clockTime(): string {
+  return new Date().toTimeString().slice(0, 8)
+}
+
+function livePopouts(): Popouts {
   if (popouts === null) throw new Error('secrets: pop-outs used before session start')
   return popouts
 }
 
-function showPopout($: EngineInterface) {
+/** Shows the pop-out area while a card or a notice is in it, hides it otherwise. */
+function syncPopout($: EngineInterface) {
   $.ui.invalidate('ui.render')
-  void $.sidebar.popout({ id: SIDEBAR_ID, isShown: popped().shown().length > 0 || notice !== null })
+  void $.sidebar.popout({ id: SIDEBAR_ID, isShown: livePopouts().shown().length > 0 || notice !== null })
 }
 
 function say($: EngineInterface, text: string, sticky: boolean) {
   notice?.timer?.cancel()
   notice = { text, sticky, timer: sticky ? null : $.clock.after(NOTICE_MS, () => unsay($, false)) }
-  showPopout($)
+  syncPopout($)
 }
 
 function unsay($: EngineInterface, evenSticky: boolean) {
   if (notice === null || (notice.sticky && !evenSticky)) return
   notice.timer?.cancel()
   notice = null
-  showPopout($)
+  syncPopout($)
 }
 
 export function register(on: On, options: PluginOptions) {
@@ -89,19 +101,21 @@ export function register(on: On, options: PluginOptions) {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
-    popouts = new Popouts(POPOUT_MS, (ms, fn) => $.clock.after(ms, fn), () => showPopout($))
+    popouts = new Popouts(POPOUT_MS, (ms, fn) => $.clock.after(ms, fn), () => syncPopout($))
     await $.command.register({ name: 'pass-demo', description: 'Show three sample password requests; no program waits on them' })
     // A reload starts with no requests and a new relay; the host still shows what the old module set.
-    await $.sidebar.badge({ id: SIDEBAR_ID, count: asks.length, level: 'urgent' })
+    await $.sidebar.badge({ id: SIDEBAR_ID, count: 0, level: 'urgent' })
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
 
     const runtimeDir = await $.env.get('XDG_RUNTIME_DIR')
     if (!runtimeDir) {
       throw new Error('secrets: XDG_RUNTIME_DIR is not set, so the relay socket has nowhere to live')
     }
-    const socket = `${runtimeDir}/claude-secrets-${Math.random().toString(36).slice(2)}.sock`
-    const helper = $.plugin.root + '/bin/ask-secret'
+    const socket = `${runtimeDir}/claude-secrets-${randomId()}.sock`
     relaySocket = socket
+    // Commands see the relay only once it listens: before, mask-run would let their output through unmasked.
+    await startRelay($, socket)
+    const helper = $.plugin.root + '/bin/ask-secret'
     await $.env.set('SECRETS_RELAY', socket)
     await $.env.set('ASK_SECRET', helper)
     await $.env.set('SUDO_ASKPASS', helper)
@@ -114,13 +128,12 @@ export function register(on: On, options: PluginOptions) {
     if (prefix && prefix !== maskRun) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
     await $.env.set('SECRETS_MASK_MIN', String(maskMinLength))
     await $.env.set('CLAUDE_CODE_SHELL_PREFIX', maskRun)
-    void readRelay($, socket).catch((error: Error) => say($, `Requests stopped: ${error.message}`, true))
     return started
   })
 
   on('tool.call', async ($, e, next) => {
-    const command = typeof (e as { command?: unknown }).command === 'string' ? (e as { command: string }).command : ''
-    running.push({ id: e.tool_use_id, command })
+    if (e.tool !== 'Bash') return maskStrings(await next(e))
+    running.push({ id: e.tool_use_id, command: e.command })
     try {
       return maskStrings(await next(e))
     } finally {
@@ -129,24 +142,24 @@ export function register(on: On, options: PluginOptions) {
   })
 
   on('ui.message', async ($, e, next) => {
-    if (e.element !== 'requests' && e.element !== 'popout') return next(e)
+    if (e.element !== LIST_KEY && e.element !== POPOUT_KEY) return next(e)
     const message = e.data as RequestsMessage
     unsay($, message.dismiss === true)
     if (!listFocused) draftAtFocus = (await $.prompt.read()).text
     listFocused = true
     listSelected = message.selected
-    popped().focus(message.selected)
+    livePopouts().focus(message.selected)
     const last = applied[message.instance] ?? 0
     for (const edit of message.edits) {
       if (edit.seq <= last) continue
       applied = { ...applied, [message.instance]: edit.seq }
-      if (!asks.some(a => a.id === edit.id)) continue
+      if (!requests.some(r => r.id === edit.id)) continue
       const value = held.get(edit.id) ?? ''
       if (edit.kind === 'append') held.set(edit.id, value + edit.text)
       else if (edit.kind === 'back') held.set(edit.id, [...value].slice(0, -1).join(''))
       else if (edit.kind === 'clear') held.set(edit.id, '')
-      else if (edit.kind === 'submit') await answerAsk($, edit.id, { secret: value })
-      else await answerAsk($, edit.id, { cancel: true })
+      else if (edit.kind === 'submit') await answerRequest($, edit.id, { secret: value })
+      else await answerRequest($, edit.id, { cancel: true })
     }
     $.ui.invalidate('ui.render')
     return next(e)
@@ -157,15 +170,15 @@ export function register(on: On, options: PluginOptions) {
       if (listFocused && e.text !== draftAtFocus) say($, UNSEEN_PASTE, false)
       listFocused = false
       draftAtFocus = null
-      popped().blur()
-      if (asks.length > 0) {
+      livePopouts().blur()
+      if (requests.length > 0) {
         focusEpoch += 1
         $.ui.invalidate('ui.render')
       }
       return next(e)
     }
     // While the list holds the keyboard, keys go to it; a key-less edit reaching the prompt is a paste.
-    const target = asks.find(a => a.id === listSelected)
+    const target = requests.find(r => r.id === listSelected)
     if (!listFocused || target === undefined || e.inputText === '') {
       const box = await next(e)
       if (listFocused) draftAtFocus = box.text
@@ -198,18 +211,14 @@ export function register(on: On, options: PluginOptions) {
         source: 'TOKEN=$($ASK_SECRET "deploy token") && curl -fsS -H "Authorization: Bearer $TOKEN" https://deploy.example.org/api/v1/releases --data @release.json',
       },
     ]
-    for (const sample of samples) {
-      const id = 'demo-' + Math.random().toString(36).slice(2)
-      asks = [...asks, { id, ...sample, since: new Date().toTimeString().slice(0, 8) }]
-      if ((await $.sidebar.selected({})) !== SIDEBAR_ID) popped().add(id)
-    }
-    await showWaiting($)
+    for (const sample of samples) await addRequest($, { id: 'demo-' + randomId(), ...sample, since: clockTime() })
+    await syncBadge($)
     return {}
   })
 
   on('sidebar.press', async ($, e, next) => {
-    // The list now shows every request, so none stays popped out.
-    if (e.element === 'tool:' + SIDEBAR_ID) popped().clear()
+    // Opening the list shows every request, so none stays popped out.
+    if (e.element === 'tool:' + SIDEBAR_ID) livePopouts().clear()
     return next(e)
   })
 
@@ -222,31 +231,43 @@ export function register(on: On, options: PluginOptions) {
     const room = await $.sidebar.room({})
     if (room === null) return tree
     const { Client } = $.ui.resolve(e)
-    const list = (key: string, requests: readonly Request[], columns: number, rows: number) => {
-      const entries: RequestEntry[] = requests.map(r => ({ ...r, length: [...(held.get(r.id) ?? '')].length }))
+    const list = (key: string, shown: readonly Request[], columns: number, rows: number) => {
+      const entries: RequestEntry[] = shown.map(r => ({ ...r, length: [...(held.get(r.id) ?? '')].length }))
       const message = notice === null ? null : notice.text
-      // A card short of the room: its bottom edge isn't always on screen.
-      const height = Math.min(layout(entries, columns, message).length, rows - tallestCard(entries, columns))
-      const props: RequestsProps = { entries, focusEpoch, applied, message, rows: height }
+      const height = listHeight(entries, columns, message, rows)
+      const props: RequestsProps = { entries, focusEpoch, applied, message, columns, rows: height }
       return Client({ key, module: './requests.ts', props, width: columns, height })
     }
     let filled = tree
     if (inDrawer) {
-      filled = fillSlot(filled, DRAWER_SLOT, () =>
-        list('requests', asks, DRAWER_COLUMNS - DRAWER_FRAME_COLUMNS, room.drawer),
-      ) as typeof tree
+      filled = fillSlot(filled, DRAWER_SLOT, () => list(LIST_KEY, requests, DRAWER_COLUMNS - room.drawerFrameColumns, room.drawer)) as typeof tree
     }
     if (inPopout) {
-      const ids = new Set(popped().shown())
-      filled = fillSlot(filled, POPOUT_SLOT, () =>
-        list('popout', asks.filter(a => ids.has(a.id)), DRAWER_COLUMNS, room.popout),
-      ) as typeof tree
+      const ids = new Set(livePopouts().shown())
+      filled = fillSlot(filled, POPOUT_SLOT, () => list(POPOUT_KEY, requests.filter(r => ids.has(r.id)), DRAWER_COLUMNS, room.popout)) as typeof tree
     }
     return filled
   })
 }
 
-async function readRelay($: EngineInterface, socket: string) {
+/** Starts the relay; resolves once it listens. A later failure shows in the list. */
+function startRelay($: EngineInterface, socket: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let isReady = false
+    const timer = $.clock.after(RELAY_START_MS, () => reject(new Error(`secrets: the relay didn't start within ${RELAY_START_MS} ms`)))
+    readRelay($, socket, () => {
+      isReady = true
+      timer.cancel()
+      resolve()
+    }).catch((error: Error) => {
+      timer.cancel()
+      if (isReady) say($, `Requests stopped: ${error.message}`, true)
+      else reject(error)
+    })
+  })
+}
+
+async function readRelay($: EngineInterface, socket: string, ready: () => void) {
   const relay = $.process.spawn({ argv: ['python3', '-I', $.plugin.root + '/bin/relay.py', socket] })
   let buffered = ''
   for await (const chunk of relay) {
@@ -260,27 +281,30 @@ async function readRelay($: EngineInterface, socket: string) {
       const event = JSON.parse(buffered.slice(0, newline)) as RelayEvent
       buffered = buffered.slice(newline + 1)
       newline = buffered.indexOf('\n')
+      if ('ready' in event) {
+        ready()
+        continue
+      }
       if ('ask' in event) {
         const { id, prompt, pid, cmdline } = event.ask
-        const entry = {
-          id,
-          prompt,
-          source: sourceOf(cmdline || `pid ${pid}`, running.map(r => r.command)),
-          since: new Date().toTimeString().slice(0, 8),
-        }
-        asks = [...asks, entry]
-        if ((await $.sidebar.selected({})) !== SIDEBAR_ID) popped().add(id)
-      } else if ('gone' in event) dropAsk(event.gone)
-      else continue
-      await showWaiting($)
+        const source = sourceOf(cmdline || `pid ${pid}`, running.map(r => r.command))
+        await addRequest($, { id, prompt, source, since: clockTime() })
+      } else dropRequest(event.gone)
+      await syncBadge($)
       if ('ask' in event) await $.ui.notify(`Password needed: ${event.ask.prompt}`, { title: 'secrets' })
     }
   }
   throw new Error('the relay exited')
 }
 
-async function answerAsk($: EngineInterface, id: string, answer: { secret: string } | { cancel: true }) {
-  if (relaySocket === null) throw new Error('secrets: answered an ask before the relay started')
+/** Lists the request; it pops out unless the list is open. */
+async function addRequest($: EngineInterface, request: Request) {
+  requests = [...requests, request]
+  if ((await $.sidebar.selected({})) !== SIDEBAR_ID) livePopouts().add(request.id)
+}
+
+async function answerRequest($: EngineInterface, id: string, answer: { secret: string } | { cancel: true }) {
+  if (relaySocket === null) throw new Error('secrets: answered a request before the relay started')
   let reply: Awaited<ReturnType<EngineInterface['http']['fetch']>>
   try {
     reply = await $.http.fetch('http://relay/answer', {
@@ -301,26 +325,19 @@ async function answerAsk($: EngineInterface, id: string, answer: { secret: strin
     return
   }
   if (reply.status === 204 && 'secret' in answer) remember(answer.secret, maskMinLength)
-  dropAsk(id)
-  await showWaiting($)
+  dropRequest(id)
+  await syncBadge($)
 }
 
-function dropAsk(id: string) {
-  asks = asks.filter(a => a.id !== id)
+function dropRequest(id: string) {
+  requests = requests.filter(r => r.id !== id)
   held.delete(id)
-  popped().remove(id)
+  livePopouts().remove(id)
 }
 
-function maskStrings(value: any): any {
-  if (typeof value === 'string') return mask(value)
-  if (Array.isArray(value)) return value.map(maskStrings)
-  if (value === null || typeof value !== 'object') return value
-  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, maskStrings(v)]))
-}
-
-async function showWaiting($: EngineInterface) {
+/** The badge shows the waiting requests; with none left, an open list closes. */
+async function syncBadge($: EngineInterface) {
   $.ui.invalidate('ui.render')
-  const count = asks.length
-  await $.sidebar.badge({ id: SIDEBAR_ID, count, level: 'urgent' })
-  if (count === 0 && (await $.sidebar.selected({})) === SIDEBAR_ID) await $.sidebar.select({ id: null })
+  await $.sidebar.badge({ id: SIDEBAR_ID, count: requests.length, level: 'urgent' })
+  if (requests.length === 0 && (await $.sidebar.selected({})) === SIDEBAR_ID) await $.sidebar.select({ id: null })
 }

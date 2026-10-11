@@ -1,3 +1,4 @@
+const MASK = '[secret]'
 const values = new Set<string>()
 
 /** A value shorter than `minLength` characters is left unmasked: it would turn up in ordinary text. */
@@ -7,6 +8,14 @@ export function remember(value: string, minLength: number) {
 
 export function mask(text: string): string {
   let out = text
-  for (const value of values) out = out.split(value).join('[secret]')
+  for (const value of values) out = out.split(value).join(MASK)
   return out
+}
+
+/** Every string inside `value` masked, the shape kept. */
+export function maskStrings<T>(value: T): T {
+  if (typeof value === 'string') return mask(value) as T
+  if (Array.isArray(value)) return value.map(maskStrings) as T
+  if (value === null || typeof value !== 'object') return value
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, maskStrings(v)])) as T
 }

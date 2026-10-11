@@ -1,16 +1,16 @@
-export type After = (ms: number, fn: () => void) => { cancel(): void }
+import type { Timer, TimerCall } from 'claude-code'
 
 /**
  * Which requests show as pop-out cards. A shown card hides after `ms` unless
  * it holds the focus; losing the focus starts the wait again.
  */
 export class Popouts {
-  private timers = new Map<string, { cancel(): void } | null>()
+  private timers = new Map<string, Timer | null>()
   private focused: string | null = null
 
   constructor(
     private readonly ms: number,
-    private readonly after: After,
+    private readonly after: TimerCall,
     private readonly changed: () => void,
   ) {}
 
@@ -57,9 +57,6 @@ export class Popouts {
 
   private wait(id: string) {
     this.timers.get(id)?.cancel()
-    this.timers.set(
-      id,
-      this.after(this.ms, () => this.remove(id)),
-    )
+    this.timers.set(id, this.after(this.ms, () => this.remove(id)))
   }
 }

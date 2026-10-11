@@ -1,11 +1,13 @@
 """Usage: relay.py <socket-path>
 
-HTTP on a unix socket. POST /ask {prompt, pid} is held open until answered and
-prints {"ask": {id, prompt, pid, cmdline}} to stdout. POST /answer {id, secret}
-or {id, cancel: true} completes it: 200 with the secret as the body, or 403.
-A held request whose client disconnects prints {"gone": id}.
-GET /watch streams every answered value as a JSON string per line, then each
-new one, until the client disconnects.
+HTTP on a unix socket; prints {"ready": path} to stdout once it listens.
+POST /ask {prompt, pid}: prints {"ask": {id, prompt, pid, cmdline}}, then
+  holds the request until answered: 200 with the secret as the body, or 403
+  when cancelled. A client that disconnects first prints {"gone": id}.
+POST /answer {id, secret} or {id, cancel: true}: 204 taken, 410 no such ask.
+GET /watch: every answered value as a JSON string per line, then each new one,
+  until the client disconnects; 403 to any client but mask-run as Claude Code
+  starts it.
 """
 import json
 import os
@@ -13,10 +15,13 @@ import select
 import signal
 import socket
 import socketserver
+import struct
 import sys
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler
+
+MASK_RUN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mask-run')
 
 lock = threading.Lock()
 waiting = {}
@@ -46,6 +51,25 @@ def keep(secret):
                 watchers.remove(watcher)
 
 
+def is_mask_run(conn):
+    """The peer is mask-run started by Claude Code, the relay's own parent.
+
+    A command's processes run below mask-run, so none has that parent: an
+    orphan goes to init or a user subreaper, and Claude Code isn't one.
+    """
+    pid, _, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            ppid = int(f.read().rsplit(')', 1)[1].split()[1])
+        if ppid != os.getppid():
+            return False
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            script = f.read().split(b'\0')[2]
+        return os.path.samefile(os.path.join(f'/proc/{pid}/cwd', os.fsdecode(script)), MASK_RUN)
+    except (OSError, IndexError):
+        return False
+
+
 def cmdline_of(pid):
     try:
         with open(f'/proc/{pid}/cmdline', 'rb') as f:
@@ -64,6 +88,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path != '/watch':
             self.send_error(404)
+            return
+        if not is_mask_run(self.connection):
+            self.send_error(403)
             return
         self.send_response(200)
         self.end_headers()

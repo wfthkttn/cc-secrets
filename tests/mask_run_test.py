@@ -71,7 +71,7 @@ def main():
             check('no minimum set: every value is masked', out, b'[secret]')
             check('no minimum set: says so', b'SECRETS_MASK_MIN' in err, True)
 
-            split ='printf "hun"; sleep 0.3; printf "ter2 and hunt"; sleep 0.3; printf "er2\\n"'
+            split = 'printf "hun"; sleep 0.3; printf "ter2 and hunt"; sleep 0.3; printf "er2\\n"'
             run = mask_run(sock_path, split)
             out, _ = run.communicate(timeout=10)
             check('a value split across writes is masked', out, b'[secret] and [secret]\n')
@@ -99,6 +99,17 @@ def main():
             out, err = run.communicate(timeout=10)
             check('no relay: the command still runs', out, b'hunter2\n')
             check('no relay: says so', b'not masked' in err, True)
+
+            run = mask_run(sock_path, 'python3 -I -c "import http.client, os, socket; c = http.client.HTTPConnection(\'r\'); c.sock = socket.socket(socket.AF_UNIX); c.sock.connect(os.environ[\'SECRETS_RELAY\']); c.request(\'GET\', \'/watch\'); print(c.getresponse().status)"')
+            out, _ = run.communicate(timeout=10)
+            check('a command under mask-run is refused the values', out, b'403\n')
+
+            env = dict(os.environ, SECRETS_RELAY=sock_path, SECRETS_MASK_MIN='6')
+            env.pop('SECRETS_ORIG_PREFIX', None)
+            run = subprocess.Popen(['sh', '-c', '"$0" "$1"; true', os.path.join(BIN, 'mask-run'), 'echo hunter2'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            out, err = run.communicate(timeout=10)
+            check('mask-run not started by the relay\'s parent is refused', b'refused' in err, True)
+            check('and its command still runs', out, b'hunter2\n')
 
             started = time.monotonic()
             run = mask_run(sock_path, 'true')

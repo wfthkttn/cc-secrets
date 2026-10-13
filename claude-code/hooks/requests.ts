@@ -18,8 +18,8 @@ export type ListState = {
   scroll: number
   /** The selected card's menu is open. */
   isMenuOpen: boolean
-  /** The menu's highlighted option: 0 is Type, then the entries. */
-  cursor: number
+  /** The menu's highlighted option: an entry's id, null for Type; it stays on its entry when the vault changes. */
+  cursor: string | null
 }
 
 /** One screen row of the list: a message row, a request card's row, a gap, or the empty note. */
@@ -42,9 +42,10 @@ export type Frame = { columns: number; rows: number; message: string | null; typ
 
 /**
  * The open menu, a window over the rows under its card's field (above it when there is no room below): `top`
- * counts view rows, `first` is the first option shown and `shown` how many.
+ * counts view rows, `first` is the first option shown and `shown` how many, `cursor` the highlighted one (-1 when its
+ * entry went).
  */
-export type Menu = { id: string; top: number; left: number; width: number; first: number; shown: number; options: string[] }
+export type Menu = { id: string; top: number; left: number; width: number; first: number; shown: number; cursor: number; options: string[] }
 
 type Result = { state: ListState; post?: RequestsMessage }
 
@@ -76,12 +77,17 @@ function edge(side: 'top' | 'bottom', width: number): string {
 }
 
 export function initialState(focusEpoch: number, instance: string): ListState {
-  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0, isMenuOpen: false, cursor: 0 }
+  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0, isMenuOpen: false, cursor: null }
 }
 
 /** The vault entries a card may be answered with; none for a sign card or a closed vault. */
 function offerOf(entry: RequestEntry): Offered[] {
   return entry.kind === 'secret' ? (entry.offer ?? []) : []
+}
+
+/** The menu's options as the cursor names them: null for Type, then the entries' ids. */
+function optionIds(entry: RequestEntry): (string | null)[] {
+  return [null, ...offerOf(entry).map(o => o.id)]
 }
 
 /** The entry the card's field holds, with this instance's unconfirmed menu choices on top; null while it takes typing. */
@@ -253,9 +259,10 @@ export function menuOf(entries: RequestEntry[], frame: Frame, state: ListState):
   const height = menuHeight(options.length)
   const below = fieldTop + 3
   const top = below + height <= frame.rows || fieldTop - height < 0 ? below : fieldTop - height
-  const first = Math.max(0, Math.min(options.length - MENU_ROWS, state.cursor - MENU_ROWS + 1))
+  const cursor = optionIds(entry).indexOf(state.cursor)
+  const first = Math.max(0, Math.min(options.length - MENU_ROWS, cursor - MENU_ROWS + 1))
   const { fieldColumns } = geometry(frame.columns)
-  return { id: entry.id, top, left: CARD_EDGE, width: fieldColumns, first, shown: Math.min(options.length, MENU_ROWS), options }
+  return { id: entry.id, top, left: CARD_EDGE, width: fieldColumns, first, shown: Math.min(options.length, MENU_ROWS), cursor, options }
 }
 
 /** The scroll that shows the card whole, or from its top when it is taller than the window. */
@@ -278,9 +285,7 @@ function selectCard(state: ListState, entries: RequestEntry[], frame: Frame, id:
 
 /** Opens the card's menu on what its field holds now, the card scrolled into view. */
 function openMenu(state: ListState, entries: RequestEntry[], frame: Frame, entry: RequestEntry): Result {
-  const chosen = choiceOf(entry, state.pending)
-  const cursor = chosen === null ? 0 : offerOf(entry).findIndex(o => o.id === chosen.id) + 1
-  const opened = { ...state, selected: entry.id, isFocused: true, isMenuOpen: true, cursor }
+  const opened = { ...state, selected: entry.id, isFocused: true, isMenuOpen: true, cursor: choiceOf(entry, state.pending)?.id ?? null }
   return { state: { ...opened, scroll: reveal(entries, frame, opened, entry.id) }, post: postOf(state, entry.id) }
 }
 
@@ -311,14 +316,16 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   const offer = offerOf(entry)
   const isEnter = k.key === 'return' || k.key === '\n'
   if (state.isMenuOpen) {
-    if (menuOf(entries, frame, state) === null) state = { ...state, isMenuOpen: false }
-    else {
-      if (k.key === 'up') return { state: { ...state, cursor: Math.max(0, state.cursor - 1) } }
-      if (k.key === 'down') return { state: { ...state, cursor: Math.min(offer.length, state.cursor + 1) } }
-      if (isEnter) return choose(state, entry, state.cursor)
-      if (k.key === 'tab') return { state: { ...state, isMenuOpen: false } }
-      return { state }
-    }
+    const menu = menuOf(entries, frame, state)
+    // A menu no longer drawn takes the key that finds it gone, rather than let it act on a card unseen.
+    if (menu === null) return { state: { ...state, isMenuOpen: false } }
+    const ids = optionIds(entry)
+    // With the highlighted entry gone, an arrow starts again from Type.
+    if (k.key === 'up') return { state: { ...state, cursor: ids[Math.max(0, menu.cursor - 1)]! } }
+    if (k.key === 'down') return { state: { ...state, cursor: ids[menu.cursor < 0 ? 0 : Math.min(offer.length, menu.cursor + 1)]! } }
+    if (isEnter) return menu.cursor < 0 ? { state } : choose(state, entry, menu.cursor)
+    if (k.key === 'tab') return { state: { ...state, isMenuOpen: false } }
+    return { state }
   }
   // Escape never reaches a Client and ↑/↓ move between cards, so Tab opens the menu.
   if (k.key === 'tab' && offer.length > 0) return openMenu(state, entries, frame, entry)
@@ -524,7 +531,7 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
             children: [
               Text({ color: 'claude', children: [edge('top', menu.width)] }),
               ...menu.options.slice(menu.first, menu.first + menu.shown).map((option, i) => {
-                const isCursor = menu.first + i === state.cursor
+                const isCursor = menu.first + i === menu.cursor
                 return Box({
                   flexDirection: 'row',
                   children: [
@@ -544,7 +551,7 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
                       flexDirection: 'row',
                       children: [
                         Text({ color: 'claude', children: ['│'] }),
-                        Text({ backgroundColor: FIELD_BACKGROUND, dimColor: true, children: [pad(`   ${state.cursor + 1} of ${menu.options.length}, ↑/↓`, menu.width - 2)] }),
+                        Text({ backgroundColor: FIELD_BACKGROUND, dimColor: true, children: [pad(`   ${menu.cursor < 0 ? '–' : menu.cursor + 1} of ${menu.options.length}, ↑/↓`, menu.width - 2)] }),
                         Text({ color: 'claude', children: ['│'] }),
                       ],
                     }),

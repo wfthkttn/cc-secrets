@@ -22,6 +22,8 @@ struct Relay {
     socket: PathBuf,
     /// The vault state the relay started with.
     vault: String,
+    /// The helpers it pinned, as the hooks run them.
+    bin: PathBuf,
 }
 
 /// A data dir of the test's own, so no test touches the user's vault.
@@ -55,7 +57,8 @@ impl Relay {
         let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
         assert!(ready["ready"].is_string(), "{ready}");
         let vault = ready["vault"].as_str().unwrap().to_owned();
-        Self { child, events, socket, vault }
+        let bin = PathBuf::from(ready["bin"].as_str().unwrap());
+        Self { child, events, socket, vault, bin }
     }
 
     fn raw_event(&mut self) -> serde_json::Value {
@@ -64,11 +67,12 @@ impl Relay {
         serde_json::from_str(&line).unwrap()
     }
 
-    /// The next event but `{"masked": true}`, which comes whenever masking first finds something.
+    /// The next event but `{"masked": true}`, which comes whenever masking first finds something, and `{"masking":
+    /// …}`, which comes whenever values to mask come or go.
     fn next_event(&mut self) -> serde_json::Value {
         loop {
             let event = self.raw_event();
-            if event != serde_json::json!({ "masked": true }) {
+            if event != serde_json::json!({ "masked": true }) && event.get("masking").is_none() {
                 return event;
             }
         }
@@ -121,7 +125,7 @@ impl Relay {
 
     /// `secrets` with `args`, run straight from the relay's parent: outside any call.
     fn secrets(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(SECRETS);
+        let mut command = Command::new(self.bin.join("secrets"));
         command.args(args).env("SECRETS_RELAY", &self.socket).stdout(Stdio::piped()).stderr(Stdio::piped());
         command
     }
@@ -137,10 +141,10 @@ impl Relay {
 
     /// A call as Claude Code runs it: `$SECRETS` is the `secrets` command.
     fn mask_run(&self, command: &str) -> Command {
-        let mut run = Command::new(MASK_RUN);
+        let mut run = Command::new(self.bin.join("secrets-mask-run"));
         run.arg(command)
             .env("SECRETS_RELAY", &self.socket)
-            .env("SECRETS", SECRETS)
+            .env("SECRETS", self.bin.join("secrets"))
             .env_remove("SECRETS_ORIG_PREFIX")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -155,10 +159,23 @@ impl Relay {
     }
 }
 
-impl Drop for Relay {
-    fn drop(&mut self) {
+impl Relay {
+    /// Ends it as Claude Code does, with SIGTERM, so it removes what it made; killed if it doesn't end soon.
+    fn stop(&mut self) {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(self.child.id()).unwrap()).unwrap();
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.stop();
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -196,7 +213,12 @@ fn a_value_typed_mid_command_is_masked_on_both_streams_and_the_status_passes_thr
     assert_eq!(stdout(&out), "got [secret]\n");
     assert_eq!(String::from_utf8_lossy(&out.stderr), "[secret]");
     assert_eq!(out.status.code(), Some(3));
-    assert_eq!(relay.raw_event(), serde_json::json!({ "masked": true }));
+    let told: Vec<_> = (0..3).map(|_| relay.raw_event()).collect();
+    assert_eq!(
+        told,
+        [serde_json::json!({ "masking": true }), serde_json::json!({ "masked": true }), serde_json::json!({ "masking": false })],
+        "the hooks mask while the typed value's call runs"
+    );
 }
 
 #[test]
@@ -257,6 +279,7 @@ fn the_relay_ends_when_its_parent_goes() {
         "the orphaned relay still runs: {:?}",
         std::fs::read_to_string(alive.join("stat"))
     );
+    assert!(!PathBuf::from(format!("{}.bin", socket.display())).exists(), "its helper copies are gone");
 }
 
 /// Kills a process by pid when dropped, so a failing test leaves nothing running.
@@ -402,14 +425,66 @@ fn without_a_relay_the_command_still_runs_and_says_so() {
 }
 
 #[test]
-fn only_mask_run_started_by_the_relays_parent_gets_a_filter() {
+fn a_refused_mask_run_runs_only_under_another_one() {
     let mut relay = Relay::start("peer");
     let nested = format!(r#"x=$("$SECRETS" ask t5); '{MASK_RUN}' "echo $x""#);
     let child = relay.mask_run(&nested).spawn().unwrap();
     assert_eq!(relay.answer_next("hunter2"), "204");
     let out = child.wait_with_output().unwrap();
-    assert_eq!(stdout(&out), "[secret]\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("refused"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!((stdout(&out), String::from_utf8_lossy(&out.stderr).into_owned()), ("[secret]\n".to_owned(), String::new()));
+
+    let data = data_dir("peer");
+    let touched = data.join("ran");
+    std::fs::create_dir_all(&data).unwrap();
+    // The relay's parent starts it, but it isn't the helper the relay pinned.
+    let out = Command::new(MASK_RUN).arg(format!("touch '{}'", touched.display())).env("SECRETS_RELAY", &relay.socket).output().unwrap();
+    assert_eq!(out.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("did not run"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!touched.exists());
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn helpers_in_a_tree_that_can_change_are_copies_removed_when_the_relay_ends() {
+    let mut relay = Relay::start("pinned");
+    let built = Path::new(MASK_RUN).parent().unwrap();
+    assert_eq!(relay.bin, PathBuf::from(format!("{}.bin", relay.socket.display())));
+    for helper in ["secrets-mask-run", "secrets", "secrets-askpass"] {
+        assert_eq!(std::fs::read(relay.bin.join(helper)).unwrap(), std::fs::read(built.join(helper)).unwrap(), "{helper}");
+    }
+    assert_eq!(stdout(&run(relay.mask_run("echo pinned"))), "pinned\n");
+    relay.stop();
+    assert!(!relay.bin.exists());
+}
+
+#[test]
+fn a_running_call_masks_what_another_session_saves_meanwhile() {
+    let data = data_dir("watched");
+    let mut first = Relay::start_in("watched-a", &data);
+    let second = Relay::start_in("watched-b", &data);
+    first.create_vault("pass phrase");
+    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "pass phrase" })), "204");
+    let running = first.mask_run("sleep 1; echo value-late-1").spawn().unwrap();
+    let add = serde_json::json!({ "op": "add", "name": "Late", "tag": "late", "kind": "password", "use": "session", "value": "value-late-1" });
+    assert_eq!(post(&second.socket, "/vault", &add), "200");
+    assert_eq!(stdout(&running.wait_with_output().unwrap()), "[secret]\n");
+    drop((first, second));
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn an_ask_names_the_calls_running_through_the_relay() {
+    let mut relay = Relay::start("live");
+    let other = relay.mask_run("sleep 1").spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let asking = relay.mask_run(r#""$SECRETS" ask t6 > /dev/null"#).spawn().unwrap();
+    let ask = relay.next_ask();
+    let live: Vec<&str> = ask["live"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+    assert_eq!(live.len(), 2, "{ask}");
+    assert!(live.iter().any(|l| l.ends_with("sleep 1")) && live.contains(&ask["cmdline"].as_str().unwrap()), "{ask}");
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "cancel": true })), "204");
+    asking.wait_with_output().unwrap();
+    other.wait_with_output().unwrap();
 }
 
 #[test]

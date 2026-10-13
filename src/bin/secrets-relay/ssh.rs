@@ -83,8 +83,11 @@ async fn reply(stream: &mut UnixStream, ctx: &Context, peer: Option<i32>, body: 
 /// Signs with a vault key once the hooks give it.
 async fn sign_with(stream: &mut UnixStream, ctx: &Context, peer: Option<i32>, entry: &Entry, key: &ssh_key::PrivateKey, data: &[u8], flags: u32) -> Vec<u8> {
     let by = peer::requester(peer, &ctx.mask_run);
-    let allowed = lock(ctx).vault.is_allowed(&entry.id);
-    let event = json!({ "tag": entry.tag, "name": entry.name, "kind": entry.kind, "use": entry.use_, "allowed": allowed, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside });
+    let (allowed, live) = {
+        let state = lock(ctx);
+        (state.vault.is_allowed(&entry.id), state.filter.live())
+    };
+    let event = json!({ "tag": entry.tag, "name": entry.name, "kind": entry.kind, "use": entry.use_, "allowed": allowed, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live });
     let decision = decide(stream, ctx, "sign", event).await;
     if decision == Some(Decision::Session) {
         let mut state = lock(ctx);

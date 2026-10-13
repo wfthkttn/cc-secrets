@@ -1,17 +1,18 @@
 //! Usage: secrets-relay <socket-path>
 //!
 //! HTTP/1.0 on a unix socket (mode 0600); prints events to stdout as JSON lines, the first `{"ready": path,
-//! "vault": "absent" | "locked", "bin": dir}` once it listens, `bin` being the resolved directory of its helpers, the
-//! only `secrets-mask-run` it serves. The vault lives at `$XDG_DATA_HOME/secrets/vault`. It ends on SIGTERM and when
-//! its parent goes.
+//! "vault": "absent" | "locked", "bin": dir}` once it listens, `bin` being the directory of the helpers it pins
+//! (`pinned`), its `secrets-mask-run` the only one it serves. The vault lives at `$XDG_DATA_HOME/secrets/vault`. It
+//! ends on SIGTERM and when its parent goes.
 //!
 //! For commands; `pid` and `cmdline` in the events name the requester by its peer credentials: the
-//! `secrets-mask-run` it runs under (`inside: true`), else the requesting process itself:
-//! - `POST /ask {prompt, tag?}`: prints `{"ask": {id, prompt, tag, entry, pid, cmdline, inside}}`, `entry` being
-//!   the open vault's entry tagged `tag` (no value) or null, then holds the request until answered: 200 with the
-//!   value, 403 when cancelled. A client that hangs up first prints `{"gone": id}`.
-//! - `POST /list`: 403 while the vault is closed; else prints `{"list": {id, pid, cmdline, inside}}` and waits for
-//!   a decision: 200 with the entries as JSON (no values), 403 refused.
+//! `secrets-mask-run` it runs under (`inside: true`), else the requesting process itself; `live` lists the command
+//! lines of the calls whose output runs through the relay then:
+//! - `POST /ask {prompt, tag?}`: prints `{"ask": {id, prompt, tag, entry, pid, cmdline, inside, live}}`, `entry`
+//!   being the open vault's entry tagged `tag` (no value) or null, then holds the request until answered: 200 with
+//!   the value, 403 when cancelled. A client that hangs up first prints `{"gone": id}`.
+//! - `POST /list`: 403 while the vault is closed; else prints `{"list": {id, pid, cmdline, inside, live}}` and waits
+//!   for a decision: 200 with the entries as JSON (no values), 403 refused.
 //! - `POST /filter`: for `secrets-mask-run` as Claude Code starts it, 403 to anyone else; a call's output stream
 //!   (`secrets::filter`), masked with what that call was handed and the open vault's values.
 //!
@@ -27,7 +28,8 @@
 //!   entry one of the texts carries, or null.
 //!
 //! `{"vault": state}` is printed after each change to the vault; `{"masked": true}` the first time anything was
-//! masked; `{"trouble": text}` when the vault can't be written.
+//! masked; `{"masking": bool}` when `/mask` starts or stops having values to mask; `{"trouble": text}` when the vault
+//! can't be written.
 //!
 //! `<socket-path>.agent` is an ssh-agent offering the open vault's ssh keys (`ssh.rs`).
 
@@ -62,6 +64,8 @@ const PARENT_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 const COSTS: Costs = Costs { memory_kib: 65536, time: 3, lanes: 1 };
 /// Masking's shortest value until the hooks send theirs.
 const MASK_MIN: usize = 6;
+/// What runs from `bin`: the shell prefix, the CLI on PATH, the askpass.
+const HELPERS: [&str; 3] = ["secrets-mask-run", "secrets", "secrets-askpass"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -90,9 +94,27 @@ struct Context {
 
 type Shared = Arc<Context>;
 
+/// Events wait here for the one thread that prints them, so a pipe the hooks don't drain stalls no request, stream
+/// or held vault lock.
+static EVENTS: Mutex<Option<std::sync::mpsc::Sender<String>>> = Mutex::new(None);
+
 fn emit(event: &serde_json::Value) {
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{event}").and_then(|()| out.flush());
+    if let Some(events) = EVENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+        let _ = events.send(event.to_string());
+    }
+}
+
+fn start_printing() {
+    let (events, printed) = std::sync::mpsc::channel::<String>();
+    *EVENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(events);
+    std::thread::spawn(move || {
+        let mut out = std::io::stdout().lock();
+        for event in printed {
+            if writeln!(out, "{event}").and_then(|()| out.flush()).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 fn note(message: &str) {
@@ -116,8 +138,9 @@ struct Head {
 }
 
 async fn read_head(stream: &mut UnixStream) -> Option<Head> {
-    let mut raw = Zeroizing::new(Vec::new());
     let mut buf = Zeroizing::new([0u8; 4096]);
+    // Sized for the largest head up front: a growing Vec would leave unwiped copies behind.
+    let mut raw = Zeroizing::new(Vec::with_capacity(HEAD_MAX + buf.len()));
     let head_end = loop {
         if let Some(end) = memchr::memmem::find(&raw, b"\r\n\r\n") {
             break end;
@@ -142,10 +165,12 @@ async fn read_head(stream: &mut UnixStream) -> Option<Head> {
 }
 
 async fn read_body(stream: &mut UnixStream, head: Head) -> Option<Zeroizing<Vec<u8>>> {
-    let mut body = head.started;
+    let mut body = Zeroizing::new(Vec::with_capacity(head.length.max(head.started.len())));
+    body.extend_from_slice(&head.started);
     let mut buf = Zeroizing::new([0u8; 4096]);
     while body.len() < head.length {
-        let n = stream.read(buf.as_mut()).await.ok().filter(|n| *n > 0)?;
+        let wanted = buf.len().min(head.length - body.len());
+        let n = stream.read(buf.get_mut(..wanted)?).await.ok().filter(|n| *n > 0)?;
         body.extend_from_slice(buf.get(..n)?);
     }
     body.truncate(head.length);
@@ -266,7 +291,32 @@ fn vault_path() -> Option<PathBuf> {
     Some(data.join("secrets").join("vault"))
 }
 
+/// A directory removed, with what it holds, when the relay ends.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The helpers this session's commands run: those beside the relay where nothing can change them (a read-only
+/// filesystem, the Nix store), else copies in `copies`, so a rebuild in a working copy doesn't swap them under it.
+/// The `secrets-mask-run` among them.
+fn pinned(mask_run: &std::path::Path, copies: &std::path::Path) -> std::io::Result<PathBuf> {
+    let Some(dir) = mask_run.parent() else { return Ok(mask_run.to_owned()) };
+    if rustix::fs::statvfs(dir).is_ok_and(|fs| fs.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY)) {
+        return Ok(mask_run.to_owned());
+    }
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700).create(copies)?;
+    for helper in HELPERS {
+        std::fs::copy(dir.join(helper), copies.join(helper))?;
+    }
+    std::fs::canonicalize(copies.join("secrets-mask-run"))
+}
+
 fn main() -> ExitCode {
+    start_printing();
     let parent = rustix::process::getppid();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [path] = args.as_slice() else {
@@ -281,6 +331,14 @@ fn main() -> ExitCode {
         Ok(path) => path,
         Err(error) => {
             note(&format!("can't find secrets-mask-run beside this binary: {error}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let copies = Removed(PathBuf::from(format!("{path}.bin")));
+    let mask_run = match pinned(&mask_run, &copies.0) {
+        Ok(path) => path,
+        Err(error) => {
+            note(&format!("can't copy the helpers to {}: {error}", copies.0.display()));
             return ExitCode::FAILURE;
         }
     };
@@ -320,6 +378,7 @@ fn main() -> ExitCode {
         emit(&json!({ "ready": path, "vault": vault.shown(), "bin": bin }));
         let state = State { pass: pass::Pass::default(), deciding: HashMap::new(), vault, filter: filter::Filter::new(MASK_MIN), forward: false };
         let ctx = Arc::new(Context { state: Mutex::new(state), mask_run, vault_path, upstream });
+        tokio::spawn(locker::watch(Arc::clone(&ctx)));
         let mut parent_check = tokio::time::interval(PARENT_CHECK);
         loop {
             tokio::select! {

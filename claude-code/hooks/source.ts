@@ -27,12 +27,19 @@ type Granted = { allowed: boolean; use: 'session' | 'each' }
 
 /**
  * The Bash call a requester runs in. Only one `inside` the session is matched: its command line is the one Claude
- * Code ran. Calls of different loops running the same command can't be told apart: `unknown`.
+ * Code ran. The same command in the main loop and a subagent can't be told apart: `unknown`; in subagents only, it is
+ * a subagent's either way.
  */
 function callFor(requester: Requester, calls: Calls): Call | 'unknown' | undefined {
   if (!requester.inside || requester.cmdline === '') return undefined
   const matches = matchesOf(requester.cmdline, calls)
-  return new Set(matches.map(c => c.agentId)).size > 1 ? 'unknown' : matches[0]
+  const loops = new Set(matches.map(c => c.agentId))
+  return loops.size > 1 && loops.has(undefined) ? 'unknown' : matches[0]
+}
+
+/** Whether a `secrets-mask-run` command line (Bash's wrapper) runs `command`. */
+export function runsIn(cmdline: string, command: string): boolean {
+  return cmdline.replace(QUOTED_QUOTE, "'").includes(command)
 }
 
 /**

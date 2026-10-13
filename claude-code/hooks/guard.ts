@@ -1,8 +1,10 @@
 /**
- * Calls of this plugin that carry secrets as they cross to the host: every hook on them, in any plugin, sees them
- * (relay requests with the passphrase and typed values, the relay's start, the shell prefix that turns masking on).
+ * Where a plugin's hooks see secrets: calls of this plugin as they cross to the host, which every hook on them in any
+ * plugin sees (relay requests with the passphrase and typed values, the relay's start, the shell prefix that turns
+ * masking on); `tool.call`, whose hooks beneath this plugin's get a tool's result before it is masked; and
+ * `classic.PostToolUse`, which fires inside the tool's run with its raw result.
  */
-export const CARRIERS = ['http.fetch', 'process.spawn', 'env.set'] as const
+export const CARRIERS = ['http.fetch', 'process.spawn', 'env.set', 'tool.call', 'classic.PostToolUse'] as const
 
 /** Whether an `on(...)` pattern (a name, `*`, `namespace.*`, or `!` before either) selects `event`. */
 export function selects(pattern: string, event: string): boolean {

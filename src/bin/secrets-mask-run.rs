@@ -2,9 +2,10 @@
 //!
 //! Runs the invocation with `/bin/sh -c`, or through `$SECRETS_ORIG_PREFIX` when set, passing its stdout and
 //! stderr through the relay at `$SECRETS_RELAY`, which masks them (`secrets::filter`); this process holds no values.
-//! Exits with the command's status, 128 + the signal when a signal ended it. Without a relay, or refused by it, the
-//! command still runs; one line on stderr says its output is unmasked. A relay that goes away mid-call may have handed
-//! the call a value, so the rest of its output is withheld; the command runs on.
+//! Exits with the command's status, 128 + the signal when a signal ended it. Without a relay the command still runs;
+//! one line on stderr says its output is unmasked. Refused by the relay, it runs only under another mask-run, which
+//! masks its output; otherwise it exits 126 without running it. A relay that goes away mid-call may have handed the
+//! call a value, so the rest of its output is withheld; the command runs on.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -30,22 +31,31 @@ struct Filter {
     stream: UnixStream,
 }
 
+enum Unfiltered {
+    /// No relay answers: nothing was handed out through it.
+    Unreachable(String),
+    /// A relay answers and won't filter this process: it isn't the call Claude Code started.
+    Refused(String),
+}
+
 impl Filter {
     /// Opens the stream; once this returns, the relay knows the call, so a value handed to it is masked.
-    fn connect(path: &std::ffi::OsStr) -> Result<Self, String> {
-        let mut stream = UnixStream::connect(path).map_err(|e| format!("no secrets relay ({e})"))?;
-        stream.write_all(b"POST /filter HTTP/1.0\r\nContent-Length: 0\r\n\r\n").map_err(|e| format!("the secrets relay can't be reached ({e})"))?;
+    fn connect(path: &std::ffi::OsStr) -> Result<Self, Unfiltered> {
+        let mut stream = UnixStream::connect(path).map_err(|e| Unfiltered::Unreachable(format!("no secrets relay ({e})")))?;
+        stream
+            .write_all(b"POST /filter HTTP/1.0\r\nContent-Length: 0\r\n\r\n")
+            .map_err(|e| Unfiltered::Unreachable(format!("the secrets relay can't be reached ({e})")))?;
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
             if head.len() > HEAD_MAX || stream.read_exact(&mut byte).is_err() {
-                return Err("the secrets relay sent no answer".to_owned());
+                return Err(Unfiltered::Unreachable("the secrets relay sent no answer".to_owned()));
             }
             head.extend_from_slice(&byte);
         }
         let status = head.split(|b| *b == b' ').nth(1).unwrap_or_default();
         if status != b"200" {
-            return Err(format!("the secrets relay refused this process ({})", String::from_utf8_lossy(status)));
+            return Err(Unfiltered::Refused(format!("the secrets relay refused this process ({})", String::from_utf8_lossy(status))));
         }
         Ok(Self { stream })
     }
@@ -197,6 +207,27 @@ fn copy(outputs: &mut [Output; 2], mut filter: Option<Filter>) {
     }
 }
 
+/// Another `secrets-mask-run` is among this process's ancestors.
+fn under_mask_run() -> bool {
+    let parent_of = |pid: i32| -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+    };
+    let mut at = rustix::process::getppid().map_or(0, Pid::as_raw_pid);
+    for _ in 0..64 {
+        if at <= 1 {
+            return false;
+        }
+        let exe = std::fs::read_link(format!("/proc/{at}/exe"));
+        if exe.is_ok_and(|exe| exe.file_name().is_some_and(|name| name == "secrets-mask-run")) {
+            return true;
+        }
+        let Some(parent) = parent_of(at) else { return false };
+        at = parent;
+    }
+    false
+}
+
 fn main() -> ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let [invocation] = args.as_slice() else {
@@ -207,7 +238,17 @@ fn main() -> ExitCode {
     let relay = std::env::var_os("SECRETS_RELAY").filter(|p| !p.is_empty());
     let filter = match relay.as_deref().map(Filter::connect) {
         Some(Ok(filter)) => filter,
-        Some(Err(reason)) => {
+        // A command a masked call started (a nested Claude Code session): its output goes through that call's.
+        Some(Err(Unfiltered::Refused(_))) if under_mask_run() => {
+            let error = command.exec();
+            note(&format!("can't run the command: {error}"));
+            return ExitCode::from(127);
+        }
+        Some(Err(Unfiltered::Refused(reason))) => {
+            note(&format!("{reason}, and nothing else masks its output, so the command did not run"));
+            return ExitCode::from(126);
+        }
+        Some(Err(Unfiltered::Unreachable(reason))) => {
             note(&format!("{reason}; this output is not masked"));
             let error = command.exec();
             note(&format!("can't run the command: {error}"));

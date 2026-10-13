@@ -9,7 +9,7 @@ import { Popouts } from './popouts'
 import { listHeight } from './requests'
 import type { Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { fillSlot, hasSlot } from './slot'
-import { askDecision, listDecision, requestSource, signDecision } from './source'
+import { askDecision, listDecision, requestSource, runsIn, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
 import type { Collision, SecretField, Suggestion, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
@@ -42,9 +42,11 @@ const ROW_COMPONENTS = [
 ] as const satisfies readonly SidebarRowComponent[]
 
 type Granted = { id: string; name: string; tag: string; kind: string; use: 'session' | 'each'; allowed: boolean }
-type Asked = { id: string; prompt: string; tag: string | null; entry: Granted | null; pid: number; cmdline: string; inside: boolean }
-type Sign = Omit<Granted, 'id'> & { id: string; pid: number; cmdline: string; inside: boolean }
-type VaultList = { id: string; pid: number; cmdline: string; inside: boolean }
+/** Who asks, and `live`: the command lines of the calls whose output runs through the relay then. */
+type Requester = { pid: number; cmdline: string; inside: boolean; live: string[] }
+type Asked = Requester & { id: string; prompt: string; tag: string | null; entry: Granted | null }
+type Sign = Omit<Granted, 'id'> & Requester & { id: string }
+type VaultList = Requester & { id: string }
 type VaultState = 'absent' | 'locked' | 'open'
 type VaultEntry = ViewEntry & { created: number }
 type Decision = 'give' | 'session' | 'refuse'
@@ -57,6 +59,7 @@ type RelayEvent =
   | { list: VaultList }
   | { vault: VaultState }
   | { masked: true }
+  | { masking: boolean }
   | { trouble: string }
 
 /** A vault entry a card may be answered with, and its tag, which a request may name. */
@@ -72,8 +75,15 @@ type Request = Omit<RequestEntry, 'length' | 'offer' | 'chosen'> & { pick: 'vaul
 let requests: readonly Request[] = []
 /** Each request's menu choice, an entry's id or null for typing; unset, its field holds the entry its tag names. */
 const choices = new Map<string, string | null>()
+type Call = { id: string; command: string; agentId: string | undefined }
 /** Bash calls in flight, for a request's source command and the loop that made it. */
-const running: { id: string; command: string; agentId: string | undefined }[] = []
+const running: Call[] = []
+/** Bash calls whose command runs on in the background after their result; kept while the relay still filters one. */
+let lingering: readonly Call[] = []
+/** The relay has values to mask (the open vault's, or one typed for a running call): tool results go through `/mask`. */
+let masking = false
+/** Collision decisions, one at a time: each reads a stored list and writes it back. */
+let deciding: Promise<void> = Promise.resolve()
 /** What the relay last said of the vault; entries and suggestions carry no values. */
 let vault: { state: VaultState; entries: readonly VaultEntry[]; suggestions: readonly Suggestion[]; forward: boolean | null } = {
   state: 'absent',
@@ -187,10 +197,11 @@ export function register(on: On) {
     if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
       return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (Refuse in the Vault tab)` }
     }
-    if (!(await storedList($, 'allowedPlugins')).includes(allowKey(e.name, e.uses.events))) {
-      collisions = [...collisions, { name: e.name, carriers, refused: false, events: e.uses.events }]
-    }
-    return next(e)
+    const isAllowed = (await storedList($, 'allowedPlugins')).includes(allowKey(e.name, e.uses.events))
+    const decided = await next(e)
+    // A judge beneath may still refuse it: only a plugin that loads collides.
+    if (decided.allow === true && !isAllowed) collisions = [...collisions, { name: e.name, carriers, refused: false, events: e.uses.events }]
+    return decided
   }).catch(($, e, next) => (next.called ? next(e) : { refuse: "secrets couldn't check what it hooks" }))
 
   on('session.start', async ($, e, next) => {
@@ -220,7 +231,9 @@ export function register(on: On) {
     const relay = await startRelay($, socket, upstream)
     vault = { state: relay.state, entries: [], suggestions: [], forward: upstream === '' ? null : false }
     await sendSettings($)
-    if (upstream !== '' && forwardAtStart) {
+    // After a reload, the session's own switch in the Config tab stands, not the start setting.
+    const switched = (await $.state.get({ plugin: 'secrets', key: 'forward' })).value
+    if (upstream !== '' && (switched ?? forwardAtStart)) {
       const refused = await relayChange($, { op: 'forward', on: true })
       if (refused !== null) throw new Error(`secrets: the relay didn't forward to your ssh-agent: ${refused}`)
       vault = { ...vault, forward: true }
@@ -268,16 +281,18 @@ export function register(on: On) {
       e.tool === 'Write' ? e.content : e.tool === 'Edit' ? e.new_string : e.tool === 'NotebookEdit' ? e.new_source : e.tool === 'Bash' ? e.command : null
     if (written !== null && hasMasked && holdsMask(written)) return { deny: WRITE_BACK }
     if (e.tool !== 'Bash') {
-      const result = await next(e)
-      // Masking would send the raw result through http.fetch, where a colliding plugin reads it.
-      if (vault.state === 'open' && collisions.length > 0 && stringsIn(result).length > 0) {
-        return { deny: `secrets: this result is withheld while ${collisions.map(c => c.name).join(', ')} could read it on its way to masking; see the Vault tab` }
+      // A colliding plugin reads the raw result: its tool.call hook beneath this one while the tool runs, or its
+      // http.fetch hook on the way to masking. Withholding the result afterwards would undo neither.
+      if (masking && collisions.length > 0) {
+        return { deny: `secrets: ${e.tool} is off while ${collisions.map(c => c.name).join(', ')} could read its result before masking; see the Vault tab` }
       }
-      return maskResult($, result)
+      return maskResult($, await next(e))
     }
-    running.push({ id: e.tool_use_id, command: e.command, agentId: e.agentId })
+    const call = { id: e.tool_use_id, command: e.command, agentId: e.agentId }
+    running.push(call)
     try {
       const result = await next(e)
+      if (runsOn(result)) lingering = [...lingering, call]
       // secrets-mask-run masked Bash output already; the extra pass through http.fetch waits until no plugin could read it.
       return collisions.length > 0 ? result : maskResult($, result)
     } finally {
@@ -543,12 +558,15 @@ async function readRelay($: EngineInterface, socket: string, upstream: string, r
       const event = JSON.parse(buffered.slice(0, newline)) as RelayEvent
       buffered = buffered.slice(newline + 1)
       newline = buffered.indexOf('\n')
-      if ('ready' in event) ready({ state: event.vault, bin: event.bin })
-      else if ('ask' in event) await onAsk($, event.ask)
+      if ('ready' in event) {
+        if (typeof event.bin !== 'string') throw new Error("secrets: the relay's ready event has no bin, the directory of the helpers it serves")
+        ready({ state: event.vault, bin: event.bin })
+      } else if ('ask' in event) await onAsk($, event.ask)
       else if ('gone' in event) dropRequest(event.gone)
       else if ('sign' in event) await onSign($, event.sign)
-      else if ('list' in event) await decideRequest($, event.list.id, listDecision(event.list, running))
+      else if ('list' in event) await decideRequest($, event.list.id, listDecision(event.list, callsBy(event.list)))
       else if ('vault' in event) await refreshVault($)
+      else if ('masking' in event) masking = event.masking
       else if ('masked' in event) {
         hasMasked = true
         await $.state.set({ plugin: 'secrets', key: 'hasMasked' }, true)
@@ -559,18 +577,34 @@ async function readRelay($: EngineInterface, socket: string, upstream: string, r
   throw new Error('the relay exited')
 }
 
+/** A Bash result whose command runs on in the background. */
+function runsOn(result: unknown): boolean {
+  const output = (result as { result?: { backgroundTaskId?: unknown } }).result
+  return typeof output?.backgroundTaskId === 'string'
+}
+
+/**
+ * The calls a request may come from: those running, and the background ones a filter stream still runs (`live`);
+ * the others are forgotten.
+ */
+function callsBy(requester: Requester): Call[] {
+  lingering = lingering.filter(c => requester.live.some(cmdline => runsIn(cmdline, c.command)))
+  return [...running, ...lingering]
+}
+
 /** The open vault's entries a request may be answered with; ssh keys answer signatures, not asks. */
 function vaultOffer(): Pickable[] {
   return vault.entries.filter(e => e.kind !== 'ssh-key').map(e => ({ id: e.id, label: `${e.name} · ${e.tag}`, tag: e.tag }))
 }
 
 async function onAsk($: EngineInterface, ask: Asked) {
-  const decision = askDecision(ask, running)
+  const calls = callsBy(ask)
+  const decision = askDecision(ask, calls)
   const request: Request = {
     id: ask.id,
     kind: 'secret',
     prompt: ask.prompt,
-    source: requestSource(ask, running.map(r => r.command)),
+    source: requestSource(ask, calls.map(r => r.command)),
     since: clockTime(),
     pick: decision === 'typed card' ? null : 'vault',
     tag: ask.tag,
@@ -582,10 +616,11 @@ async function onAsk($: EngineInterface, ask: Asked) {
 }
 
 async function onSign($: EngineInterface, sign: Sign) {
-  const decision = signDecision(sign, running)
+  const calls = callsBy(sign)
+  const decision = signDecision(sign, calls)
   // A decision that fails leaves the program waiting: it gets the card instead.
   if (decision !== 'ask' && (await decideRequest($, sign.id, decision))) return
-  const source = requestSource(sign, running.map(r => r.command))
+  const source = requestSource(sign, calls.map(r => r.command))
   await addRequest($, { id: sign.id, kind: 'sign', prompt: `${sign.name} · ${sign.tag}`, source, since: clockTime(), pick: null, tag: null })
   await $.ui.notify(`Vault key wanted: ${sign.name}`, { title: 'secrets' })
 }
@@ -632,9 +667,9 @@ async function relayJson($: EngineInterface, path: string, body: object | null):
   return JSON.parse(reply.text)
 }
 
-/** The tool's result with the open vault's values masked; as it is while the vault is closed. */
+/** The tool's result with the relay's values masked; as it is while it has none. */
 async function maskResult<T>($: EngineInterface, result: T): Promise<T> {
-  if (vault.state !== 'open') return result
+  if (!masking) return result
   const texts = stringsIn(result)
   if (texts.length === 0) return result
   const masked = (await relayJson($, '/mask', { texts })) as { texts: string[] }
@@ -691,7 +726,12 @@ async function onVaultMessage($: EngineInterface, message: VaultMessage) {
 }
 
 async function onVaultAction($: EngineInterface, action: VaultAction) {
-  if (action.kind === 'collision') return decideCollision($, action.name, action.decision)
+  if (action.kind === 'collision') {
+    const decided = deciding.then(() => decideCollision($, action.name, action.decision))
+    // The chain goes on past a failed decision; the failure reaches this caller through `decided`.
+    deciding = decided.catch(() => {})
+    return decided
+  }
   // The passphrase and a new value cross to the relay through http.fetch, where a colliding plugin reads them.
   const carriesSecret = action.kind === 'open' || (action.kind === 'save' && action.form.suggestion === null && fields.value !== '')
   if (carriesSecret && collisions.length > 0) {
@@ -789,7 +829,10 @@ async function onConfigAction($: EngineInterface, action: ConfigAction) {
   configError = null
   if (action.kind === 'apply') await applyAutoMode($)
   else if (action.kind === 'suggest') configDraft = SUGGESTED
-  else if (action.kind === 'forward') configError = await relayChange($, { op: 'forward', on: action.on })
+  else if (action.kind === 'forward') {
+    configError = await relayChange($, { op: 'forward', on: action.on })
+    if (configError === null) await $.state.set({ plugin: 'secrets', key: 'forward' }, action.on)
+  }
   else if (action.kind === 'unlockAtStart') {
     await $.store.set('unlockAtStart', action.on)
     unlockAtStart = action.on

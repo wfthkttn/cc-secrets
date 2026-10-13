@@ -37,13 +37,14 @@ pub async fn ask(stream: &mut UnixStream, ctx: &Context, body: &[u8]) {
     let Ok(id) = secrets::vault::random_hex::<16>() else { return respond(stream, "500 Internal Server Error", b"").await };
     let by = peer::requester(peer::peer_pid(stream), &ctx.mask_run);
     let (tx, rx) = oneshot::channel();
-    let entry = {
+    let (entry, live) = {
         let mut state = lock(ctx);
         state.pass.waiting.insert(id.clone(), Asking { tx, prompt: ask.prompt.clone(), call: by.inside.then_some(by.pid) });
         let tagged = ask.tag.as_deref().and_then(|tag| state.vault.tagged(tag));
-        tagged.map(|(e, allowed)| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "allowed": allowed }))
+        let entry = tagged.map(|(e, allowed)| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "allowed": allowed }));
+        (entry, state.filter.live())
     };
-    let event = json!({ "id": id, "prompt": ask.prompt, "tag": ask.tag, "entry": entry, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside });
+    let event = json!({ "id": id, "prompt": ask.prompt, "tag": ask.tag, "entry": entry, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live });
     emit(&json!({ "ask": event }));
     tokio::select! {
         answer = rx => match answer {

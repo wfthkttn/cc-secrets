@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{Context, emit, lock, peer, respond};
 
@@ -20,6 +20,8 @@ use crate::{Context, emit, lock, peer, respond};
 struct Call {
     values: Vec<Zeroizing<String>>,
     masker: Masker,
+    /// Its `secrets-mask-run`'s, which holds the command.
+    cmdline: String,
 }
 
 pub struct Filter {
@@ -33,11 +35,36 @@ pub struct Filter {
     vault: Masker,
     /// Something was masked this session; told to the hooks once, for their write-back guard.
     has_masked: bool,
+    /// What the hooks were last told of whether `/mask` has values to mask.
+    told_masking: bool,
 }
 
 impl Filter {
     pub fn new(min_length: usize) -> Self {
-        Self { min_length, calls: HashMap::new(), typed: Vec::new(), vault_values: Vec::new(), vault: Masker::new(min_length), has_masked: false }
+        Self {
+            min_length,
+            calls: HashMap::new(),
+            typed: Vec::new(),
+            vault_values: Vec::new(),
+            vault: Masker::new(min_length),
+            has_masked: false,
+            told_masking: false,
+        }
+    }
+
+    /// The command lines of the calls whose output runs through here now.
+    pub fn live(&self) -> Vec<String> {
+        self.calls.values().map(|call| call.cmdline.clone()).collect()
+    }
+
+    /// Tells the hooks when `/mask` starts or stops having values to mask: the open vault's, or one typed for a
+    /// running call. They send other tools' results only meanwhile.
+    fn tell_masking(&mut self) {
+        let masking = !self.vault_values.is_empty() || !self.typed.is_empty();
+        if masking != self.told_masking {
+            self.told_masking = masking;
+            emit(&json!({ "masking": masking }));
+        }
     }
 
     fn masker_with(&self, values: &[Zeroizing<String>]) -> Masker {
@@ -70,6 +97,7 @@ impl Filter {
     pub fn set_vault_values(&mut self, values: Vec<Zeroizing<String>>) {
         self.vault_values = values;
         self.rebuild();
+        self.tell_masking();
     }
 
     /// Masks the call `pid`'s output with `value` from now on, until the call ends.
@@ -90,6 +118,7 @@ impl Filter {
         }
         self.vault.add(value);
         self.typed.push((pid, Zeroizing::new(value.to_owned())));
+        self.tell_masking();
     }
 
     /// Forgets the call `pid` and the values typed for it.
@@ -99,6 +128,7 @@ impl Filter {
         self.typed.retain(|(owner, _)| *owner != pid);
         if self.typed.len() != before {
             self.rebuild();
+            self.tell_masking();
         }
     }
 
@@ -126,10 +156,11 @@ pub async fn serve(stream: &mut UnixStream, ctx: &Context) {
     let Some(pid) = peer::mask_run_pid(stream, &ctx.mask_run) else {
         return respond(stream, "403 Forbidden", b"").await;
     };
+    let cmdline = peer::cmdline_of(i64::from(pid));
     {
         let mut state = lock(ctx);
         let masker = state.filter.masker_with(&[]);
-        state.filter.calls.insert(pid, Call { values: Vec::new(), masker });
+        state.filter.calls.insert(pid, Call { values: Vec::new(), masker, cmdline });
     }
     if stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.is_ok() {
         let mut held = [Vec::new(), Vec::new()];
@@ -159,12 +190,19 @@ pub struct Texts {
     texts: Vec<String>,
 }
 
+impl Drop for Texts {
+    fn drop(&mut self) {
+        self.texts.zeroize();
+    }
+}
+
 /// `/mask`: the texts with the open vault's values masked.
 pub fn mask_texts(ctx: &Context, body: &[u8]) -> Option<serde_json::Value> {
-    let texts = serde_json::from_slice::<Texts>(body).ok()?.texts;
+    let parsed = serde_json::from_slice::<Texts>(body).ok()?;
     let mut state = lock(ctx);
     let mut any = false;
-    let masked: Vec<String> = texts
+    let masked: Vec<String> = parsed
+        .texts
         .iter()
         .map(|text| {
             let (out, found) = state.filter.vault.mask_found(text.as_bytes());
@@ -178,9 +216,9 @@ pub fn mask_texts(ctx: &Context, body: &[u8]) -> Option<serde_json::Value> {
 
 /// `/check`: the entry, as "name (tag)", whose value any of the texts carries in some form; null for none.
 pub fn check_texts(entries: &[Entry], min_length: usize, body: &[u8]) -> Option<serde_json::Value> {
-    let texts = serde_json::from_slice::<Texts>(body).ok()?.texts;
+    let parsed = serde_json::from_slice::<Texts>(body).ok()?;
     let carried = entries.iter().filter(|e| e.value.chars().count() >= min_length).find(|entry| {
-        forms(&entry.value).iter().any(|form| texts.iter().any(|text| memchr::memmem::find(text.as_bytes(), form).is_some()))
+        forms(&entry.value).iter().any(|form| parsed.texts.iter().any(|text| memchr::memmem::find(text.as_bytes(), form).is_some()))
     });
     Some(json!({ "label": carried.map(|e| format!("{} ({})", e.name, e.tag)) }))
 }

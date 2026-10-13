@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { askDecision, listDecision, requestSource, signDecision, sourceOf } from '../hooks/source'
+import { askDecision, listDecision, requestSource, runsIn, signDecision, sourceOf } from '../hooks/source'
 
 const WRAPPER = (command: string, quote = `'"'"'`) =>
   `/run/current-system/sw/bin/zsh -c source /home/alex/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval '${command.split("'").join(quote)}' < /dev/null && pwd -P >| /tmp/claude-cwd`
@@ -82,6 +82,25 @@ test('the same command running in the main loop and a subagent is neither given 
   expect(askDecision({ ...sign, entry: { allowed: true, use: 'session' } }, both)).toBe('typed card')
   expect(listDecision(sign, both)).toBe('refuse')
   expect(signDecision(sign, [both[0]!, both[0]!])).toBe('give')
+})
+
+test('the same command in two subagents only is a subagent\'s: refused, no entries offered', async () => {
+  const command = 'ssh prod uptime'
+  const subagents = [
+    { command, agentId: 'a-1' },
+    { command, agentId: 'a-2' },
+  ]
+  const sign = { cmdline: WRAPPER(command), inside: true, allowed: true, use: 'session' as const }
+  expect(signDecision(sign, subagents)).toBe('refuse')
+  expect(askDecision({ ...sign, entry: { allowed: true, use: 'session' } }, subagents)).toBe('typed card')
+  expect(listDecision(sign, subagents)).toBe('refuse')
+})
+
+test("a mask-run's command line runs the command its wrapper holds, either way of quoting", async () => {
+  const command = `echo 'quoted' && secrets ask x`
+  expect(runsIn(WRAPPER(command), command)).toBe(true)
+  expect(runsIn(WRAPPER(command, `'\\''`), command)).toBe(true)
+  expect(runsIn(WRAPPER('ls'), command)).toBe(false)
 })
 
 test('a secrets list that matches no running call is refused, as from a background call', async () => {

@@ -142,6 +142,14 @@ fn parse_header(data: &[u8]) -> Result<(Costs, [u8; SALT_LEN]), Error> {
     Ok((costs, salt))
 }
 
+/// What tells one save of the file at `path` from another: its header and the save's nonce, both random. None when
+/// there is no file to read.
+pub fn identity(path: &Path) -> Option<Vec<u8>> {
+    let mut start = Vec::with_capacity(HEADER_LEN + NONCE_LEN);
+    std::fs::File::open(path).ok()?.take((HEADER_LEN + NONCE_LEN) as u64).read_to_end(&mut start).ok()?;
+    Some(start)
+}
+
 fn unseal(data: &[u8], key: &[u8; 32]) -> Result<Vec<Entry>, Error> {
     let nonce = data.get(HEADER_LEN..HEADER_LEN + NONCE_LEN).and_then(|n| XNonce::try_from(n).ok()).ok_or(Error::Unreadable("header cut short"))?;
     let sealed = data.get(HEADER_LEN + NONCE_LEN..).ok_or(Error::Unreadable("header cut short"))?;
@@ -276,6 +284,7 @@ mod tests {
         vault.save(&path).unwrap();
         let second = std::fs::read(&path).unwrap();
         assert_ne!(first[HEADER_LEN..HEADER_LEN + NONCE_LEN], second[HEADER_LEN..HEADER_LEN + NONCE_LEN]);
+        assert_eq!(identity(&path).unwrap(), second[..HEADER_LEN + NONCE_LEN]);
         assert_eq!(Vault::open(&path, b"pass").unwrap().entries.len(), 1);
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().collect();
         assert_eq!(leftovers.len(), 1);

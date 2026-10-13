@@ -229,7 +229,7 @@ test('a request naming no key is a bare field that takes typing; a click on it o
   expect(onKey(START, entries, FRAME, { key: 'x' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'append', text: 'x' }])
   const field = rows.findIndex(r => r.kind === 'field')
   const opened = onClick(START, entries, FRAME, field, 6).state
-  expect(opened).toMatchObject({ isMenuOpen: true, cursor: 0, selected: 'a' })
+  expect(opened).toMatchObject({ isMenuOpen: true, cursor: null, selected: 'a' })
   const menu = menuOf(entries, FRAME, opened)!
   expect(menu).toMatchObject({ id: 'a', top: field + 2, first: 0, shown: MENU_ROWS })
   expect(menu.options).toEqual([TYPE_OPTION, ...OFFER.map(o => o.label)])
@@ -242,8 +242,8 @@ test('in the menu ↑/↓ move, Enter or a click chooses, Tab or a click outside
   const opened = onClick(START, entries, FRAME, field, 6).state
   let state = opened
   for (let i = 0; i < 7; i++) state = onKey(state, entries, FRAME, { key: 'down' }).state
-  expect(state.cursor).toBe(7)
-  expect(menuOf(entries, FRAME, state)!.first).toBe(2)
+  expect(state.cursor).toBe('e6')
+  expect(menuOf(entries, FRAME, state)).toMatchObject({ first: 2, cursor: 7 })
   const chose = onKey(state, entries, FRAME, { key: 'return' })
   expect(chose.state.isMenuOpen).toBe(false)
   expect(chose.post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'choose', entry: 'e6' }])
@@ -264,12 +264,26 @@ test('Type in the menu turns a chosen entry back into a field that takes typing;
   const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, chosen: 'e0' }]
   const field = layout(entries, 60, null).findIndex(r => r.kind === 'field')
   const opened = onClick(START, entries, FRAME, field, 6).state
-  expect(opened.cursor).toBe(1)
+  expect(opened.cursor).toBe('e0')
   const typing = onKey(onKey(opened, entries, FRAME, { key: 'up' }).state, entries, FRAME, { key: 'return' }).state
   expect(typing.pending).toEqual([{ seq: 1, id: 'a', kind: 'choose', entry: null }])
   expect(layout(entries, 60, null, typing.pending).some(r => r.kind === 'pick')).toBe(false)
   expect(onKey(typing, entries, FRAME, { key: 'return' }).post?.edits.at(-1)).toEqual({ seq: 2, id: 'a', kind: 'submit' })
-  expect(onClick(typing, entries, FRAME, field, 6).state.cursor).toBe(0)
+  expect(onClick(typing, entries, FRAME, field, 6).state.cursor).toBe(null)
+})
+
+test('the menu cursor stays on its entry when the vault changes; with its entry gone, Enter chooses nothing', async () => {
+  const entries: RequestEntry[] = [{ ...entry('a', 'deploy token'), offer: OFFER }]
+  const field = layout(entries, 60, null).findIndex(r => r.kind === 'field')
+  let state = onClick(START, entries, FRAME, field, 6).state
+  for (let i = 0; i < 3; i++) state = onKey(state, entries, FRAME, { key: 'down' }).state
+  expect(state.cursor).toBe('e2')
+  const shifted: RequestEntry[] = [{ ...entries[0]!, offer: OFFER.filter(o => o.id !== 'e0') }]
+  expect(onKey(state, shifted, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'choose', entry: 'e2' }])
+  const gone: RequestEntry[] = [{ ...entries[0]!, offer: OFFER.filter(o => o.id !== 'e2') }]
+  expect(menuOf(gone, FRAME, state)!.cursor).toBe(-1)
+  expect(onKey(state, gone, FRAME, { key: 'return' }).post).toBe(undefined)
+  expect(onKey(state, gone, FRAME, { key: 'down' }).state.cursor).toBe(null)
 })
 
 test("a choice comes from the hooks, so another instance's card (pop-out or drawer) holds the same", async () => {
@@ -300,9 +314,11 @@ test('a menu scrolled out of view takes no keys and shuts', async () => {
   expect(menuOf(many, SHORT, opened)).not.toBe(null)
   const hidden = { ...opened, scroll: 0 }
   expect(menuOf(many, SHORT, hidden)).toBe(null)
-  const result = onKey(hidden, many, SHORT, { key: 'return' })
-  expect(result.state.isMenuOpen).toBe(false)
-  expect(result.post?.edits.some(e => e.kind === 'choose')).toBeFalsy()
+  for (const key of ['return', 'down', 'up']) {
+    const result = onKey(hidden, many, SHORT, { key })
+    expect(result.state).toMatchObject({ isMenuOpen: false, selected: 'z' })
+    expect(result.post).toBe(undefined)
+  }
 })
 
 test('multi-line and wide text take the rows and cells counted for them', async () => {
@@ -313,6 +329,9 @@ test('multi-line and wide text take the rows and cells counted for them', async 
   const from = rows.filter(r => r.kind === 'from') as { text: string }[]
   expect(from.map(r => r.text)).toEqual(['git add -A⏎git push 日本語 ?'])
   expect(rows.map(r => r.kind)).toEqual(['cardTop', 'what', 'from', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
+  // が written as か + U+3099, as macOS file names are: the mark sits in a wide range but joins the か.
+  const voiced = layout([{ ...entry('a', 'が 〪') }], 60, null).find(r => r.kind === 'what') as { text: string }
+  expect(voiced.text).toBe('か? ?')
 })
 
 test('the menu opens above its field when the room under it is short', async () => {

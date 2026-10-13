@@ -6,17 +6,18 @@
 //! a relay that finds the file replaced since it last read it takes the new one in before serving.
 
 use std::collections::HashSet;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use secrets::agent;
 use secrets::vault::{Entry, Kind, Use, Vault, random_hex};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::UnixStream;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::{COSTS, Context, Decision, State, decide, emit, lock, now, peer, respond};
+use crate::{COSTS, Context, Decision, Shared, State, decide, emit, lock, note, now, peer, respond};
 
 pub enum Locker {
     Absent,
@@ -33,11 +34,11 @@ pub struct Opened {
     seen: Option<Stamp>,
 }
 
-/// A vault file's identity: every save renames a new file over the old one.
-type Stamp = (u64, u64);
+/// Which save of the vault file this is (`vault::identity`).
+type Stamp = Vec<u8>;
 
 fn stamp(path: &Path) -> Option<Stamp> {
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    secrets::vault::identity(path)
 }
 
 /// Holds `vault.lock` beside the vault until dropped, so no other session's relay changes the file meanwhile.
@@ -57,6 +58,12 @@ fn exclusive(path: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("can't open {}: {e}", lock_path.display()))?;
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|e| format!("can't lock {}: {e}", lock_path.display()))?;
     Ok(file)
+}
+
+/// `exclusive` off the runtime thread: waiting for another session's relay stalls no stream of this one.
+async fn exclusive_waiting(path: &Path) -> Result<std::fs::File, String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || exclusive(&path)).await.map_err(|e| format!("locking the vault stopped: {e}"))?
 }
 
 /// A value typed this session while the vault was open, kept in memory until the user saves or dismisses it.
@@ -180,18 +187,65 @@ pub fn fresh(ctx: &Context, state: &mut State) {
     changed(state);
 }
 
-/// Takes the opened vault in, dropping the typed entries earlier versions kept. `seen` is the file's stamp from
-/// before it was read, so a save made since then is caught up with.
-fn opened(ctx: &Context, mut vault: Vault, mut seen: Option<Stamp>) -> Result<(), String> {
-    if vault.entries.iter().any(|e| e.kind == Kind::Typed) {
-        let _held = exclusive(&ctx.vault_path)?;
-        vault.reload(&ctx.vault_path).map_err(|e| e.to_string())?;
-        vault.entries.retain(|e| e.kind != Kind::Typed);
-        seen = save(ctx, &vault)?;
+/// Drops the typed entries earlier versions kept, under the lock; the stamp of the file as saved then.
+fn without_typed(path: &Path, vault: &mut Vault) -> Result<Option<Stamp>, Opening> {
+    let _held = exclusive(path).map_err(Opening::Lock)?;
+    vault.reload(path)?;
+    vault.entries.retain(|e| e.kind != Kind::Typed);
+    vault.save(path)?;
+    Ok(stamp(path))
+}
+
+/// Catches up as soon as another session's relay saves, so a call already running masks what it added; the check
+/// before each request stays for whatever this misses.
+pub async fn watch(ctx: Shared) {
+    use rustix::fs::inotify;
+    let Some(dir) = ctx.vault_path.parent() else { return };
+    let watching = std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+        .create(dir)
+        .map_err(|e| e.to_string())
+        .and_then(|()| inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).map_err(|e| e.to_string()))
+        .and_then(|fd| {
+            let flags = inotify::WatchFlags::MOVED_TO | inotify::WatchFlags::MOVED_FROM | inotify::WatchFlags::DELETE;
+            inotify::add_watch(&fd, dir, flags).map(|_| fd).map_err(|e| e.to_string())
+        })
+        .and_then(|fd| tokio::io::unix::AsyncFd::new(fd).map_err(|e| e.to_string()));
+    let watched = match watching {
+        Ok(watched) => watched,
+        Err(error) => return note(&format!("can't watch {} for other sessions' saves: {error}", dir.display())),
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        let Ok(mut ready) = watched.readable().await else { return };
+        loop {
+            match rustix::io::read(ready.get_inner(), &mut buf) {
+                Ok(0) => return note(&format!("watching {} ended", dir.display())),
+                Ok(_) => {}
+                Err(rustix::io::Errno::AGAIN) => break ready.clear_ready(),
+                Err(error) => return note(&format!("watching {} stopped: {error}", dir.display())),
+            }
+        }
+        fresh(&ctx, &mut lock(&ctx));
     }
-    let mut state = lock(ctx);
+}
+
+/// Takes the opened vault in. `seen` is the file's stamp from before it was read, so a save made since then is
+/// caught up with.
+fn opened(state: &mut State, vault: Vault, seen: Option<Stamp>) {
     state.vault = Locker::Open(Box::new(Opened { vault, allowed: HashSet::new(), suggestions: Vec::new(), seen }));
-    changed(&mut state);
+    changed(state);
+}
+
+/// Saves a new vault and takes it in at once: no catching up in between finds the file and calls the vault locked.
+fn created(ctx: &Context, vault: Vault) -> Result<(), Opening> {
+    let path = &ctx.vault_path;
+    let _held = exclusive(path).map_err(Opening::Lock)?;
+    let mut state = lock(ctx);
+    if path.exists() {
+        return Err(Opening::Exists);
+    }
+    vault.save(path)?;
+    opened(&mut state, vault, stamp(path));
     Ok(())
 }
 
@@ -215,7 +269,7 @@ impl From<secrets::vault::Error> for Opening {
 
 /// `/unlock` or, with `create`, `/create`: 204 once open, 403 for a wrong passphrase, 409 when the vault isn't in
 /// a state to do it, 500 with the reason when the file can't be read or written.
-pub async fn open(stream: &mut UnixStream, ctx: &Context, body: &[u8], create: bool) {
+pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bool) {
     let Ok(Passphrase { passphrase }) = serde_json::from_slice::<Passphrase>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let passphrase = Zeroizing::new(passphrase);
     let expected = if create { "absent" } else { "locked" };
@@ -223,27 +277,21 @@ pub async fn open(stream: &mut UnixStream, ctx: &Context, body: &[u8], create: b
     if shown != expected {
         return respond(stream, "409 Conflict", format!("the vault is {shown}").as_bytes()).await;
     }
-    let path: PathBuf = ctx.vault_path.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(Vault, Option<Stamp>), Opening> {
+    let shared = Arc::clone(ctx);
+    let result = tokio::task::spawn_blocking(move || -> Result<(), Opening> {
+        let path = &shared.vault_path;
         if create {
-            let _held = exclusive(&path).map_err(Opening::Lock)?;
-            if path.exists() {
-                return Err(Opening::Exists);
-            }
-            let vault = Vault::create(passphrase.as_bytes(), COSTS)?;
-            vault.save(&path)?;
-            Ok((vault, stamp(&path)))
-        } else {
-            let seen = stamp(&path);
-            Ok((Vault::open(&path, passphrase.as_bytes())?, seen))
+            return created(&shared, Vault::create(passphrase.as_bytes(), COSTS)?);
         }
+        let seen = stamp(path);
+        let mut vault = Vault::open(path, passphrase.as_bytes())?;
+        let seen = if vault.entries.iter().any(|e| e.kind == Kind::Typed) { without_typed(path, &mut vault)? } else { seen };
+        opened(&mut lock(&shared), vault, seen);
+        Ok(())
     })
     .await;
     match result {
-        Ok(Ok((vault, seen))) => match opened(ctx, vault, seen) {
-            Ok(()) => respond(stream, "204 No Content", b"").await,
-            Err(reason) => respond(stream, "500 Internal Server Error", reason.as_bytes()).await,
-        },
+        Ok(Ok(())) => respond(stream, "204 No Content", b"").await,
         Ok(Err(Opening::Exists)) => {
             fresh(ctx, &mut lock(ctx));
             respond(stream, "409 Conflict", b"another session made the vault meanwhile; unlock it").await;
@@ -371,7 +419,7 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
             entry.kind = kind.unwrap_or(entry.kind);
             entry.use_ = use_.unwrap_or(entry.use_);
             if let Some(value) = value {
-                entry.value = value;
+                std::mem::replace(&mut entry.value, value).zeroize();
             }
             id
         }
@@ -393,43 +441,47 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
     Ok(id)
 }
 
+/// Applies the change; the changed entry's id, or why not.
+async fn apply(ctx: &Context, parsed: Change) -> Result<String, String> {
+    if let Change::Forward { on } = parsed {
+        if on && ctx.upstream.is_none() {
+            return Err("there is no ssh-agent of yours to forward to".to_owned());
+        }
+        let mut state = lock(ctx);
+        state.forward = on;
+        emit(&json!({ "vault": state.vault.shown() }));
+        return Ok("forward".to_owned());
+    }
+    let saves = !matches!(parsed, Change::Allow { .. } | Change::Dismiss { .. });
+    // The change is made to what the file holds now, with no other session's relay writing meanwhile.
+    let _held = if saves { Some(exclusive_waiting(&ctx.vault_path).await?) } else { None };
+    let mut state = lock(ctx);
+    fresh(ctx, &mut state);
+    let Locker::Open(open) = &mut state.vault else { return Err("the vault is not open".to_owned()) };
+    let before = (open.vault.entries.clone(), open.allowed.clone(), open.suggestions.clone());
+    let done = change(open, parsed).and_then(|id| if saves { save(ctx, &open.vault).map(|seen| (id, Some(seen))) } else { Ok((id, None)) });
+    let id = match done {
+        Ok((id, seen)) => {
+            if let Some(seen) = seen {
+                open.seen = seen;
+            }
+            id
+        }
+        Err(reason) => {
+            (open.vault.entries, open.allowed, open.suggestions) = before;
+            return Err(reason);
+        }
+    };
+    changed(&mut state);
+    Ok(id)
+}
+
 /// `POST /vault`: 200 `{id}` once applied (and saved, for a change to the entries); 400 with the reason.
 pub async fn change_vault(stream: &mut UnixStream, ctx: &Context, body: &[u8]) {
-    let parsed = serde_json::from_slice::<Change>(body);
-    let result = parsed.map_err(|e| format!("not a change: {e}")).and_then(|parsed| {
-        let mut state = lock(ctx);
-        if let Change::Forward { on } = parsed {
-            if on && ctx.upstream.is_none() {
-                return Err("there is no ssh-agent of yours to forward to".to_owned());
-            }
-            state.forward = on;
-            emit(&json!({ "vault": state.vault.shown() }));
-            return Ok("forward".to_owned());
-        }
-        let saves = !matches!(parsed, Change::Allow { .. } | Change::Dismiss { .. });
-        drop(state);
-        // The change is made to what the file holds now, with no other session's relay writing meanwhile.
-        let _held = if saves { Some(exclusive(&ctx.vault_path)?) } else { None };
-        let mut state = lock(ctx);
-        fresh(ctx, &mut state);
-        let Locker::Open(open) = &mut state.vault else { return Err("the vault is not open".to_owned()) };
-        let before = (open.vault.entries.clone(), open.allowed.clone(), open.suggestions.clone());
-        let done = change(open, parsed).and_then(|id| if saves { save(ctx, &open.vault).map(|seen| (id, Some(seen))) } else { Ok((id, None)) });
-        let id = match done {
-            Ok((id, seen)) => {
-                if let Some(seen) = seen {
-                    open.seen = seen;
-                }
-                id
-            }
-            Err(reason) => {
-                (open.vault.entries, open.allowed, open.suggestions) = before;
-                return Err(reason);
-            }
-        };
-        changed(&mut state);
-        Ok(id)
-    });
+    let result = match serde_json::from_slice::<Change>(body) {
+        Ok(parsed) => apply(ctx, parsed).await,
+        Err(e) => Err(format!("not a change: {e}")),
+    };
     match result {
         Ok(id) => respond(stream, "200 OK", json!({ "id": id }).to_string().as_bytes()).await,
         Err(reason) => respond(stream, "400 Bad Request", reason.as_bytes()).await,
@@ -439,10 +491,12 @@ pub async fn change_vault(stream: &mut UnixStream, ctx: &Context, body: &[u8]) {
 /// `POST /list`: the vault's entries once the hooks decide; never a value.
 pub async fn list(stream: &mut UnixStream, ctx: &Context) {
     let by = peer::requester(peer::peer_pid(stream), &ctx.mask_run);
-    if !matches!(lock(ctx).vault, Locker::Open(_)) {
-        return respond(stream, "403 Forbidden", b"the vault is closed").await;
-    }
-    match decide(stream, ctx, "list", json!({ "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside })).await {
+    let live = {
+        let state = lock(ctx);
+        matches!(state.vault, Locker::Open(_)).then(|| state.filter.live())
+    };
+    let Some(live) = live else { return respond(stream, "403 Forbidden", b"the vault is closed").await };
+    match decide(stream, ctx, "list", json!({ "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live })).await {
         None => return,
         Some(Decision::Refuse) => return respond(stream, "403 Forbidden", b"").await,
         Some(_) => {}

@@ -117,6 +117,16 @@ test('an entry opens for editing; its dot or space allows or revokes it for the 
   expect(onKey(onDeploy, PROPS, { key: 'space' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'allow', id: 'e2', allowed: true })
 })
 
+test("the selection stays on its entry when another session's change moves the rows; once it went, keys act on nothing", async () => {
+  const onDeploy = onKey(onKey(START, PROPS, { key: 'down' }).state, PROPS, { key: 'down' }).state
+  const shifted = { ...PROPS, entries: [ENTRIES[1]!] }
+  expect(onKey(onDeploy, shifted, { key: 'space' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'allow', id: 'e2', allowed: true })
+  const gone = { ...PROPS, entries: [ENTRIES[0]!] }
+  expect(onKey(onDeploy, gone, { key: 'space' }).post).toBe(undefined)
+  expect(onKey(onDeploy, gone, { key: 'return' }).post).toBe(undefined)
+  expect(onKey(onDeploy, gone, { key: 'down' }).state.selected).toBe('add')
+})
+
 test('a suggestion opens as a new entry named by its prompt; its value is not typed again, nor an ssh key', async () => {
   const opened = click(START, 4, 6)
   expect(opened.state.form).toEqual({ id: null, suggestion: 's1', name: '[sudo] password for alex', tag: '', kind: 'password', use: 'session' })

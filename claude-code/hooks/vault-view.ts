@@ -18,8 +18,8 @@ export type ViewState = {
   door: Door
   /** The vault is closed: keys go to its passphrase. */
   isClosed: boolean
-  /** The selected row among the list's selectable ones. */
-  selected: number
+  /** The selected list row (`rowKey`): it stays on its entry when another session's change moves the rows; null once it went. */
+  selected: string | null
   formEpoch: number
 }
 
@@ -56,7 +56,12 @@ function edge(side: 'top' | 'bottom', width: number): string {
 }
 
 export function initialState(formEpoch: number, instance: string, isClosed = false): ViewState {
-  return { instance, seq: 0, pending: [], form: null, field: 'name', door: 'passphrase', isClosed, selected: 0, formEpoch }
+  return { instance, seq: 0, pending: [], form: null, field: 'name', door: 'passphrase', isClosed, selected: 'add', formEpoch }
+}
+
+/** What a selectable list row is, whatever its position. */
+function rowKey(row: Row): string | null {
+  return row.kind === 'add' ? 'add' : row.kind === 'entry' ? 'entry:' + row.entry.id : row.kind === 'suggestion' ? 'suggestion:' + row.suggestion.id : null
 }
 
 function doors(state: VaultProps['state']): Door[] {
@@ -256,8 +261,12 @@ export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entri
   if (props.state !== 'open') return onDoorKey(state, props, k)
   if (state.form !== null) return onFormKey(state, state.form, k)
   const rows = listRows(props).filter(isSelectable)
-  const selected = Math.min(state.selected, rows.length - 1)
-  if (k.key === 'up' || k.key === 'down') return { state: { ...state, selected: Math.max(0, Math.min(rows.length - 1, selected + (k.key === 'up' ? -1 : 1))) } }
+  const selected = rows.findIndex(r => rowKey(r) === state.selected)
+  if (k.key === 'up' || k.key === 'down') {
+    // With the selected row gone, an arrow selects from the list's end rather than next to where it was.
+    const to = selected < 0 ? (k.key === 'up' ? rows.length - 1 : 0) : Math.max(0, Math.min(rows.length - 1, selected + (k.key === 'up' ? -1 : 1)))
+    return { state: { ...state, selected: rowKey(rows[to]!) } }
+  }
   const row = rows[selected]
   if (row === undefined) return { state }
   if (row.kind === 'entry' && k.key === 'space') return act(state, { kind: 'allow', id: row.entry.id, allowed: !row.entry.allowed })
@@ -303,20 +312,18 @@ export function onClick(state: ViewState, props: VaultProps, y: number, x: numbe
     }
     return { state }
   }
-  const all = listRows(props)
-  const row = window(all, props.rows - TAB_ROWS, state.selected)[at]
+  const row = window(listRows(props), props.rows - TAB_ROWS, state.selected)[at]
   if (row === undefined || !isSelectable(row)) return { state }
-  const selected = all.filter(isSelectable).indexOf(row)
-  const chosen = { ...state, selected }
+  const chosen = { ...state, selected: rowKey(row) }
   // The dot at the row's start allows or revokes; the rest opens the entry.
   if (row.kind === 'entry' && x <= 2) return act(chosen, { kind: 'allow', id: row.entry.id, allowed: !row.entry.allowed })
   return open(chosen, row)
 }
 
 /** The list rows that fit in `room`, scrolled so the selected one shows. */
-export function window(rows: Row[], room: number, selected: number): Row[] {
+export function window(rows: Row[], room: number, selected: string | null): Row[] {
   if (rows.length <= room) return rows
-  const target = rows.indexOf(rows.filter(isSelectable)[selected] ?? rows[0]!)
+  const target = Math.max(0, rows.findIndex(r => rowKey(r) === selected))
   const top = Math.max(0, Math.min(rows.length - room, target - room + 1))
   return rows.slice(top, top + room)
 }
@@ -411,10 +418,8 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
       }
     })
   } else if (form === null) {
-    const all = listRows(props)
-    const chosen = all.filter(isSelectable)[Math.min(state.selected, all.filter(isSelectable).length - 1)]
-    rows = window(all, props.rows - TAB_ROWS, state.selected).map(row => {
-      const look = row === chosen ? active : {}
+    rows = window(listRows(props), props.rows - TAB_ROWS, state.selected).map(row => {
+      const look = rowKey(row) !== null && rowKey(row) === state.selected ? active : {}
       switch (row.kind) {
         case 'add':
           return line(' + Add', look)

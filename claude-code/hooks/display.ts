@@ -47,6 +47,8 @@ export function displayed(text: string): string {
     if (char === '\n') out += '⏎'
     else if (char === '\r') continue
     else if (char === '\t') out += ' '
+    // Some combining marks sit inside the wide ranges (U+3099 voices kana); they join the character before them.
+    else if (/\p{M}/u.test(char)) out += '?'
     else out += within(NARROW, code) || within(WIDE, code) ? char : '?'
   }
   return out

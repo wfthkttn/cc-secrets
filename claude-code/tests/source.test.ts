@@ -69,3 +69,21 @@ test('a requester outside the session is never matched to a call: its own argv c
   expect(requestSource({ cmdline: 'secrets list', pid: 7, inside: false }, [])).toBe('outside this session: secrets list')
   expect(requestSource({ cmdline: WRAPPER(command), pid: 7, inside: true }, [])).toBe(command)
 })
+
+test('the same command running in the main loop and a subagent is neither given nor refused unseen: the person decides', async () => {
+  const command = 'git push origin main'
+  const both = [
+    { command, agentId: undefined },
+    { command, agentId: 'a-1' },
+  ]
+  const sign = { cmdline: WRAPPER(command), inside: true, allowed: true, use: 'session' as const }
+  expect(signDecision(sign, both)).toBe('ask')
+  expect(signDecision(sign, [...both].reverse())).toBe('ask')
+  expect(askDecision({ ...sign, entry: { allowed: true, use: 'session' } }, both)).toBe('typed card')
+  expect(listDecision(sign, both)).toBe('refuse')
+  expect(signDecision(sign, [both[0]!, both[0]!])).toBe('give')
+})
+
+test('a secrets list that matches no running call is refused, as from a background call', async () => {
+  expect(listDecision({ cmdline: WRAPPER('secrets list'), inside: true }, [])).toBe('refuse')
+})

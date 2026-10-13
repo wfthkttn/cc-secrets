@@ -1,5 +1,6 @@
 //! `secrets ask`: a program waits for a secret; the user types it into the request's card or, with the vault open,
-//! picks an entry. The value goes to the program and to the asking call's filter, and is not kept here.
+//! picks an entry. The value goes to the program and to the filter, which masks a typed one in every call while the
+//! asking call runs, and is not kept here.
 
 use std::collections::HashMap;
 
@@ -85,12 +86,16 @@ fn take(ctx: &Context, answer: Answer) -> (&'static str, &'static str) {
         let _ = asking.tx.send(None);
         return ("204 No Content", "");
     }
+    let typed = answer.secret.is_some() && answer.entry.is_none();
     let value = match (answer.entry, answer.secret) {
         (Some(entry), _) => {
-            let Some(value) = state.vault.hand_out(&entry, answer.session) else {
+            let Some((value, granted)) = state.vault.hand_out(&entry, answer.session) else {
                 state.pass.waiting.insert(answer.id, asking);
                 return ("409 Conflict", "no such entry, or the vault is closed");
             };
+            if granted {
+                emit(&json!({ "vault": state.vault.shown() }));
+            }
             value
         }
         (None, Some(secret)) => {
@@ -107,8 +112,10 @@ fn take(ctx: &Context, answer: Answer) -> (&'static str, &'static str) {
             return ("400 Bad Request", "");
         }
     };
-    if let Some(call) = asking.call {
-        state.filter.hand_to(call, &value);
+    match asking.call {
+        Some(call) if typed => state.filter.type_for(call, &value),
+        Some(call) => state.filter.hand_to(call, &value),
+        None => {}
     }
     let _ = asking.tx.send(Some(value));
     ("204 No Content", "")

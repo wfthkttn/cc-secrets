@@ -132,6 +132,25 @@ fn u32_at(data: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
 }
 
+fn parse_header(data: &[u8]) -> Result<(Costs, [u8; SALT_LEN]), Error> {
+    if !data.starts_with(MAGIC) {
+        return Err(Error::Unreadable("no vault header"));
+    }
+    let costs = (|| Some(Costs { memory_kib: u32_at(data, MAGIC.len())?, time: u32_at(data, MAGIC.len() + 4)?, lanes: u32_at(data, MAGIC.len() + 8)? }))()
+        .ok_or(Error::Unreadable("header cut short"))?;
+    let salt = data.get(MAGIC.len() + 12..HEADER_LEN).and_then(|s| s.try_into().ok()).ok_or(Error::Unreadable("header cut short"))?;
+    Ok((costs, salt))
+}
+
+fn unseal(data: &[u8], key: &[u8; 32]) -> Result<Vec<Entry>, Error> {
+    let nonce = data.get(HEADER_LEN..HEADER_LEN + NONCE_LEN).and_then(|n| XNonce::try_from(n).ok()).ok_or(Error::Unreadable("header cut short"))?;
+    let sealed = data.get(HEADER_LEN + NONCE_LEN..).ok_or(Error::Unreadable("header cut short"))?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| Error::Unreadable("key length"))?;
+    let aad = data.get(..HEADER_LEN).ok_or(Error::Unreadable("header cut short"))?;
+    let plain = Zeroizing::new(cipher.decrypt(&nonce, Payload { msg: sealed, aad }).map_err(|_| Error::Refused)?);
+    serde_json::from_slice(&plain).map_err(|_| Error::Unreadable("entries"))
+}
+
 impl Vault {
     /// A new, empty vault; nothing is written until `save`.
     pub fn create(passphrase: &[u8], costs: Costs) -> Result<Self, Error> {
@@ -142,22 +161,21 @@ impl Vault {
 
     pub fn open(path: &Path, passphrase: &[u8]) -> Result<Self, Error> {
         let data = std::fs::read(path)?;
-        if !data.starts_with(MAGIC) {
-            return Err(Error::Unreadable("no vault header"));
-        }
-        let costs = (|| {
-            Some(Costs { memory_kib: u32_at(&data, MAGIC.len())?, time: u32_at(&data, MAGIC.len() + 4)?, lanes: u32_at(&data, MAGIC.len() + 8)? })
-        })()
-        .ok_or(Error::Unreadable("header cut short"))?;
-        let salt: [u8; SALT_LEN] = data.get(MAGIC.len() + 12..HEADER_LEN).and_then(|s| s.try_into().ok()).ok_or(Error::Unreadable("header cut short"))?;
-        let nonce = data.get(HEADER_LEN..HEADER_LEN + NONCE_LEN).and_then(|n| XNonce::try_from(n).ok()).ok_or(Error::Unreadable("header cut short"))?;
-        let sealed = data.get(HEADER_LEN + NONCE_LEN..).ok_or(Error::Unreadable("header cut short"))?;
+        let (costs, salt) = parse_header(&data)?;
         let key = derive(passphrase, &salt, costs)?;
-        let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|_| Error::Unreadable("key length"))?;
-        let aad = data.get(..HEADER_LEN).ok_or(Error::Unreadable("header cut short"))?;
-        let plain = Zeroizing::new(cipher.decrypt(&nonce, Payload { msg: sealed, aad }).map_err(|_| Error::Refused)?);
-        let entries = serde_json::from_slice(&plain).map_err(|_| Error::Unreadable("entries"))?;
+        let entries = unseal(&data, &key)?;
         Ok(Self { costs, salt, key, entries })
+    }
+
+    /// Takes in the entries the file at `path` holds now, which another session may have changed. A file sealed
+    /// under another salt or costs is another vault (made anew meanwhile) and is refused.
+    pub fn reload(&mut self, path: &Path) -> Result<(), Error> {
+        let data = std::fs::read(path)?;
+        if parse_header(&data)? != (self.costs, self.salt) {
+            return Err(Error::Unreadable("the vault file was made anew under another passphrase"));
+        }
+        self.entries = unseal(&data, &self.key)?;
+        Ok(())
     }
 
     /// Writes the vault under a fresh nonce: a 0600 temporary file beside `path`, synced, then renamed over it.
@@ -230,6 +248,21 @@ mod tests {
         assert!(matches!(Vault::open(&path, b"pass"), Err(Error::Refused)));
         std::fs::write(&path, b"plain text").unwrap();
         assert!(matches!(Vault::open(&path, b"pass"), Err(Error::Unreadable(_))));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_reload_takes_another_sessions_save_and_refuses_a_vault_made_anew() {
+        let path = scratch("reload");
+        let mut ours = Vault::create(b"pass", CHEAP).unwrap();
+        ours.save(&path).unwrap();
+        let mut theirs = Vault::open(&path, b"pass").unwrap();
+        theirs.entries.push(entry("db", "hunter22"));
+        theirs.save(&path).unwrap();
+        ours.reload(&path).unwrap();
+        assert_eq!(ours.entries, theirs.entries);
+        Vault::create(b"pass", CHEAP).unwrap().save(&path).unwrap();
+        assert!(matches!(ours.reload(&path), Err(Error::Unreadable(_))));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

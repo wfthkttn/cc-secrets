@@ -15,8 +15,15 @@ export type Form = { id: string | null; suggestion: string | null; name: string;
 /** The fields whose text the hooks hold: an entry's value, the passphrase and its repeat. */
 export type SecretField = 'value' | 'passphrase' | 'again'
 
-/** One change to a held field, numbered per view instance. */
-export type ValueEdit = { seq: number; field: SecretField; kind: 'append'; text: string } | { seq: number; field: SecretField; kind: 'back' | 'clear' }
+/**
+ * One change, numbered per view instance and carried in every post until the hooks confirm it: a held field's edit,
+ * an action (a button, Enter, an allow dot) or a click on another tab.
+ */
+export type ValueEdit =
+  | { seq: number; field: SecretField; kind: 'append'; text: string }
+  | { seq: number; field: SecretField; kind: 'back' | 'clear' }
+  | { seq: number; kind: 'action'; action: VaultAction }
+  | { seq: number; kind: 'tab'; tab: Tab }
 
 export type VaultAction =
   | { kind: 'save'; form: Form }
@@ -50,6 +57,4 @@ export type VaultMessage = {
   focused: SecretField | null
   /** A form is open, which a turn to the Requests tab would drop. */
   formOpen: boolean
-  action?: VaultAction
-  tab?: Tab
 }

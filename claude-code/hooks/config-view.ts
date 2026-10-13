@@ -1,9 +1,10 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
 import type { ConfigAction, ConfigMessage, ConfigProps, TextEdit } from './config-view-props'
-import { drawTabs, TAB_ROWS, tabAt } from './tabs'
+import { cells, clip, displayed, pad, rowsOf } from './display'
+import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
 
-type Focus = 'text' | 'unlock' | 'mask' | 'forward'
+type Focus = 'text' | 'unlock' | 'mask' | 'forward' | 'forwardAtStart'
 
 export type ConfigState = {
   instance: string
@@ -15,7 +16,7 @@ export type ConfigState = {
 
 /** One row under the tabs. */
 export type Row =
-  | { kind: 'head' | 'gap' | 'buttonsTop' | 'buttons' | 'buttonsBottom' | 'unlock' | 'mask' | 'forward' }
+  | { kind: 'head' | 'gap' | 'buttonsTop' | 'buttons' | 'buttonsBottom' | 'unlock' | 'mask' | 'forward' | 'forwardAtStart' }
   | { kind: 'text'; text: string; isLast: boolean }
   | { kind: 'error'; text: string }
 
@@ -28,12 +29,8 @@ const BUTTONS = [
 ] as const
 const FIELD_BACKGROUND = '#1f2a3a'
 const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
-/** The rows around the text: head, buttons and gaps, the three settings, an error. */
-const FIXED_ROWS = 1 + 1 + 3 + 1 + 3 + 1
-
-function pad(text: string, width: number): string {
-  return text + ' '.repeat(Math.max(0, width - [...text].length))
-}
+/** The rows around the text: head, buttons and gaps, the four settings, an error. */
+const FIXED_ROWS = 1 + 1 + 3 + 1 + 4 + 1
 
 function edge(side: 'top' | 'bottom', width: number): string {
   const [left, right] = side === 'top' ? ['╭', '╮'] : ['╰', '╯']
@@ -50,7 +47,7 @@ export function shownText(draft: string, pending: TextEdit[]): string {
   for (const edit of pending) {
     if (edit.kind === 'append') text += edit.text
     else if (edit.kind === 'back') text = [...text].slice(0, -1).join('')
-    else text = ''
+    else if (edit.kind === 'clear') text = ''
   }
   return text
 }
@@ -60,29 +57,32 @@ export function status(shown: string, applied: string | null): string {
   return shown === applied ? 'applied' : 'changed, not applied'
 }
 
-/** Rows of at most `width`, broken after the last space that fits; a full last row leaves the cursor a row of its own. */
+/**
+ * A displayed text in rows of at most `width` cells, broken after the last space that fits; a full last row leaves
+ * the cursor a row of its own.
+ */
 export function wrap(text: string, width: number, cursor: boolean): string[] {
-  const chars = [...text]
   const rows: string[] = []
-  let at = 0
-  while (at < chars.length) {
-    let end = Math.min(at + width, chars.length)
-    const space = chars.lastIndexOf(' ', end - 1)
-    if (end < chars.length && chars[end] !== ' ' && space > at) end = space + 1
-    rows.push(chars.slice(at, end).join(''))
-    at = end
+  let rest = text
+  while (rest !== '') {
+    const fits = rowsOf(rest, width)[0]!
+    const space = fits.lastIndexOf(' ')
+    const end = fits.length < rest.length && !rest.slice(fits.length).startsWith(' ') && space > 0 ? space + 1 : fits.length
+    rows.push(rest.slice(0, end))
+    rest = rest.slice(end)
   }
-  if (rows.length === 0 || (cursor && [...rows.at(-1)!].length === width)) rows.push('')
+  if (rows.length === 0 || (cursor && cells(rows.at(-1)!) === width)) rows.push('')
   return rows
 }
 
 /** The view's rows; a text longer than the room shows its end, where typing goes. */
 export function layout(props: Pick<ConfigProps, 'columns' | 'rows' | 'forward' | 'error'>, shown: string, cursor: boolean): Row[] {
-  const lines = wrap(shown, props.columns - 2, cursor)
+  const lines = wrap(displayed(shown), props.columns - 2, cursor)
   const room = Math.max(1, props.rows - TAB_ROWS - FIXED_ROWS)
   const kept = lines.slice(-room)
   const rows: Row[] = [{ kind: 'head' }, ...kept.map((text, i) => ({ kind: 'text' as const, text, isLast: i === kept.length - 1 }))]
   rows.push({ kind: 'buttonsTop' }, { kind: 'buttons' }, { kind: 'buttonsBottom' }, { kind: 'gap' }, { kind: 'unlock' }, { kind: 'mask' })
+  rows.push({ kind: 'forwardAtStart' })
   if (props.forward !== null) rows.push({ kind: 'forward' })
   if (props.error !== null) rows.push({ kind: 'error', text: props.error })
   return rows
@@ -105,16 +105,18 @@ export function maskArrows(value: number) {
   return { less, more: less + [...`‹ ${value} `].length }
 }
 
-function postOf(state: ConfigState, edits = state.pending, action?: ConfigAction): ConfigMessage {
-  return { instance: state.instance, edits, textFocused: state.focus === 'text', ...(action === undefined ? {} : { action }) }
+function postOf(state: ConfigState, edits = state.pending): ConfigMessage {
+  return { instance: state.instance, edits, textFocused: state.focus === 'text' }
 }
 
 type EditBody = TextEdit extends infer E ? (E extends TextEdit ? Omit<E, 'seq'> : never) : never
 
+/** A numbered edit; a text edit gives the text the keyboard. */
 function withEdit(state: ConfigState, edit: EditBody): Result {
   const seq = state.seq + 1
   const pending = [...state.pending, { ...edit, seq } as TextEdit]
-  return { state: { ...state, seq, pending, focus: 'text' }, post: postOf({ ...state, focus: 'text' }, pending) }
+  const focus = edit.kind === 'action' || edit.kind === 'tab' ? state.focus : 'text'
+  return { state: { ...state, seq, pending, focus }, post: postOf({ ...state, focus }, pending) }
 }
 
 export function confirm(state: ConfigState, confirmed: number | undefined): ConfigState | null {
@@ -123,7 +125,7 @@ export function confirm(state: ConfigState, confirmed: number | undefined): Conf
 }
 
 function act(state: ConfigState, action: ConfigAction): Result {
-  return { state, post: postOf(state, state.pending, action) }
+  return withEdit(state, { kind: 'action', action })
 }
 
 function focusOn(state: ConfigState, focus: Focus): Result {
@@ -138,15 +140,18 @@ function typedText(k: ClientKeyEvent): string | null {
   return k.key
 }
 
-function settingAction(focus: Focus, props: Pick<ConfigProps, 'unlockAtStart' | 'maskMinLength' | 'forward'>, step: number): ConfigAction | null {
+type Settings = Pick<ConfigProps, 'unlockAtStart' | 'maskMinLength' | 'forward' | 'forwardAtStart'>
+
+function settingAction(focus: Focus, props: Settings, step: number): ConfigAction | null {
   if (focus === 'unlock') return { kind: 'unlockAtStart', on: !props.unlockAtStart }
+  if (focus === 'forwardAtStart') return { kind: 'forwardAtStart', on: !props.forwardAtStart }
   if (focus === 'forward' && props.forward !== null) return { kind: 'forward', on: !props.forward }
   if (focus === 'mask' && props.maskMinLength + step >= 1) return { kind: 'maskMinLength', value: props.maskMinLength + step }
   return null
 }
 
-export function onKey(state: ConfigState, props: Pick<ConfigProps, 'unlockAtStart' | 'maskMinLength' | 'forward'>, k: ClientKeyEvent): Result {
-  const order: Focus[] = props.forward === null ? ['text', 'unlock', 'mask'] : ['text', 'unlock', 'mask', 'forward']
+export function onKey(state: ConfigState, props: Settings, k: ClientKeyEvent): Result {
+  const order: Focus[] = props.forward === null ? ['text', 'unlock', 'mask', 'forwardAtStart'] : ['text', 'unlock', 'mask', 'forwardAtStart', 'forward']
   const at = order.indexOf(state.focus)
   if (k.key === 'up' || k.key === 'down') return focusOn(state, order[Math.max(0, Math.min(order.length - 1, at + (k.key === 'up' ? -1 : 1)))]!)
   const isEnter = k.key === 'return' || k.key === '\n'
@@ -165,8 +170,8 @@ export function onKey(state: ConfigState, props: Pick<ConfigProps, 'unlockAtStar
 /** `y` and `x` count from the view's top left, the tab rows included. */
 export function onClick(state: ConfigState, props: ConfigProps, y: number, x: number): Result {
   if (y < TAB_ROWS) {
-    const tab = y === 0 ? tabAt(props.tabs, x) : null
-    return tab !== null && tab !== 'config' ? { state, post: { ...postOf(state), tab } } : { state }
+    const tab: Tab | null = y === 0 ? tabAt(props.tabs, x) : null
+    return tab !== null && tab !== 'config' ? withEdit(state, { kind: 'tab', tab }) : { state }
   }
   const row = layout(props, shownText(props.draft, state.pending), state.focus === 'text')[y - TAB_ROWS]
   if (row === undefined) return { state }
@@ -182,7 +187,7 @@ export function onClick(state: ConfigState, props: ConfigProps, y: number, x: nu
     const moved = { ...state, focus: 'mask' as const }
     return action === null ? focusOn(state, 'mask') : act(moved, action)
   }
-  if (row.kind === 'unlock' || row.kind === 'forward') {
+  if (row.kind === 'unlock' || row.kind === 'forward' || row.kind === 'forwardAtStart') {
     const action = settingAction(row.kind, props, 1)
     const moved = { ...state, focus: row.kind }
     return action === null ? focusOn(state, row.kind) : act(moved, action)
@@ -211,7 +216,7 @@ const ConfigView: ClientModule<ConfigProps, ConfigState> = (props, surface) => {
 
   const shown = shownText(props.draft, state.pending)
   const look = (focus: Focus) => (state.focus === focus ? { color: 'claude' as const, bold: true } : {})
-  const line = (text: string, style: object = {}) => Text({ ...style, children: [pad(text, columns)] })
+  const line = (text: string, style: object = {}) => Text({ ...style, children: [pad(clip(text, columns), columns)] })
   const check = (on: boolean) => (on ? '✓' : '·')
   const rows = layout(props, shown, state.focus === 'text').map(row => {
     switch (row.kind) {
@@ -249,10 +254,12 @@ const ConfigView: ClientModule<ConfigProps, ConfigState> = (props, surface) => {
         return line(` ${check(props.unlockAtStart)} Unlock the vault at session start`, look('unlock'))
       case 'mask':
         return line(` Mask values of at least ‹ ${props.maskMinLength} › characters`, look('mask'))
+      case 'forwardAtStart':
+        return line(` ${check(props.forwardAtStart)} Your ssh-agent's keys too, from session start`, look('forwardAtStart'))
       case 'forward':
         return line(` ${check(props.forward === true)} Your ssh-agent's keys too, this session`, look('forward'))
       case 'error':
-        return line(' ' + row.text, { color: 'error' })
+        return line(' ' + displayed(row.text), { color: 'error' })
       default:
         return line('')
     }

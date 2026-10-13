@@ -1,7 +1,9 @@
 //! Usage: secrets-relay <socket-path>
 //!
 //! HTTP/1.0 on a unix socket (mode 0600); prints events to stdout as JSON lines, the first `{"ready": path,
-//! "vault": "absent" | "locked"}` once it listens. The vault lives at `$XDG_DATA_HOME/secrets/vault`.
+//! "vault": "absent" | "locked", "bin": dir}` once it listens, `bin` being the resolved directory of its helpers, the
+//! only `secrets-mask-run` it serves. The vault lives at `$XDG_DATA_HOME/secrets/vault`. It ends on SIGTERM and when
+//! its parent goes.
 //!
 //! For commands; `pid` and `cmdline` in the events name the requester by its peer credentials: the
 //! `secrets-mask-run` it runs under (`inside: true`), else the requesting process itself:
@@ -48,8 +50,15 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
+use zeroize::Zeroizing;
 
 const HEAD_MAX: usize = 65536;
+/// The largest request body: `/mask` carries whole tool results.
+const BODY_MAX: usize = 32 << 20;
+/// A request's head, and then its body, must arrive within this.
+const REQUEST_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the relay checks that Claude Code, its parent, is still there.
+const PARENT_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 const COSTS: Costs = Costs { memory_kib: 65536, time: 3, lanes: 1 };
 /// Masking's shortest value until the hooks send theirs.
 const MASK_MIN: usize = 6;
@@ -98,15 +107,17 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-struct Request {
+/// A request's head, and the body bytes that came with it.
+struct Head {
     method: String,
     path: String,
-    body: Vec<u8>,
+    length: usize,
+    started: Zeroizing<Vec<u8>>,
 }
 
-async fn read_request(stream: &mut UnixStream) -> Option<Request> {
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 4096];
+async fn read_head(stream: &mut UnixStream) -> Option<Head> {
+    let mut raw = Zeroizing::new(Vec::new());
+    let mut buf = Zeroizing::new([0u8; 4096]);
     let head_end = loop {
         if let Some(end) = memchr::memmem::find(&raw, b"\r\n\r\n") {
             break end;
@@ -114,7 +125,7 @@ async fn read_request(stream: &mut UnixStream) -> Option<Request> {
         if raw.len() > HEAD_MAX {
             return None;
         }
-        let n = stream.read(&mut buf).await.ok().filter(|n| *n > 0)?;
+        let n = stream.read(buf.as_mut()).await.ok().filter(|n| *n > 0)?;
         raw.extend_from_slice(buf.get(..n)?);
     };
     let head = String::from_utf8_lossy(raw.get(..head_end)?).into_owned();
@@ -126,13 +137,19 @@ async fn read_request(stream: &mut UnixStream) -> Option<Request> {
         .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    let mut body = raw.get(head_end + 4..)?.to_vec();
-    while body.len() < length {
-        let n = stream.read(&mut buf).await.ok().filter(|n| *n > 0)?;
+    let started = Zeroizing::new(raw.get(head_end + 4..)?.to_vec());
+    Some(Head { method, path, length, started })
+}
+
+async fn read_body(stream: &mut UnixStream, head: Head) -> Option<Zeroizing<Vec<u8>>> {
+    let mut body = head.started;
+    let mut buf = Zeroizing::new([0u8; 4096]);
+    while body.len() < head.length {
+        let n = stream.read(buf.as_mut()).await.ok().filter(|n| *n > 0)?;
         body.extend_from_slice(buf.get(..n)?);
     }
-    body.truncate(length);
-    Some(Request { method, path, body })
+    body.truncate(head.length);
+    Some(body)
 }
 
 async fn respond(stream: &mut UnixStream, status: &str, body: &[u8]) {
@@ -193,13 +210,19 @@ async fn json_reply(stream: &mut UnixStream, reply: Option<serde_json::Value>) {
 }
 
 async fn serve(mut stream: UnixStream, ctx: Shared) {
-    let Some(request) = read_request(&mut stream).await else { return };
-    let route = (request.method.as_str(), request.path.as_str());
+    let Ok(Some(head)) = tokio::time::timeout(REQUEST_WITHIN, read_head(&mut stream)).await else { return };
+    let (method, path) = (head.method.clone(), head.path.clone());
+    let route = (method.as_str(), path.as_str());
     let for_claude_code = !matches!(route, ("POST", "/ask" | "/list" | "/filter"));
     if for_claude_code && !peer::is_claude_code(&stream) {
         return respond(&mut stream, "403 Forbidden", b"").await;
     }
-    let body = &request.body;
+    if head.length > BODY_MAX {
+        return respond(&mut stream, "413 Content Too Large", b"").await;
+    }
+    let Ok(Some(body)) = tokio::time::timeout(REQUEST_WITHIN, read_body(&mut stream, head)).await else { return };
+    locker::fresh(&ctx, &mut lock(&ctx));
+    let body = body.as_slice();
     match route {
         ("POST", "/ask") => pass::ask(&mut stream, &ctx, body).await,
         ("POST", "/list") => locker::list(&mut stream, &ctx).await,
@@ -244,6 +267,7 @@ fn vault_path() -> Option<PathBuf> {
 }
 
 fn main() -> ExitCode {
+    let parent = rustix::process::getppid();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [path] = args.as_slice() else {
         note("usage: secrets-relay <socket-path>");
@@ -292,9 +316,11 @@ fn main() -> ExitCode {
             note("can't watch for SIGTERM");
             return ExitCode::FAILURE;
         };
-        emit(&json!({ "ready": path, "vault": vault.shown() }));
+        let bin = mask_run.parent().map(|dir| dir.display().to_string());
+        emit(&json!({ "ready": path, "vault": vault.shown(), "bin": bin }));
         let state = State { pass: pass::Pass::default(), deciding: HashMap::new(), vault, filter: filter::Filter::new(MASK_MIN), forward: false };
         let ctx = Arc::new(Context { state: Mutex::new(state), mask_run, vault_path, upstream });
+        let mut parent_check = tokio::time::interval(PARENT_CHECK);
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -308,6 +334,12 @@ fn main() -> ExitCode {
                     }
                 }
                 _ = terminate.recv() => break,
+                // Claude Code killed outright never ends the relay; reparented, it would keep the vault open.
+                _ = parent_check.tick() => {
+                    if rustix::process::getppid() != parent {
+                        break;
+                    }
+                }
             }
         }
         let _ = std::fs::remove_file(path);

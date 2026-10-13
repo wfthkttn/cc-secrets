@@ -3,5 +3,6 @@
   "version": "0.1.0",
   "description": "Passwords for the session's commands, typed into Claude Code",
   "author": { "name": "alex" },
-  "dependencies": ["sidebar"]
+  "dependencies": ["sidebar"],
+  "types": "./types/index.d.ts"
 }

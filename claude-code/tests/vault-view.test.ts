@@ -2,7 +2,10 @@ import { expect, test } from 'claude-code/testing'
 
 import { TAB_ROWS, tabSpans } from '../hooks/tabs'
 import VaultView, { closedRows, doorButtons, formButtons, initialState, listRows, onClick, onKey, type ViewState } from '../hooks/vault-view'
-import type { VaultProps, ViewEntry } from '../hooks/vault-view-props'
+import type { ValueEdit, VaultProps, ViewEntry } from '../hooks/vault-view-props'
+
+const isAction = (e: ValueEdit): e is Extract<ValueEdit, { kind: 'action' }> => e.kind === 'action'
+const isTab = (e: ValueEdit): e is Extract<ValueEdit, { kind: 'tab' }> => e.kind === 'tab'
 
 const ENTRIES: ViewEntry[] = [
   { id: 'e1', name: 'Prod DB', tag: 'db', kind: 'password', use: 'session', allowed: true },
@@ -59,8 +62,8 @@ test('keys on a closed vault go to its passphrase; Enter or the button opens it'
   const locked = { ...PROPS, state: 'locked' as const, entries: [], suggestions: [] }
   const typed = onKey(CLOSED, locked, { key: 'p4ss' })
   expect(typed.post).toEqual({ instance: 'v1', edits: [{ seq: 1, field: 'passphrase', kind: 'append', text: 'p4ss' }], focused: 'passphrase', formOpen: false })
-  expect(onKey(typed.state, locked, { key: 'return' }).post?.action).toEqual({ kind: 'open' })
-  expect(click(CLOSED, 3, doorButtons('locked')[0]!.start + 1, locked).post?.action).toEqual({ kind: 'open' })
+  expect(onKey(typed.state, locked, { key: 'return' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'open' })
+  expect(click(CLOSED, 3, doorButtons('locked')[0]!.start + 1, locked).post?.edits.find(isAction)?.action).toEqual({ kind: 'open' })
   const absent = { ...locked, state: 'absent' as const }
   const again = onKey(CLOSED, absent, { key: 'down' })
   expect(again.post?.focused).toBe('again')
@@ -92,14 +95,14 @@ test('Add opens an empty form and drops any value left; typed text fills the fie
   expect(toValue.post?.focused).toBe('value')
   const typed = onKey(toValue.state, PROPS, { key: 's3cret' })
   expect(typed.post?.edits.at(-1)).toEqual({ seq: 2, field: 'value', kind: 'append', text: 's3cret' })
-  expect(onKey(typed.state, PROPS, { key: 'return' }).post?.action).toEqual({ kind: 'save', form: typed.state.form })
+  expect(onKey(typed.state, PROPS, { key: 'return' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'save', form: typed.state.form })
 })
 
 test('an entry opens for editing; its dot or space allows or revokes it for the session', async () => {
   expect(click(START, 1, 10).state.form).toEqual({ id: 'e1', suggestion: null, name: 'Prod DB', tag: 'db', kind: 'password', use: 'session' })
-  expect(click(START, 2, 1).post?.action).toEqual({ kind: 'allow', id: 'e2', allowed: true })
+  expect(click(START, 2, 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'allow', id: 'e2', allowed: true })
   const onDeploy = onKey(onKey(START, PROPS, { key: 'down' }).state, PROPS, { key: 'down' }).state
-  expect(onKey(onDeploy, PROPS, { key: 'space' }).post?.action).toEqual({ kind: 'allow', id: 'e2', allowed: true })
+  expect(onKey(onDeploy, PROPS, { key: 'space' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'allow', id: 'e2', allowed: true })
 })
 
 test('a suggestion opens as a new entry named by its prompt; its value is not typed again, nor an ssh key', async () => {
@@ -114,7 +117,7 @@ test('a suggestion opens as a new entry named by its prompt; its value is not ty
   expect(atValue.post).toBe(undefined)
   const buttonsRow = 5 + 1 + 1
   const dismiss = formButtons(opened.state.form!)[1]!
-  expect(click(opened.state, buttonsRow, dismiss.start + 1).post?.action).toEqual({ kind: 'dismiss', id: 's1' })
+  expect(click(opened.state, buttonsRow, dismiss.start + 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'dismiss', id: 's1' })
 })
 
 test('the form saves, deletes an existing entry, or closes on ✕', async () => {
@@ -124,8 +127,8 @@ test('the form saves, deletes an existing entry, or closes on ✕', async () => 
   const buttons = formButtons(edit.form!)
   expect(buttons.map(b => b.kind)).toEqual(['save', 'delete', 'cancel'])
   const buttonsRow = 5 + 1 + 1
-  expect(click(edit, buttonsRow, buttons[1]!.start + 1).post?.action).toEqual({ kind: 'delete', id: 'e1' })
-  expect(click(edit, buttonsRow, buttons[0]!.start).post?.action).toEqual({ kind: 'save', form: edit.form })
+  expect(click(edit, buttonsRow, buttons[1]!.start + 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'delete', id: 'e1' })
+  expect(click(edit, buttonsRow, buttons[0]!.start).post?.edits.find(isAction)?.action).toEqual({ kind: 'save', form: edit.form })
   const closed = click(edit, buttonsRow - 1, buttons[2]!.start + 2)
   expect(closed.state.form).toBe(null)
   expect(closed.post?.edits.at(-1)).toEqual({ seq: 2, field: 'value', kind: 'clear' })
@@ -134,7 +137,7 @@ test('the form saves, deletes an existing entry, or closes on ✕', async () => 
 
 test('the Requests tab switches back; a saved form closes when the hooks bump the epoch', async () => {
   const requests = tabSpans(PROPS.tabs)[0]!
-  expect(onClick(START, PROPS, 0, requests.start + 1).post?.tab).toBe('requests')
+  expect(onClick(START, PROPS, 0, requests.start + 1).post?.edits.find(isTab)?.tab).toBe('requests')
   const edit = click(START, 1, 10).state
   const rows = draw({ ...PROPS, formEpoch: 1 }, edit)
   expect(rows.some(r => r.includes('+ Add'))).toBe(true)

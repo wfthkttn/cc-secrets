@@ -117,6 +117,14 @@ pub struct Masker {
     patterns: BTreeSet<Vec<u8>>,
 }
 
+impl Drop for Masker {
+    fn drop(&mut self) {
+        for mut pattern in std::mem::take(&mut self.patterns) {
+            zeroize::Zeroize::zeroize(&mut pattern);
+        }
+    }
+}
+
 impl Masker {
     /// Values shorter than `min_length` characters are left unmasked: they would turn up in ordinary text.
     pub fn new(min_length: usize) -> Self {

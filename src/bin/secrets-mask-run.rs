@@ -3,7 +3,8 @@
 //! Runs the invocation with `/bin/sh -c`, or through `$SECRETS_ORIG_PREFIX` when set, passing its stdout and
 //! stderr through the relay at `$SECRETS_RELAY`, which masks them (`secrets::filter`); this process holds no values.
 //! Exits with the command's status, 128 + the signal when a signal ended it. Without a relay, or refused by it, the
-//! command still runs; one line on stderr says its output is unmasked.
+//! command still runs; one line on stderr says its output is unmasked. A relay that goes away mid-call may have handed
+//! the call a value, so the rest of its output is withheld; the command runs on.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -92,9 +93,10 @@ impl Output {
         let _ = self.sink.write_all(bytes).and_then(|()| self.sink.flush());
     }
 
-    /// Passes a piece through the relay; once the relay is gone, the rest goes out unmasked, after one line saying so.
+    /// Passes a piece through the relay. Once the relay is gone the rest is withheld, after one line saying so: it may
+    /// have handed this call a value that only it could mask.
     fn pass(&mut self, filter: &mut Option<Filter>, kind: u8, body: &[u8]) {
-        let Some(open) = filter.as_mut() else { return self.write(body) };
+        let Some(open) = filter.as_mut() else { return };
         match open.send(kind, self.which, body) {
             Ok((out, holding)) => {
                 self.write(&out);
@@ -103,8 +105,7 @@ impl Output {
             Err(error) => {
                 *filter = None;
                 self.holding = false;
-                note(&format!("the secrets relay stopped ({error}); what it held back is dropped and the rest is not masked"));
-                self.write(body);
+                note(&format!("the secrets relay stopped ({error}); the rest of this output is withheld"));
             }
         }
     }

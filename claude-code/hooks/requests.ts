@@ -1,7 +1,8 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
+import { cells, clip, displayed, pad, rowsOf } from './display'
 import type { Edit, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
-import { drawTabs, TAB_ROWS, tabAt } from './tabs'
+import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
 
 export type ListState = {
   /** Tells this instance's edits apart from another's, the pop-out's and the list's. */
@@ -9,13 +10,12 @@ export type ListState = {
   seq: number
   /** Edits sent but not yet confirmed by the hooks. */
   pending: Edit[]
+  /** The card the keys go to; null picks the first, and a card that left the list leaves nothing selected. */
   selected: string | null
   isFocused: boolean
   epoch: number
   /** The first card row shown; clamped when drawn. */
   scroll: number
-  /** What each request's field holds, as chosen in its menu: a vault entry's id, or null to type; unset keeps the request's `preset`. */
-  choices: Record<string, string | null>
   /** The selected card's menu is open. */
   isMenuOpen: boolean
   /** The menu's highlighted option: 0 is Type, then the entries. */
@@ -75,18 +75,8 @@ function edge(side: 'top' | 'bottom', width: number): string {
   return left + '─'.repeat(width - 2) + right
 }
 
-/** `text` cut to `width` characters, the last one `…` when cut. */
-function clip(text: string, width: number): string {
-  const chars = [...text]
-  return chars.length <= width ? text : chars.slice(0, width - 1).join('') + '…'
-}
-
-function pad(text: string, width: number): string {
-  return text + ' '.repeat(Math.max(0, width - [...text].length))
-}
-
 export function initialState(focusEpoch: number, instance: string): ListState {
-  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0, choices: {}, isMenuOpen: false, cursor: 0 }
+  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0, isMenuOpen: false, cursor: 0 }
 }
 
 /** The vault entries a card may be answered with; none for a sign card or a closed vault. */
@@ -94,9 +84,10 @@ function offerOf(entry: RequestEntry): Offered[] {
   return entry.kind === 'secret' ? (entry.offer ?? []) : []
 }
 
-/** The entry the card's field holds; null while it takes typing. */
-export function choiceOf(choices: Record<string, string | null>, entry: RequestEntry): Offered | null {
-  const id = entry.id in choices ? choices[entry.id] : entry.preset
+/** The entry the card's field holds, with this instance's unconfirmed menu choices on top; null while it takes typing. */
+export function choiceOf(entry: RequestEntry, pending: Edit[]): Offered | null {
+  let id = entry.chosen
+  for (const edit of pending) if (edit.kind === 'choose' && edit.id === entry.id) id = edit.entry
   return offerOf(entry).find(o => o.id === id) ?? null
 }
 
@@ -108,12 +99,12 @@ function typedText(k: ClientKeyEvent): string | null {
 }
 
 function selectedOf(state: ListState, entries: RequestEntry[]): string | null {
-  if (state.selected !== null && entries.some(e => e.id === state.selected)) return state.selected
-  return entries[0]?.id ?? null
+  if (state.selected === null) return entries[0]?.id ?? null
+  return entries.some(e => e.id === state.selected) ? state.selected : null
 }
 
-function postOf(state: ListState, selected: string | null, edits = state.pending, dismiss = false): RequestsMessage {
-  return { instance: state.instance, selected, edits, ...(dismiss ? { dismiss: true as const } : {}) }
+function postOf(state: ListState, selected: string | null, edits = state.pending): RequestsMessage {
+  return { instance: state.instance, selected, edits }
 }
 
 /** Drops the edits the hooks confirmed; null when none were. */
@@ -126,7 +117,7 @@ export function confirm(state: ListState, applied: number | undefined): ListStat
 export function shownLength(entry: RequestEntry, pending: Edit[]): number {
   let length = entry.length
   for (const edit of pending) {
-    if (edit.id !== entry.id) continue
+    if (!('id' in edit) || edit.id !== entry.id) continue
     if (edit.kind === 'append') length += [...edit.text].length
     else if (edit.kind === 'back') length = Math.max(0, length - 1)
     else if (edit.kind === 'clear') length = 0
@@ -134,29 +125,19 @@ export function shownLength(entry: RequestEntry, pending: Edit[]): number {
   return length
 }
 
-function wrap(text: string, width: number, maxRows: number): string[] {
-  const chars = [...text]
-  const rows: string[] = []
-  for (let i = 0; i < chars.length && rows.length < maxRows; i += width) rows.push(chars.slice(i, i + width).join(''))
-  if (chars.length > width * maxRows) rows[maxRows - 1] = clip(rows[maxRows - 1]! + '…', width)
-  return rows.length === 0 ? [''] : rows
-}
-
 function wrapWords(text: string, width: number, maxRows: number): string[] {
   const rows: string[] = []
   let row = ''
   for (const word of text.split(/\s+/).filter(w => w !== '')) {
     const joined = row === '' ? word : row + ' ' + word
-    if ([...joined].length <= width) {
+    if (cells(joined) <= width) {
       row = joined
       continue
     }
     if (row !== '') rows.push(row)
-    row = word
-    while ([...row].length > width) {
-      rows.push([...row].slice(0, width).join(''))
-      row = [...row].slice(width).join('')
-    }
+    const pieces = rowsOf(word, width)
+    rows.push(...pieces.slice(0, -1))
+    row = pieces.at(-1)!
   }
   if (row !== '') rows.push(row)
   if (rows.length <= maxRows) return rows
@@ -185,12 +166,13 @@ export function grantButtons(columns: number, withCancel = true) {
   })
 }
 
-export function layout(entries: RequestEntry[], columns: number, message: string | null, choices: Record<string, string | null> = {}): Row[] {
+/** The rows the request cards take; text from outside is drawn displayed (`display.ts`), one screen row each. */
+export function layout(entries: RequestEntry[], columns: number, message: string | null, pending: Edit[] = []): Row[] {
   if (entries.length === 0 && message === null) return [{ id: null, kind: 'empty' }]
   const { inner, fieldColumns } = geometry(columns)
   const rows: Row[] = []
   if (message !== null) {
-    const lines = wrapWords(message, fieldColumns, MESSAGE_MAX_ROWS)
+    const lines = wrapWords(displayed(message), fieldColumns, MESSAGE_MAX_ROWS)
     rows.push({ id: null, kind: 'msgTop' })
     for (let index = 0; index < Math.max(BUTTON_ROW_TEXT.length, lines.length); index++) {
       rows.push({ id: null, kind: 'msg', text: lines[index] ?? '', index })
@@ -200,11 +182,16 @@ export function layout(entries: RequestEntry[], columns: number, message: string
   for (const entry of entries) {
     if (rows.length > 0) rows.push({ id: null, kind: 'gap' })
     rows.push({ id: entry.id, kind: 'cardTop' })
-    rows.push({ id: entry.id, kind: 'what', text: entry.prompt, since: entry.since })
-    if (entry.source !== '') for (const text of wrap(entry.source, inner, FROM_MAX_ROWS)) rows.push({ id: entry.id, kind: 'from', text })
+    rows.push({ id: entry.id, kind: 'what', text: displayed(entry.prompt), since: entry.since })
+    if (entry.source !== '') {
+      const from = rowsOf(displayed(entry.source), inner)
+      const kept = from.slice(0, FROM_MAX_ROWS)
+      if (from.length > FROM_MAX_ROWS) kept[FROM_MAX_ROWS - 1] = clip(kept[FROM_MAX_ROWS - 1]! + '…', inner)
+      for (const text of kept) rows.push({ id: entry.id, kind: 'from', text })
+    }
     const answer = entry.kind === 'sign' ? (['grantTop', 'grant', 'grantBottom'] as const) : (['fieldTop', 'field', 'fieldBottom'] as const)
     for (const kind of answer) rows.push({ id: entry.id, kind })
-    if (choiceOf(choices, entry) !== null) for (const kind of ['pickTop', 'pick', 'pickBottom'] as const) rows.push({ id: entry.id, kind })
+    if (choiceOf(entry, pending) !== null) for (const kind of ['pickTop', 'pick', 'pickBottom'] as const) rows.push({ id: entry.id, kind })
     rows.push({ id: entry.id, kind: 'cardBottom' })
   }
   return rows
@@ -232,7 +219,7 @@ type Window = { head: Row[]; body: Row[]; top: number; room: number; fits: boole
 
 /** The message rows, the card rows, and which card rows fit under the message. */
 function windowOf(entries: RequestEntry[], frame: Frame, state: ListState): Window {
-  const all = layout(entries, frame.columns, frame.message, state.choices)
+  const all = layout(entries, frame.columns, frame.message, state.pending)
   const headLength = all.findIndex(r => r.kind === 'msgBottom') + 1
   const head = all.slice(0, headLength)
   const body = all.slice(headLength)
@@ -254,7 +241,7 @@ export function view(entries: RequestEntry[], frame: Frame, state: ListState): V
   ]
 }
 
-/** The selected card's open menu, placed under its field, or above it when the room below is short; null when shut. */
+/** The selected card's open menu, placed under its field, or above it when the room below is short; null when shut or not on screen. */
 export function menuOf(entries: RequestEntry[], frame: Frame, state: ListState): Menu | null {
   if (!state.isMenuOpen) return null
   const entry = entries.find(e => e.id === selectedOf(state, entries))
@@ -262,7 +249,7 @@ export function menuOf(entries: RequestEntry[], frame: Frame, state: ListState):
   const rows = view(entries, frame, state)
   const fieldTop = rows.findIndex(r => r.id === entry.id && r.kind === 'fieldTop')
   if (fieldTop < 0) return null
-  const options = [TYPE_OPTION, ...offerOf(entry).map(o => o.label)]
+  const options = [TYPE_OPTION, ...offerOf(entry).map(o => displayed(o.label))]
   const height = menuHeight(options.length)
   const below = fieldTop + 3
   const top = below + height <= frame.rows || fieldTop - height < 0 ? below : fieldTop - height
@@ -289,17 +276,12 @@ function selectCard(state: ListState, entries: RequestEntry[], frame: Frame, id:
   return tell || id !== selectedOf(state, entries) ? { state: shown, post: postOf(state, id) } : { state: shown }
 }
 
-/** Opens the card's menu on what its field holds now. */
-function openMenu(state: ListState, entry: RequestEntry): Result {
-  const chosen = choiceOf(state.choices, entry)
+/** Opens the card's menu on what its field holds now, the card scrolled into view. */
+function openMenu(state: ListState, entries: RequestEntry[], frame: Frame, entry: RequestEntry): Result {
+  const chosen = choiceOf(entry, state.pending)
   const cursor = chosen === null ? 0 : offerOf(entry).findIndex(o => o.id === chosen.id) + 1
-  return { state: { ...state, selected: entry.id, isFocused: true, isMenuOpen: true, cursor }, post: postOf(state, entry.id) }
-}
-
-/** The menu's option `index` goes into the field: 0 makes it take typing, any other is that entry. */
-function choose(state: ListState, entry: RequestEntry, index: number): ListState {
-  const chosen = index === 0 ? null : (offerOf(entry)[index - 1]?.id ?? null)
-  return { ...state, choices: { ...state.choices, [entry.id]: chosen }, isMenuOpen: false, isFocused: true }
+  const opened = { ...state, selected: entry.id, isFocused: true, isMenuOpen: true, cursor }
+  return { state: { ...opened, scroll: reveal(entries, frame, opened, entry.id) }, post: postOf(state, entry.id) }
 }
 
 type EditBody = Edit extends infer E ? (E extends Edit ? Omit<E, 'seq'> : never) : never
@@ -310,27 +292,41 @@ function withEdit(state: ListState, selected: string | null, edit: EditBody): Re
   return { state: { ...state, seq, pending, selected, isFocused: true }, post: postOf(state, selected, pending) }
 }
 
+/** The menu's option `index` goes into the field: 0 makes it take typing, any other is that entry. */
+function choose(state: ListState, entry: RequestEntry, index: number): Result {
+  const chosen = index === 0 ? null : (offerOf(entry)[index - 1]?.id ?? null)
+  return withEdit({ ...state, isMenuOpen: false }, entry.id, { id: entry.id, kind: 'choose', entry: chosen })
+}
+
 export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k: ClientKeyEvent): Result {
   const selected = selectedOf(state, entries)
-  if (selected === null) return { state }
+  if (selected === null) {
+    // The selected card left: the keys wait for a new selection rather than go to another card.
+    const closed = { ...state, isMenuOpen: false }
+    const first = k.key === 'down' || k.key === 'home' ? entries[0] : k.key === 'up' || k.key === 'end' ? entries.at(-1) : undefined
+    return first === undefined ? { state: closed } : selectCard(closed, entries, frame, first.id, true)
+  }
   const at = entries.findIndex(e => e.id === selected)
   const entry = entries[at]!
   const offer = offerOf(entry)
   const isEnter = k.key === 'return' || k.key === '\n'
-  if (state.isMenuOpen && offer.length > 0) {
-    if (k.key === 'up') return { state: { ...state, cursor: Math.max(0, state.cursor - 1) } }
-    if (k.key === 'down') return { state: { ...state, cursor: Math.min(offer.length, state.cursor + 1) } }
-    if (isEnter) return { state: choose(state, entry, state.cursor) }
-    if (k.key === 'tab') return { state: { ...state, isMenuOpen: false } }
-    return { state }
+  if (state.isMenuOpen) {
+    if (menuOf(entries, frame, state) === null) state = { ...state, isMenuOpen: false }
+    else {
+      if (k.key === 'up') return { state: { ...state, cursor: Math.max(0, state.cursor - 1) } }
+      if (k.key === 'down') return { state: { ...state, cursor: Math.min(offer.length, state.cursor + 1) } }
+      if (isEnter) return choose(state, entry, state.cursor)
+      if (k.key === 'tab') return { state: { ...state, isMenuOpen: false } }
+      return { state }
+    }
   }
   // Escape never reaches a Client and ↑/↓ move between cards, so Tab opens the menu.
-  if (k.key === 'tab' && offer.length > 0) return openMenu(state, entry)
+  if (k.key === 'tab' && offer.length > 0) return openMenu(state, entries, frame, entry)
   const jumps: Record<string, number> = { up: at - 1, down: at + 1, home: 0, end: entries.length - 1 }
   const to = jumps[k.key]
   if (to !== undefined) return selectCard(state, entries, frame, entries[Math.max(0, Math.min(entries.length - 1, to))]!.id)
   if (entry.kind === 'sign') return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: null }) : { state }
-  const chosen = choiceOf(state.choices, entry)
+  const chosen = choiceOf(entry, state.pending)
   if (chosen !== null) return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: chosen.id }) : { state }
   if (isEnter) return withEdit(state, selected, { id: selected, kind: 'submit' })
   if (k.key === 'backspace' || k.key === 'delete') return withEdit(state, selected, { id: selected, kind: 'back' })
@@ -339,14 +335,18 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   return text === null ? { state } : withEdit(state, selected, { id: selected, kind: 'append', text })
 }
 
+/** Another tab was clicked: a numbered edit, so a later post in the same frame keeps it. */
+export function onTab(state: ListState, entries: RequestEntry[], tab: Tab): Result {
+  return withEdit(state, selectedOf(state, entries), { kind: 'tab', tab })
+}
+
 /** A click gives the list the keyboard, so it always tells the hooks what is selected. */
 export function onClick(state: ListState, entries: RequestEntry[], frame: Frame, y: number, x: number): Result {
   const menu = menuOf(entries, frame, state)
   if (menu !== null) {
     const entry = entries.find(e => e.id === menu.id)!
     const inside = x >= menu.left && x < menu.left + menu.width && y >= menu.top && y < menu.top + menuHeight(menu.options.length)
-    const option = menu.first + y - menu.top - 1
-    if (inside && y > menu.top && y <= menu.top + menu.shown) return { state: choose(state, entry, option), post: postOf(state, menu.id) }
+    if (inside && y > menu.top && y <= menu.top + menu.shown) return choose(state, entry, menu.first + y - menu.top - 1)
     if (inside) return { state }
     // A click outside shuts the menu and goes on to what it hit.
     state = { ...state, isMenuOpen: false }
@@ -364,19 +364,19 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
         : w.body.slice(w.top + w.room).find(r => r.kind === 'cardBottom')?.id
     if (id != null) return selectCard(state, entries, frame, id, true)
   }
-  if (row?.kind === 'msg' && row.index < BUTTON_ROW_TEXT.length && onButton) return { state: focused, post: postOf(state, current, state.pending, true) }
+  if (row?.kind === 'msg' && row.index < BUTTON_ROW_TEXT.length && onButton) return withEdit(state, current, { kind: 'dismiss' })
   if (row?.id == null) return { state: focused, post: postOf(state, current) }
   const entry = entries.find(e => e.id === row.id)!
   const isField = row.kind === 'fieldTop' || row.kind === 'field' || row.kind === 'fieldBottom'
   if (isField && onButton) return withEdit(state, current, { id: row.id, kind: 'cancel' })
   // A click on the field, whatever it holds, opens its menu.
-  if (isField && offerOf(entry).length > 0) return openMenu(state, entry)
+  if (isField && offerOf(entry).length > 0) return openMenu(state, entries, frame, entry)
   if (row.kind === 'grantTop' || row.kind === 'grant' || row.kind === 'grantBottom') {
     const button = grantButtons(frame.columns).find(b => x >= b.start && x < b.start + b.width)
     if (button?.kind === 'cancel') return withEdit(state, current, { id: row.id, kind: 'cancel' })
     if (button !== undefined) return withEdit(state, current, { id: row.id, kind: button.kind, entry: null })
   }
-  const chosen = choiceOf(state.choices, entry)
+  const chosen = choiceOf(entry, state.pending)
   if (chosen !== null && (row.kind === 'pickTop' || row.kind === 'pick' || row.kind === 'pickBottom')) {
     const button = grantButtons(frame.columns, false).find(b => x >= b.start && x < b.start + b.width)
     if (button !== undefined && button.kind !== 'cancel') return withEdit(state, current, { id: row.id, kind: button.kind, entry: chosen.id })
@@ -392,9 +392,11 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   surface.onPointer(p => {
     if (p.type !== 'down') return
     if (p.y < tabRows) {
-      const current = surface.state as ListState
       const tab = p.y === 0 && props.tabs !== null ? tabAt(props.tabs, p.x) : null
-      if (tab !== null && tab !== 'requests') surface.post({ ...postOf(current, selectedOf(current, props.entries)), tab })
+      if (tab === null || tab === 'requests') return
+      const result = onTab(surface.state as ListState, props.entries, tab)
+      surface.setState(result.state)
+      if (result.post) surface.post(result.post)
       return
     }
     const result = onClick(surface.state as ListState, props.entries, frame, p.y - tabRows, p.x)
@@ -426,7 +428,7 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
         return Text({ dimColor: true, children: [pad('No requests', columns)] })
       case 'more': {
         const label = row.count === 0 ? '' : `${row.dir === 'up' ? '▲' : '▼'} ${row.count} more`
-        return Text({ dimColor: true, children: [pad(' '.repeat(Math.floor((columns - [...label].length) / 2)) + label, columns)] })
+        return Text({ dimColor: true, children: [pad(' '.repeat(Math.floor((columns - cells(label)) / 2)) + label, columns)] })
       }
       case 'msgTop':
       case 'msgBottom':
@@ -464,12 +466,12 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
         const entry = entriesById.get(row.id)!
         const hasMenu = offerOf(entry).length > 0
         const room = fieldColumns - 4 - (hasMenu ? 2 : 0)
-        const chosen = choiceOf(state.choices, entry)
+        const chosen = choiceOf(entry, state.pending)
         const count = shownLength(entry, state.pending)
         const typing = active(row.id) && chosen === null
         const shown =
           chosen !== null
-            ? clip(chosen.label, room)
+            ? clip(displayed(chosen.label), room)
             : typing
               ? (count + 1 > room ? '…' + '•'.repeat(room - 2) : '•'.repeat(count)) + '▏'
               : count > 0
@@ -523,7 +525,11 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
                   flexDirection: 'row',
                   children: [
                     Text({ color: 'claude', children: ['│'] }),
-                    Text({ backgroundColor: FIELD_BACKGROUND, ...(isCursor ? { color: 'claude' as const, bold: true } : {}), children: [pad((isCursor ? ' ▸ ' : '   ') + clip(option, menu.width - 5), menu.width - 2)] }),
+                    Text({
+                      backgroundColor: FIELD_BACKGROUND,
+                      ...(isCursor ? { color: 'claude' as const, bold: true } : {}),
+                      children: [pad((isCursor ? ' ▸ ' : '   ') + clip(option, menu.width - 5), menu.width - 2)],
+                    }),
                     Text({ color: 'claude', children: ['│'] }),
                   ],
                 })

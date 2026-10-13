@@ -1,6 +1,7 @@
 //! Masking, done here only: the values never leave this process. Each Bash call's `secrets-mask-run` pipes its
-//! output through a `/filter` stream, masked with the values handed to that call and, while the vault is open,
-//! every value it holds. The hooks send other tools' results to `/mask` and tool calls' input to `/check`.
+//! output through a `/filter` stream, masked with the values handed to that call, the values typed for any call
+//! still running and, while the vault is open, every value it holds. The hooks send other tools' results to `/mask`
+//! and tool calls' input to `/check`.
 
 use std::collections::HashMap;
 
@@ -24,6 +25,9 @@ struct Call {
 pub struct Filter {
     min_length: usize,
     calls: HashMap<i32, Call>,
+    /// Typed values, each with the call it was handed to: every call masks them until that call ends, since another
+    /// call can show the asking one's command line (`ps`).
+    typed: Vec<(i32, Zeroizing<String>)>,
     /// The open vault's values, entries and suggestions; empty while it is closed.
     vault_values: Vec<Zeroizing<String>>,
     vault: Masker,
@@ -33,12 +37,12 @@ pub struct Filter {
 
 impl Filter {
     pub fn new(min_length: usize) -> Self {
-        Self { min_length, calls: HashMap::new(), vault_values: Vec::new(), vault: Masker::new(min_length), has_masked: false }
+        Self { min_length, calls: HashMap::new(), typed: Vec::new(), vault_values: Vec::new(), vault: Masker::new(min_length), has_masked: false }
     }
 
     fn masker_with(&self, values: &[Zeroizing<String>]) -> Masker {
         let mut masker = Masker::new(self.min_length);
-        for value in values.iter().chain(&self.vault_values) {
+        for value in values.iter().chain(&self.vault_values).chain(self.typed.iter().map(|(_, value)| value)) {
             masker.add(value);
         }
         masker
@@ -73,6 +77,28 @@ impl Filter {
         if let Some(call) = self.calls.get_mut(&pid) {
             call.masker.add(value);
             call.values.push(Zeroizing::new(value.to_owned()));
+        }
+    }
+
+    /// Masks every running call's output with a value typed for the call `pid`, until that call ends.
+    pub fn type_for(&mut self, pid: i32, value: &str) {
+        if !self.calls.contains_key(&pid) {
+            return;
+        }
+        for call in self.calls.values_mut() {
+            call.masker.add(value);
+        }
+        self.vault.add(value);
+        self.typed.push((pid, Zeroizing::new(value.to_owned())));
+    }
+
+    /// Forgets the call `pid` and the values typed for it.
+    fn end(&mut self, pid: i32) {
+        self.calls.remove(&pid);
+        let before = self.typed.len();
+        self.typed.retain(|(owner, _)| *owner != pid);
+        if self.typed.len() != before {
+            self.rebuild();
         }
     }
 
@@ -115,7 +141,7 @@ pub async fn serve(stream: &mut UnixStream, ctx: &Context) {
             }
         }
     }
-    lock(ctx).filter.calls.remove(&pid);
+    lock(ctx).filter.end(pid);
 }
 
 async fn read_request(stream: &mut UnixStream) -> Option<(u8, u8, Vec<u8>)> {

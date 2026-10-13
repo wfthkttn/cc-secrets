@@ -16,15 +16,22 @@ export type RequestEntry = {
   length: number
   /** The open vault's entries to pick from; null when the vault is closed or the asker may not have them. */
   offer: Offered[] | null
-  /** The entry the request named by its tag, shown ready to give; null when it named none or the vault has no such entry. */
-  preset: string | null
+  /** The entry the field holds, as chosen in its menu or else named by the request's tag; null while it takes typing. */
+  chosen: string | null
 }
 
-/** One change to a request's value, numbered per list instance; `session` and `once` answer with an entry. */
+/**
+ * One change, numbered per list instance and carried in every post until the hooks confirm it, so a post replaced
+ * before delivery loses none: a request's value, its answer (`session` and `once` with an entry), its menu choice
+ * (`choose`, null for typing), and the list's own clicks (`dismiss` the message, `tab`).
+ */
 export type Edit =
   | { seq: number; id: string; kind: 'append'; text: string }
   | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' }
   | { seq: number; id: string; kind: 'session' | 'once'; entry: string | null }
+  | { seq: number; id: string; kind: 'choose'; entry: string | null }
+  | { seq: number; kind: 'dismiss' }
+  | { seq: number; kind: 'tab'; tab: Tab }
 
 export type RequestsProps = {
   entries: RequestEntry[]
@@ -51,8 +58,4 @@ export type RequestsMessage = {
   instance: string
   selected: string | null
   edits: Edit[]
-  /** The message's ✕ was clicked. */
-  dismiss?: true
-  /** Another tab was clicked. */
-  tab?: Tab
 }

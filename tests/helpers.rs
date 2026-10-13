@@ -200,15 +200,137 @@ fn a_value_typed_mid_command_is_masked_on_both_streams_and_the_status_passes_thr
 }
 
 #[test]
-fn a_typed_value_is_forgotten_when_its_call_ends_and_other_calls_never_get_it() {
+fn a_typed_value_masks_every_call_while_its_call_runs_and_is_forgotten_after() {
     let mut relay = Relay::start("scoped");
     let asking = relay.mask_run(r#"x=$("$SECRETS" ask t2); sleep 0.5; echo "$x""#).spawn().unwrap();
     let ask = relay.next_ask();
     let other = relay.mask_run("sleep 0.2; echo hunter2").spawn().unwrap();
     assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "hunter2" })), "204");
-    assert_eq!(stdout(&other.wait_with_output().unwrap()), "hunter2\n");
+    assert_eq!(stdout(&other.wait_with_output().unwrap()), "[secret]\n");
     assert_eq!(stdout(&asking.wait_with_output().unwrap()), "[secret]\n");
     assert_eq!(stdout(&run(relay.mask_run("echo hunter2"))), "hunter2\n");
+}
+
+#[test]
+fn a_call_whose_relay_goes_away_withholds_the_rest_of_its_output() {
+    let relay = Relay::start("gone");
+    let mut child = relay.mask_run("echo before; sleep 0.5; echo after").spawn().unwrap();
+    let mut first = String::new();
+    BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut first).unwrap();
+    assert_eq!(first, "before\n");
+    drop(relay);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(stdout(&out), "");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("withheld"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn the_relay_ends_when_its_parent_goes() {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    let socket = dir.join(format!("secrets-test-orphan-{}.sock", std::process::id()));
+    let data = data_dir("orphan");
+    let mut parent = Command::new("/bin/sh")
+        .args(["-c", r#""$0" "$1" > /dev/null & echo $!; sleep 30"#, RELAY])
+        .arg(&socket)
+        .env("XDG_DATA_HOME", &data)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pid = String::new();
+    BufReader::new(parent.stdout.as_mut().unwrap()).read_line(&mut pid).unwrap();
+    let _reaped = KilledPid(pid.trim().to_owned());
+    let alive = PathBuf::from(format!("/proc/{}", pid.trim()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(alive.exists() && socket.exists(), "the relay didn't start");
+    parent.kill().unwrap();
+    parent.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive.exists() && std::fs::read_to_string(alive.join("stat")).is_ok_and(|s| !s.contains(") Z ")) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !alive.exists() || std::fs::read_to_string(alive.join("stat")).is_ok_and(|s| s.contains(") Z ")),
+        "the orphaned relay still runs: {:?}",
+        std::fs::read_to_string(alive.join("stat"))
+    );
+}
+
+/// Kills a process by pid when dropped, so a failing test leaves nothing running.
+struct KilledPid(String);
+
+impl Drop for KilledPid {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").arg(&self.0).stderr(Stdio::null()).status();
+    }
+}
+
+#[test]
+fn an_oversized_body_is_refused_before_it_is_read() {
+    let relay = Relay::start("oversized");
+    let mut stream = UnixStream::connect(&relay.socket).unwrap();
+    write!(stream, "POST /mask HTTP/1.0\r\nContent-Length: {}\r\n\r\n", 64 << 20).unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.0 413"), "{reply}");
+}
+
+#[test]
+fn two_sessions_change_one_vault_without_losing_each_others_changes() {
+    let data = data_dir("shared");
+    let mut first = Relay::start_in("shared-a", &data);
+    let second = Relay::start_in("shared-b", &data);
+    assert_eq!(second.vault, "absent");
+    first.create_vault("pass phrase");
+    assert_eq!(post_reply(&second.socket, "/create", &serde_json::json!({ "passphrase": "other" })).0, "409", "a vault made meanwhile is not replaced");
+    assert_eq!(second.get("/vault").1["state"], "locked");
+    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "pass phrase" })), "204");
+    first.add("One", "one", "password", "session", "value-one-1");
+    let add = |tag: &str| serde_json::json!({ "op": "add", "name": tag, "tag": tag, "kind": "password", "use": "session", "value": format!("value-{tag}-1") });
+    assert_eq!(post(&second.socket, "/vault", &add("two")), "200");
+    assert_eq!(post(&first.socket, "/vault", &add("three")), "200");
+    let tags = |relay: &Relay| relay.get("/vault").1["entries"].as_array().unwrap().iter().map(|e| e["tag"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    assert_eq!(tags(&first), ["one", "two", "three"]);
+    assert_eq!(tags(&second), ["one", "two", "three"]);
+    assert_eq!(stdout(&run(second.mask_run("echo value-three-1"))), "[secret]\n", "the other session's new entry is masked");
+    let one = first.get("/vault").1["entries"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(post(&first.socket, "/vault", &serde_json::json!({ "op": "delete", "id": one })), "200");
+    assert_eq!(post(&second.socket, "/vault", &add("four")), "200");
+    assert_eq!(tags(&second), ["two", "three", "four"], "a deleted entry stays deleted");
+    drop((first, second));
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn a_change_that_cannot_be_saved_changes_nothing() {
+    let data = data_dir("unsaved");
+    let mut relay = Relay::start_in("unsaved", &data);
+    relay.create_vault("pass phrase");
+    let dir = data.join("secrets");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let added = serde_json::json!({ "op": "add", "name": "New", "tag": "new", "kind": "password", "use": "session", "value": "value-new-1" });
+    let (status, reason) = post_reply(&relay.socket, "/vault", &added);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(status, "400", "{reason}");
+    assert_eq!(relay.get("/vault").1["entries"], serde_json::json!([]));
+    assert_eq!(stdout(&run(relay.mask_run("echo value-new-1"))), "value-new-1\n");
+    drop(relay);
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn a_key_file_that_cannot_be_read_is_named_without_the_value() {
+    let data = data_dir("keypath");
+    let mut relay = Relay::start_in("keypath", &data);
+    relay.create_vault("pass phrase");
+    let (status, reason) = relay.add_key("k", Path::new("typed-secret-in-the-file-field"));
+    assert_eq!(status, "400");
+    assert!(!reason.contains("typed-secret"), "{reason}");
+    drop(relay);
+    std::fs::remove_dir_all(&data).unwrap();
 }
 
 #[test]
@@ -325,6 +447,7 @@ fn an_open_vault_hands_a_tagged_entry_out_as_decided_and_masks_it_everywhere() {
     assert!(ask["cmdline"].as_str().unwrap().ends_with("secrets ask --tag db Prod DB password"), "{ask}");
     let picked = serde_json::json!({ "id": ask["id"], "entry": id, "session": true });
     assert_eq!(post(&relay.socket, "/answer", &picked), "204");
+    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }), "a session grant is told");
     assert_eq!(stdout(&first.wait_with_output().unwrap()), "hunter22x\n");
     let second = relay.secrets(&["ask", "--tag", "db", "Prod DB password"]).spawn().unwrap();
     assert_eq!(relay.next_ask()["entry"]["allowed"], true);

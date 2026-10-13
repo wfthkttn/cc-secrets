@@ -1,7 +1,14 @@
 import type { Tab, Tabs } from './tabs'
 
-/** One change to the auto-mode text, numbered per view instance; the hooks hold the text. */
-export type TextEdit = { seq: number; kind: 'append'; text: string } | { seq: number; kind: 'back' | 'clear' }
+/**
+ * One change, numbered per view instance and carried in every post until the hooks confirm it: an edit of the
+ * auto-mode text, which the hooks hold, an action, or a click on another tab.
+ */
+export type TextEdit =
+  | { seq: number; kind: 'append'; text: string }
+  | { seq: number; kind: 'back' | 'clear' }
+  | { seq: number; kind: 'action'; action: ConfigAction }
+  | { seq: number; kind: 'tab'; tab: Tab }
 
 export type ConfigAction =
   | { kind: 'apply' }
@@ -9,6 +16,7 @@ export type ConfigAction =
   | { kind: 'unlockAtStart'; on: boolean }
   | { kind: 'maskMinLength'; value: number }
   | { kind: 'forward'; on: boolean }
+  | { kind: 'forwardAtStart'; on: boolean }
 
 export type ConfigProps = {
   tabs: Tabs
@@ -24,6 +32,8 @@ export type ConfigProps = {
   maskMinLength: number
   /** Whether the user's own ssh-agent keys are offered too this session; null when there is no agent of theirs. */
   forward: boolean | null
+  /** Whether a session starts with them offered. */
+  forwardAtStart: boolean
   /** Why the last apply or change failed. */
   error: string | null
 }
@@ -33,6 +43,4 @@ export type ConfigMessage = {
   edits: TextEdit[]
   /** The text field has the keyboard, so a paste belongs in it. */
   textFocused: boolean
-  action?: ConfigAction
-  tab?: Tab
 }

@@ -1,6 +1,7 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
-import { drawTabs, TAB_ROWS, tabAt } from './tabs'
+import { cells, clip, displayed, pad } from './display'
+import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
 import type { EntryKind, EntryUse, Form, SecretField, Suggestion, ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
 type Field = 'name' | 'tag' | 'kind' | 'use' | 'value'
@@ -45,15 +46,6 @@ const KINDS: readonly EntryKind[] = ['password', 'token', 'ssh-key']
 const USES: readonly EntryUse[] = ['session', 'each']
 const FIELD_BACKGROUND = '#1f2a3a'
 const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
-
-function pad(text: string, width: number): string {
-  return text + ' '.repeat(Math.max(0, width - [...text].length))
-}
-
-function clip(text: string, width: number): string {
-  const chars = [...text]
-  return chars.length <= width ? text : chars.slice(0, width - 1).join('') + '…'
-}
 
 function edge(side: 'top' | 'bottom', width: number): string {
   const [left, right] = side === 'top' ? ['╭', '╮'] : ['╰', '╯']
@@ -127,8 +119,8 @@ function focusedOf(state: ViewState): SecretField | null {
   return state.form !== null && state.form.suggestion === null && state.field === 'value' ? 'value' : null
 }
 
-function postOf(state: ViewState, edits = state.pending, action?: VaultAction): VaultMessage {
-  return { instance: state.instance, edits, focused: focusedOf(state), formOpen: state.form !== null, ...(action === undefined ? {} : { action }) }
+function postOf(state: ViewState, edits = state.pending): VaultMessage {
+  return { instance: state.instance, edits, focused: focusedOf(state), formOpen: state.form !== null }
 }
 
 /** Moves the keyboard; the hooks learn which held field a paste now goes to. */
@@ -151,7 +143,7 @@ export function confirm(state: ViewState, applied: number | undefined): ViewStat
 
 export function shownLength(length: number, field: SecretField, pending: ValueEdit[]): number {
   for (const edit of pending) {
-    if (edit.field !== field) continue
+    if (!('field' in edit) || edit.field !== field) continue
     if (edit.kind === 'append') length += [...edit.text].length
     else if (edit.kind === 'back') length = Math.max(0, length - 1)
     else length = 0
@@ -174,7 +166,7 @@ function open(state: ViewState, row: Row): Result {
 }
 
 function act(state: ViewState, action: VaultAction): Result {
-  return { state, post: postOf(state, state.pending, action) }
+  return withEdit(state, { kind: 'action', action })
 }
 
 function cycle<T>(list: readonly T[], at: T, step: number): T {
@@ -221,7 +213,10 @@ function onFormKey(state: ViewState, form: Form, k: ClientKeyEvent): Result {
     // A suggestion is a typed value: it can't become an ssh key.
     const kinds = form.suggestion === null ? KINDS : KINDS.filter(kind => kind !== 'ssh-key')
     const next = state.field === 'kind' ? { ...form, kind: cycle(kinds, form.kind, step) } : { ...form, use: cycle(USES, form.use, step) }
-    return { state: { ...state, form: next } }
+    // To or from an ssh key, the value field turns between a secret and a file path: what was typed for one isn't
+    // the other, and a secret read as a path would show in the error.
+    const turns = (next.kind === 'ssh-key') !== (form.kind === 'ssh-key')
+    return turns ? withEdit({ ...state, form: next }, { field: 'value', kind: 'clear' }) : { state: { ...state, form: next } }
   }
   if (state.field === 'value') {
     const edit = form.suggestion === null ? heldEdit('value', k) : null
@@ -255,8 +250,8 @@ function buttonAt<B extends { start: number; width: number }>(buttons: B[], x: n
 /** `y` and `x` count from the view's top left, the tab rows included. */
 export function onClick(state: ViewState, props: VaultProps, y: number, x: number): Result {
   if (y < TAB_ROWS) {
-    const tab = y === 0 ? tabAt(props.tabs, x) : null
-    return tab !== null && tab !== 'vault' ? { state, post: { ...postOf(state), tab } } : { state }
+    const tab: Tab | null = y === 0 ? tabAt(props.tabs, x) : null
+    return tab !== null && tab !== 'vault' ? withEdit(state, { kind: 'tab', tab }) : { state }
   }
   const at = y - TAB_ROWS
   const onButtons = (row: Row | undefined) => row?.kind === 'buttonsTop' || row?.kind === 'buttons' || row?.kind === 'buttonsBottom'
@@ -362,7 +357,7 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
         case 'buttonsBottom':
           return buttonRow(row.kind, doorButtons(props.state))
         case 'error':
-          return line(' ' + row.text, { color: 'error' })
+          return line(' ' + displayed(row.text), { color: 'error' })
         default:
           return line('')
       }
@@ -380,13 +375,13 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
         case 'suggestHead':
           return line(' Typed this session; Enter keeps one', { dimColor: true })
         case 'suggestion':
-          return line('   ' + row.suggestion.prompt, look)
+          return line('   ' + displayed(row.suggestion.prompt), look)
         case 'entry': {
           const e = row.entry
           const dot = e.allowed ? '✓ ' : '· '
-          const tail = ` ${pad(e.tag, 14)} ${pad(KIND_NAMES[e.kind], 8)} ${e.use === 'each' ? 'each' : ''}`
-          const name = clip(e.name, Math.max(4, columns - 1 - 2 - [...tail].length))
-          return line(' ' + dot + pad(name, columns - 3 - [...tail].length) + tail, look)
+          const tail = ` ${pad(clip(displayed(e.tag), 14), 14)} ${pad(KIND_NAMES[e.kind], 8)} ${e.use === 'each' ? 'each' : ''}`
+          const name = clip(displayed(e.name), Math.max(4, columns - 1 - 2 - cells(tail)))
+          return line(' ' + dot + pad(name, columns - 3 - cells(tail)) + tail, look)
         }
         default:
           return line('')
@@ -414,7 +409,7 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
               ? `‹ ${KIND_NAMES[form.kind]} ›`
               : row.field === 'use'
                 ? `‹ ${form.use === 'each' ? 'ask every use' : 'session once allowed'} ›`
-                : clip(form[row.field], room - 1)
+                : clip(displayed(form[row.field]), room - 1)
           const cursor = isActive && row.field !== 'kind' && row.field !== 'use' ? '▏' : ''
           return Box({
             flexDirection: 'row',
@@ -426,7 +421,7 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
         case 'buttonsBottom':
           return buttonRow(row.kind, formButtons(form))
         case 'error':
-          return line(' ' + row.text, { color: 'error' })
+          return line(' ' + displayed(row.text), { color: 'error' })
         default:
           return line('')
       }

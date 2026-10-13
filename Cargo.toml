@@ -6,9 +6,9 @@ rust-version = "1.95"
 publish = false
 
 [dependencies]
-argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 base64 = "0.23.1"
-chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 memchr = "2.8.3"
 rsa = "0.9.10"
 rustix = { version = "1.1.5", features = ["event", "fs", "process"] }
@@ -18,7 +18,7 @@ sha2 = "0.10.9"
 signal-hook = "0.4.5"
 ssh-encoding = { version = "0.2.0", features = ["alloc"] }
 ssh-key = { version = "0.6.7", features = ["ed25519", "rsa", "p256", "p384"] }
-tokio = { version = "1.53.2", features = ["rt", "macros", "net", "io-util", "sync", "signal"] }
+tokio = { version = "1.53.2", features = ["rt", "macros", "net", "io-util", "sync", "signal", "time"] }
 zeroize = "1.9.1"
 
 # Unlocking derives a key with 64 MiB of Argon2; unoptimized, the tests would wait seconds on each one.

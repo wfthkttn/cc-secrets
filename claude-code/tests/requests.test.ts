@@ -20,7 +20,7 @@ import {
 } from '../hooks/requests'
 import type { RequestEntry } from '../hooks/requests-props'
 
-const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, offer: null, preset: null })
+const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, offer: null, chosen: null })
 const ENTRIES = [entry('a', '[sudo] password for alex'), entry('b', 'test token')]
 const START = initialState(0, 'i1')
 const FRAME: Frame = { columns: 60, rows: 100, message: null }
@@ -129,7 +129,7 @@ test('a click on a card selects it and tells the hooks; on its Cancel button, ca
 test("a click on the message's ✕ dismisses it; elsewhere on it, only focuses", async () => {
   const { buttonStart } = geometry(60)
   for (const y of [1, 2, 3]) {
-    expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, y, buttonStart + 2).post).toEqual({ instance: 'i1', selected: 'a', edits: [], dismiss: true })
+    expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, y, buttonStart + 2).post).toEqual({ instance: 'i1', selected: 'a', edits: [{ seq: 1, kind: 'dismiss' }] })
   }
   expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, 2, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [] })
   expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, 0, buttonStart + 2).post).toEqual({ instance: 'i1', selected: 'a', edits: [] })
@@ -209,10 +209,10 @@ const OFFER = ['Prod DB · db', 'Deploy · deploy', 'S3 · s3', 'SMTP · smtp', 
 )
 
 test('a request naming its key holds that entry in its field: Session, Once, or Enter gives it; typing does nothing', async () => {
-  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, preset: 'e0' }]
+  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, chosen: 'e0' }]
   const rows = layout(entries, 60, null)
   expect(rows.map(r => r.kind).slice(-4)).toEqual(['pickTop', 'pick', 'pickBottom', 'cardBottom'])
-  expect(choiceOf({}, entries[0]!)).toEqual(OFFER[0])
+  expect(choiceOf(entries[0]!, [])).toEqual(OFFER[0])
   const at = rows.findIndex(r => r.kind === 'pick')
   const [session, once] = grantButtons(60, false)
   expect(onClick(START, entries, FRAME, at, session!.start + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'session', entry: 'e0' }])
@@ -244,29 +244,75 @@ test('in the menu ↑/↓ move, Enter or a click chooses, Tab or a click outside
   for (let i = 0; i < 7; i++) state = onKey(state, entries, FRAME, { key: 'down' }).state
   expect(state.cursor).toBe(7)
   expect(menuOf(entries, FRAME, state)!.first).toBe(2)
-  const chosen = onKey(state, entries, FRAME, { key: 'return' }).state
-  expect(chosen).toMatchObject({ isMenuOpen: false, choices: { a: 'e6' } })
-  expect(layout(entries, 60, null, chosen.choices).some(r => r.kind === 'pick')).toBe(true)
-  expect(onKey(chosen, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e6' }])
+  const chose = onKey(state, entries, FRAME, { key: 'return' })
+  expect(chose.state.isMenuOpen).toBe(false)
+  expect(chose.post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'choose', entry: 'e6' }])
+  const chosen = chose.state
+  expect(layout(entries, 60, null, chosen.pending).some(r => r.kind === 'pick')).toBe(true)
+  expect(onKey(chosen, entries, FRAME, { key: 'return' }).post?.edits.at(-1)).toEqual({ seq: 2, id: 'a', kind: 'once', entry: 'e6' })
   const menu = menuOf(entries, FRAME, opened)!
-  expect(onClick(opened, entries, FRAME, menu.top + 3, menu.left + 4).state).toMatchObject({ isMenuOpen: false, choices: { a: 'e1' } })
+  const clicked = onClick(opened, entries, FRAME, menu.top + 3, menu.left + 4)
+  expect([clicked.state.isMenuOpen, clicked.post?.edits]).toEqual([false, [{ seq: 1, id: 'a', kind: 'choose', entry: 'e1' }]])
   expect(onClick(opened, entries, FRAME, menu.top, menu.left + 4).state).toEqual(opened)
-  expect(onClick(opened, entries, FRAME, 1, 3).state).toMatchObject({ isMenuOpen: false, choices: {} })
+  expect(onClick(opened, entries, FRAME, 1, 3).state).toMatchObject({ isMenuOpen: false, pending: [] })
   expect(onKey(opened, entries, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(false)
   expect(onKey(START, entries, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(true)
   expect(onKey(opened, entries, FRAME, { key: 'x' }).post).toBe(undefined)
 })
 
 test('Type in the menu turns a chosen entry back into a field that takes typing; the menu opens on what the field holds', async () => {
-  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, preset: 'e0' }]
+  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, chosen: 'e0' }]
   const field = layout(entries, 60, null).findIndex(r => r.kind === 'field')
   const opened = onClick(START, entries, FRAME, field, 6).state
   expect(opened.cursor).toBe(1)
   const typing = onKey(onKey(opened, entries, FRAME, { key: 'up' }).state, entries, FRAME, { key: 'return' }).state
-  expect(typing.choices).toEqual({ a: null })
-  expect(layout(entries, 60, null, typing.choices).some(r => r.kind === 'pick')).toBe(false)
-  expect(onKey(typing, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'submit' }])
+  expect(typing.pending).toEqual([{ seq: 1, id: 'a', kind: 'choose', entry: null }])
+  expect(layout(entries, 60, null, typing.pending).some(r => r.kind === 'pick')).toBe(false)
+  expect(onKey(typing, entries, FRAME, { key: 'return' }).post?.edits.at(-1)).toEqual({ seq: 2, id: 'a', kind: 'submit' })
   expect(onClick(typing, entries, FRAME, field, 6).state.cursor).toBe(0)
+})
+
+test("a choice comes from the hooks, so another instance's card (pop-out or drawer) holds the same", async () => {
+  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, chosen: 'e3' }]
+  expect(choiceOf(entries[0]!, [])).toEqual(OFFER[3])
+  expect(onKey(START, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e3' }])
+  expect(choiceOf({ ...entries[0]!, chosen: null }, [])).toBe(null)
+})
+
+test('a selected card that leaves the list leaves nothing selected: keys wait, an open menu shuts', async () => {
+  const entries: RequestEntry[] = [entry('a', 'one'), { ...entry('b', 'two'), offer: OFFER }]
+  const field = layout(entries, 60, null).findIndex(r => r.id === 'b' && r.kind === 'field')
+  const opened = onClick(START, entries, FRAME, field, 6).state
+  const left = [entries[0]!]
+  for (const key of ['return', 'x', 'down']) {
+    const result = onKey(opened, left, FRAME, { key })
+    expect(result.post?.edits ?? []).toEqual([])
+    expect(result.state.isMenuOpen).toBe(false)
+  }
+  expect(onKey(opened, left, FRAME, { key: 'down' }).state.selected).toBe('a')
+  const typedInB = onKey({ ...START, selected: 'b', isFocused: true }, left, FRAME, { key: 'y' })
+  expect(typedInB.post).toBe(undefined)
+})
+
+test('a menu scrolled out of view takes no keys and shuts', async () => {
+  const many = [...MANY.slice(0, 4), { ...entry('z', 'menu'), offer: OFFER }]
+  const opened = onKey({ ...START, selected: 'z', isFocused: true, scroll: 999 }, many, SHORT, { key: 'tab' }).state
+  expect(menuOf(many, SHORT, opened)).not.toBe(null)
+  const hidden = { ...opened, scroll: 0 }
+  expect(menuOf(many, SHORT, hidden)).toBe(null)
+  const result = onKey(hidden, many, SHORT, { key: 'return' })
+  expect(result.state.isMenuOpen).toBe(false)
+  expect(result.post?.edits.some(e => e.kind === 'choose')).toBeFalsy()
+})
+
+test('multi-line and wide text take the rows and cells counted for them', async () => {
+  const entries: RequestEntry[] = [{ ...entry('a', 'what\nnext'), source: 'git add -A\ngit push 日本語 🙂' }]
+  const rows = layout(entries, 60, null)
+  const what = rows.find(r => r.kind === 'what') as { text: string }
+  expect(what.text).toBe('what⏎next')
+  const from = rows.filter(r => r.kind === 'from') as { text: string }[]
+  expect(from.map(r => r.text)).toEqual(['git add -A⏎git push 日本語 ?'])
+  expect(rows.map(r => r.kind)).toEqual(['cardTop', 'what', 'from', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
 })
 
 test('the menu opens above its field when the room under it is short', async () => {

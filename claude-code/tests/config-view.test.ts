@@ -3,8 +3,11 @@ import { expect, test } from 'claude-code/testing'
 
 import { SUGGESTED } from '../hooks/auto-mode'
 import ConfigView, { buttons, type ConfigState, confirm, initialState, layout, maskArrows, onClick, onKey, shownText, status, wrap } from '../hooks/config-view'
-import type { ConfigProps } from '../hooks/config-view-props'
+import type { ConfigProps, TextEdit } from '../hooks/config-view-props'
 import { TAB_ROWS, tabSpans } from '../hooks/tabs'
+
+const isAction = (e: TextEdit): e is Extract<TextEdit, { kind: 'action' }> => e.kind === 'action'
+const isTab = (e: TextEdit): e is Extract<TextEdit, { kind: 'tab' }> => e.kind === 'tab'
 
 const PROPS: ConfigProps = {
   tabs: { active: 'config', requests: 0, vaultMark: false },
@@ -16,14 +19,15 @@ const PROPS: ConfigProps = {
   unlockAtStart: true,
   maskMinLength: 6,
   forward: false,
+  forwardAtStart: true,
   error: null,
 }
 const START = initialState('c1')
 const key = (k: string, mods: { ctrl?: true } = {}): ClientKeyEvent => ({ key: k, ...mods })
 /** A click on the row `at` under the tabs. */
 const click = (state: ConfigState, at: number, x: number, props = PROPS) => onClick(state, props, at + TAB_ROWS, x)
-/** Rows under the tabs for a one-row text: head 0, text 1, buttons 2–4, gap 5, unlock 6, mask 7, forward 8. */
-const ROW = { text: 1, buttons: 3, unlock: 6, mask: 7, forward: 8 }
+/** Rows under the tabs for a one-row text: head 0, text 1, buttons 2–4, gap 5, unlock 6, mask 7, forward at start 8, forward 9. */
+const ROW = { text: 1, buttons: 3, unlock: 6, mask: 7, forwardAtStart: 8, forward: 9 }
 
 function draw(props: ConfigProps, state?: ConfigState) {
   let current: unknown = state
@@ -67,10 +71,10 @@ test("typing shows at once as unconfirmed edits; the hooks' confirmation drops t
 })
 
 test('Enter in the text applies; the buttons apply or reset to the suggested text', async () => {
-  expect(onKey(START, PROPS, key('return')).post?.action).toEqual({ kind: 'apply' })
+  expect(onKey(START, PROPS, key('return')).post?.edits.find(isAction)?.action).toEqual({ kind: 'apply' })
   const [apply, suggest] = buttons()
-  expect(click(START, ROW.buttons, apply!.start).post?.action).toEqual({ kind: 'apply' })
-  expect(click(START, ROW.buttons, suggest!.start + 2).post?.action).toEqual({ kind: 'suggest' })
+  expect(click(START, ROW.buttons, apply!.start).post?.edits.find(isAction)?.action).toEqual({ kind: 'apply' })
+  expect(click(START, ROW.buttons, suggest!.start + 2).post?.edits.find(isAction)?.action).toEqual({ kind: 'suggest' })
   expect(click(START, ROW.buttons, 0).post).toBe(undefined)
 })
 
@@ -78,7 +82,7 @@ test('↑/↓ walk the text and the settings; the forward row only exists with a
   const down = (state: ConfigState, props = PROPS) => onKey(state, props, key('down')).state
   expect(down(down(down(down(START)))).focus).toBe('forward')
   const noAgent = { ...PROPS, forward: null }
-  expect(down(down(down(down(START, noAgent), noAgent), noAgent), noAgent).focus).toBe('mask')
+  expect(down(down(down(down(START, noAgent), noAgent), noAgent), noAgent).focus).toBe('forwardAtStart')
   expect(layout(noAgent, 'mine', true).map(r => r.kind)).not.toContain('forward')
   const up = onKey(START, PROPS, key('up'))
   expect(up.state.focus).toBe('text')
@@ -88,29 +92,37 @@ test('↑/↓ walk the text and the settings; the forward row only exists with a
 
 test('Space or Enter flips a toggle; ←/→ step the mask minimum, never below 1', async () => {
   const at = (focus: ConfigState['focus']) => ({ ...START, focus })
-  expect(onKey(at('unlock'), PROPS, key('space')).post?.action).toEqual({ kind: 'unlockAtStart', on: false })
-  expect(onKey(at('forward'), PROPS, key('return')).post?.action).toEqual({ kind: 'forward', on: true })
-  expect(onKey(at('mask'), PROPS, key('right')).post?.action).toEqual({ kind: 'maskMinLength', value: 7 })
+  expect(onKey(at('unlock'), PROPS, key('space')).post?.edits.find(isAction)?.action).toEqual({ kind: 'unlockAtStart', on: false })
+  expect(onKey(at('forward'), PROPS, key('return')).post?.edits.find(isAction)?.action).toEqual({ kind: 'forward', on: true })
+  expect(onKey(at('mask'), PROPS, key('right')).post?.edits.find(isAction)?.action).toEqual({ kind: 'maskMinLength', value: 7 })
   expect(onKey(at('mask'), { ...PROPS, maskMinLength: 1 }, key('left')).post).toBe(undefined)
   expect(onKey(at('unlock'), PROPS, key('x')).post).toBe(undefined)
 })
 
+test('an action and a tab click travel as numbered edits, so a later post in the same frame keeps them', async () => {
+  const applied = onKey(START, PROPS, key('return'))
+  const typed = onKey(applied.state, PROPS, key('x'))
+  expect(typed.post?.edits.map(e => e.kind)).toEqual(['action', 'append'])
+  expect(confirm(typed.state, 1)?.pending.map(e => e.kind)).toEqual(['append'])
+})
+
 test('clicks: a toggle row flips, the mask arrows step, a tab turns the drawer', async () => {
-  expect(click(START, ROW.unlock, 5).post?.action).toEqual({ kind: 'unlockAtStart', on: false })
-  expect(click(START, ROW.forward, 5).post?.action).toEqual({ kind: 'forward', on: true })
+  expect(click(START, ROW.unlock, 5).post?.edits.find(isAction)?.action).toEqual({ kind: 'unlockAtStart', on: false })
+  expect(click(START, ROW.forward, 5).post?.edits.find(isAction)?.action).toEqual({ kind: 'forward', on: true })
+  expect(click(START, ROW.forwardAtStart, 5).post?.edits.find(isAction)?.action).toEqual({ kind: 'forwardAtStart', on: false })
   const arrows = maskArrows(6)
-  expect(click(START, ROW.mask, arrows.less).post?.action).toEqual({ kind: 'maskMinLength', value: 5 })
-  expect(click(START, ROW.mask, arrows.more).post?.action).toEqual({ kind: 'maskMinLength', value: 7 })
-  expect(click(START, ROW.mask, 2).post?.action).toBe(undefined)
+  expect(click(START, ROW.mask, arrows.less).post?.edits.find(isAction)?.action).toEqual({ kind: 'maskMinLength', value: 5 })
+  expect(click(START, ROW.mask, arrows.more).post?.edits.find(isAction)?.action).toEqual({ kind: 'maskMinLength', value: 7 })
+  expect(click(START, ROW.mask, 2).post?.edits.find(isAction)?.action).toBe(undefined)
   expect(click(START, ROW.mask, 2).state.focus).toBe('mask')
   const vault = tabSpans(PROPS.tabs).find(s => s.tab === 'vault')!
-  expect(onClick(START, PROPS, 0, vault.start).post?.tab).toBe('vault')
+  expect(onClick(START, PROPS, 0, vault.start).post?.edits.find(isTab)?.tab).toBe('vault')
   const config = tabSpans(PROPS.tabs).find(s => s.tab === 'config')!
   expect(onClick(START, PROPS, 0, config.start).post).toBe(undefined)
 })
 
 test('a text longer than the room shows its end, where typing goes', async () => {
-  const rows = layout({ ...PROPS, rows: TAB_ROWS + 10 + 2 }, 'a'.repeat(58 * 5), false)
+  const rows = layout({ ...PROPS, rows: TAB_ROWS + 11 + 2 }, 'a'.repeat(58 * 5), false)
   const text = rows.filter(r => r.kind === 'text')
   expect(text.length).toBe(2)
   expect(text.at(-1)).toEqual({ kind: 'text', text: 'a'.repeat(58), isLast: true })

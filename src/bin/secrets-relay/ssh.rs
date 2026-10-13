@@ -4,11 +4,12 @@
 use std::path::Path;
 
 use secrets::agent;
-use secrets::vault::Entry;
+use secrets::vault::{Entry, Use};
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 
+use crate::access::Grant;
 use crate::{Context, Decision, Shared, decide, emit, lock, locker, note, peer};
 
 async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
@@ -83,17 +84,17 @@ async fn reply(stream: &mut UnixStream, ctx: &Context, peer: Option<i32>, body: 
 /// Signs with a vault key once the hooks give it.
 async fn sign_with(stream: &mut UnixStream, ctx: &Context, peer: Option<i32>, entry: &Entry, key: &ssh_key::PrivateKey, data: &[u8], flags: u32) -> Vec<u8> {
     let by = peer::requester(peer, &ctx.mask_run);
-    let (allowed, live) = {
+    let (access, live) = {
         let state = lock(ctx);
-        (state.vault.is_allowed(&entry.id), state.filter.live())
+        (state.access.of(&entry.id), state.filter.live())
     };
-    let event = json!({ "tag": entry.tag, "name": entry.name, "kind": entry.kind, "use": entry.use_, "allowed": allowed, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live });
+    let event = json!({ "tag": entry.tag, "name": entry.name, "kind": entry.kind, "use": entry.use_, "access": access, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live });
     let decision = decide(stream, ctx, "sign", event).await;
-    if decision == Some(Decision::Session) {
-        let mut state = lock(ctx);
-        if state.vault.allow(&entry.id) {
-            emit(&json!({ "vault": state.vault.shown() }));
-        }
+    if decision == Some(Decision::Session)
+        && entry.use_ == Use::Session
+        && let Err(error) = locker::grant(&mut lock(ctx), &entry.id, Grant::Allowed)
+    {
+        emit(&json!({ "trouble": format!("vault: not allowed for the session: {error}") }));
     }
     if !matches!(decision, Some(Decision::Give | Decision::Session)) {
         return vec![agent::FAILURE];

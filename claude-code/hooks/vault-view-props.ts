@@ -3,8 +3,14 @@ import type { Tab, Tabs } from './tabs'
 export type EntryKind = 'password' | 'token' | 'ssh-key'
 export type EntryUse = 'session' | 'each'
 
-/** A vault entry as the view shows it: no value. */
-export type ViewEntry = { id: string; name: string; tag: string; kind: EntryKind; use: EntryUse; allowed: boolean }
+/** What this session lets its agent have of an entry: a card each time, no card, or nothing. */
+export type Access = 'ask' | 'allowed' | 'refused'
+
+/** A vault entry as the view shows it: no value; `access` is this session's, not the vault's. */
+export type ViewEntry = { id: string; name: string; tag: string; kind: EntryKind; use: EntryUse; access: Access }
+
+/** A tag the agent asks for, and what asks with it. */
+export type TagChoice = { tag: string; what: string }
 
 /** A value typed this session that the open vault offers to keep: no value. */
 export type Suggestion = { id: string; prompt: string }
@@ -17,7 +23,7 @@ export type SecretField = 'value' | 'passphrase' | 'again'
 
 /**
  * One change, numbered per view instance and carried in every post until the hooks confirm it: a held field's edit,
- * an action (a button, Enter, an allow dot) or a click on another tab.
+ * an action (a button, Enter, an entry's access) or a click on another tab.
  */
 export type ValueEdit =
   | { seq: number; field: SecretField; kind: 'append'; text: string }
@@ -37,7 +43,7 @@ export type VaultAction =
   | { kind: 'save'; form: Form }
   | { kind: 'delete'; id: string }
   | { kind: 'dismiss'; id: string }
-  | { kind: 'allow'; id: string; allowed: boolean }
+  | { kind: 'access'; id: string; access: Access }
   /** Unlocks the vault, or creates it when there is none. */
   | { kind: 'open' }
   /** Seals the open vault under the passphrase typed twice. */
@@ -49,6 +55,8 @@ export type VaultProps = {
   collisions: Collision[]
   entries: ViewEntry[]
   suggestions: Suggestion[]
+  /** What the form's tag field offers before the person's own text; tags other entries hold are left out there. */
+  tagChoices: TagChoice[]
   tabs: Tabs
   columns: number
   rows: number

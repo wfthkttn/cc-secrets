@@ -19,20 +19,24 @@
 //! For Claude Code only (the peer must be the relay's parent), 403 to anyone else:
 //! - `POST /answer {id, secret}`, `{id, entry, session}` or `{id, cancel: true}`.
 //! - `POST /unlock {passphrase}`, `POST /create {passphrase}`: 204 open, 403 wrong passphrase.
+//! - `POST /passphrase {passphrase}`: the open vault sealed under a new passphrase (`locker::rekey`).
+//! - `POST /session {id, projects?}`: whose grants these are (`session`).
 //! - `POST /decide {id, decision: "give" | "session" | "refuse"}`: 204, 410 no such request.
-//! - `GET /vault`: `{state, entries, suggestions, forward, upstream}`; never a value.
-//! - `POST /vault {op: "add" | "edit" | "delete" | "allow" | "save" | "dismiss" | "forward", …}`: 200 `{id}`; 400
+//! - `GET /vault`: `{state, entries, suggestions, forward, upstream}`; never a value. Each entry, like those in `ask`
+//!   and `sign` events and `/list`, carries the session's `access`: `"ask" | "allowed" | "refused"`.
+//! - `POST /vault {op: "add" | "edit" | "delete" | "access" | "save" | "dismiss" | "forward", …}`: 200 `{id}`; 400
 //!   with a reason.
 //! - `POST /settings {maskMinLength}`: 204.
 //! - `POST /mask {texts}`: `{texts}` with the open vault's values masked. `POST /check {texts}`: `{label}`, the
 //!   entry one of the texts carries, or null.
 //!
-//! `{"vault": state}` is printed after each change to the vault; `{"masked": true}` the first time anything was
-//! masked; `{"masking": bool}` when `/mask` starts or stops having values to mask; `{"trouble": text}` when the vault
-//! can't be written.
+//! `{"vault": state}` is printed after each change to the vault or the session's grants; `{"masked": true}` the first
+//! time anything was masked; `{"masking": bool}` when `/mask` starts or stops having values to mask;
+//! `{"trouble": text}` when the vault or the grants can't be written.
 //!
 //! `<socket-path>.agent` is an ssh-agent offering the open vault's ssh keys (`ssh.rs`).
 
+mod access;
 mod filter;
 mod locker;
 mod pass;
@@ -81,6 +85,8 @@ struct State {
     /// Decisions the hooks owe: signatures and lists.
     deciding: HashMap<String, oneshot::Sender<Decision>>,
     vault: locker::Locker,
+    /// What this session lets its agent have of each entry.
+    access: access::Access,
     filter: filter::Filter,
     /// The upstream agent's keys are offered too.
     forward: bool,
@@ -90,6 +96,8 @@ struct Context {
     state: Mutex<State>,
     mask_run: PathBuf,
     vault_path: PathBuf,
+    /// Each session's grants (`access`), beside the vault.
+    sessions_dir: PathBuf,
     upstream: Option<PathBuf>,
 }
 
@@ -228,6 +236,39 @@ struct Settings {
     mask_min_length: usize,
 }
 
+#[derive(Deserialize)]
+struct Session {
+    id: String,
+    /// Claude Code's transcripts folder; given, the grants of sessions that can't be resumed are removed.
+    projects: Option<PathBuf>,
+}
+
+/// `POST /session {id, projects?}`: the grants are now session `id`'s, as kept in its file; 204, 400 with the reason.
+async fn session(stream: &mut UnixStream, ctx: &Shared, body: &[u8]) {
+    let Ok(Session { id, projects }) = serde_json::from_slice::<Session>(body) else { return respond(stream, "400 Bad Request", b"").await };
+    let access = match access::Access::load(&ctx.sessions_dir, &id) {
+        Ok(access) => access,
+        Err(reason) => return respond(stream, "400 Bad Request", reason.as_bytes()).await,
+    };
+    {
+        let mut state = lock(ctx);
+        state.access = access;
+        locker::prune(&mut state);
+        emit(&json!({ "vault": state.vault.shown() }));
+    }
+    respond(stream, "204 No Content", b"").await;
+    if let Some(projects) = projects {
+        let dir = ctx.sessions_dir.clone();
+        let swept = tokio::task::spawn_blocking(move || access::sweep(&dir, &projects, &id)).await;
+        match swept {
+            Ok(Ok(removed)) if !removed.is_empty() => note(&format!("removed the grants of ended sessions: {}", removed.join(", "))),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => note(&format!("can't remove the grants of ended sessions: {error}")),
+            Err(error) => note(&format!("removing the grants of ended sessions stopped: {error}")),
+        }
+    }
+}
+
 async fn json_reply(stream: &mut UnixStream, reply: Option<serde_json::Value>) {
     match reply {
         Some(reply) => respond(stream, "200 OK", reply.to_string().as_bytes()).await,
@@ -258,6 +299,7 @@ async fn serve(mut stream: UnixStream, ctx: Shared) {
         ("POST", "/create") => locker::open(&mut stream, &ctx, body, true).await,
         ("POST", "/passphrase") => locker::rekey(&mut stream, &ctx, body).await,
         ("POST", "/decide") => decided(&mut stream, &ctx, body).await,
+        ("POST", "/session") => session(&mut stream, &ctx, body).await,
         ("GET", "/vault") => {
             let shown = locker::show(&lock(&ctx), ctx.upstream.is_some());
             respond(&mut stream, "200 OK", shown.to_string().as_bytes()).await;
@@ -378,8 +420,16 @@ fn main() -> ExitCode {
         };
         let bin = mask_run.parent().map(|dir| dir.display().to_string());
         emit(&json!({ "ready": path, "vault": vault.shown(), "bin": bin }));
-        let state = State { pass: pass::Pass::default(), deciding: HashMap::new(), vault, filter: filter::Filter::new(MASK_MIN), forward: false };
-        let ctx = Arc::new(Context { state: Mutex::new(state), mask_run, vault_path, upstream });
+        let state = State {
+            pass: pass::Pass::default(),
+            deciding: HashMap::new(),
+            vault,
+            access: access::Access::default(),
+            filter: filter::Filter::new(MASK_MIN),
+            forward: false,
+        };
+        let sessions_dir = vault_path.with_file_name("sessions");
+        let ctx = Arc::new(Context { state: Mutex::new(state), mask_run, vault_path, sessions_dir, upstream });
         tokio::spawn(locker::watch(Arc::clone(&ctx)));
         let mut parent_check = tokio::time::interval(PARENT_CHECK);
         loop {

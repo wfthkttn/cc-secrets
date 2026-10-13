@@ -1,11 +1,10 @@
-//! The vault in the session. Closed (absent or locked) it holds and tracks nothing; open, it holds its entries,
-//! the grants of this session and the values typed this session that it suggests keeping. Only the hooks unlock it,
-//! with the passphrase typed into the Vault tab.
+//! The vault in the session. Closed (absent or locked) it holds and tracks nothing; open, it holds its entries and
+//! the values typed this session that it suggests keeping. What the session lets its agent have of each entry is
+//! `access`, not the vault's. Only the hooks unlock it, with the passphrase typed into the Vault tab.
 //!
 //! Every session's relay opens the same file. A change is made under `vault.lock` to what the file holds then, and
 //! a relay that finds the file replaced since it last read it takes the new one in before serving.
 
-use std::collections::HashSet;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use serde_json::json;
 use tokio::net::UnixStream;
 use zeroize::{Zeroize as _, Zeroizing};
 
+use crate::access::Grant;
 use crate::{COSTS, Context, Decision, Shared, State, decide, emit, lock, note, now, peer, respond};
 
 pub enum Locker {
@@ -27,8 +27,6 @@ pub enum Locker {
 
 pub struct Opened {
     vault: Vault,
-    /// Entry ids allowed in this session.
-    allowed: HashSet<String>,
     suggestions: Vec<Suggestion>,
     /// The file as last read or written here; a save from another session replaces it.
     seen: Option<Stamp>,
@@ -95,16 +93,6 @@ impl Locker {
         self.entries().iter().filter(|e| e.kind == Kind::SshKey).cloned().collect()
     }
 
-    pub fn is_allowed(&self, id: &str) -> bool {
-        matches!(self, Self::Open(open) if open.allowed.contains(id))
-    }
-
-    /// Allows the entry for the session; true when that is new, which the caller tells.
-    pub fn allow(&mut self, id: &str) -> bool {
-        let Self::Open(open) = self else { return false };
-        open.allowed.insert(id.to_owned())
-    }
-
     /// Every value the open vault holds, its suggestions too.
     pub fn values(&self) -> Vec<Zeroizing<String>> {
         let Self::Open(open) = self else { return Vec::new() };
@@ -112,20 +100,15 @@ impl Locker {
         entries.chain(open.suggestions.iter().map(|s| s.value.clone())).collect()
     }
 
-    /// The entry tagged `tag` that `secrets ask --tag` can hand out, and whether this session allowed it.
-    pub fn tagged(&self, tag: &str) -> Option<(&Entry, bool)> {
-        let Self::Open(open) = self else { return None };
-        let entry = open.vault.entries.iter().find(|e| e.tag == tag && e.kind != Kind::SshKey)?;
-        Some((entry, open.allowed.contains(&entry.id)))
+    /// The entry tagged `tag` that `secrets ask --tag` can hand out.
+    pub fn tagged(&self, tag: &str) -> Option<&Entry> {
+        self.entries().iter().find(|e| e.tag == tag && e.kind != Kind::SshKey)
     }
 
-    /// The value of the entry `id` for an answer, and whether it made a new session grant, which the caller tells.
-    pub fn hand_out(&mut self, id: &str, session: bool) -> Option<(Zeroizing<String>, bool)> {
-        let Self::Open(open) = self else { return None };
-        let entry = open.vault.entries.iter().find(|e| e.id == id && e.kind != Kind::SshKey)?;
-        let value = Zeroizing::new(entry.value.clone());
-        let granted = session && open.allowed.insert(id.to_owned());
-        Some((value, granted))
+    /// The value of the entry `id` for an answer, and its use.
+    pub fn hand_out(&self, id: &str) -> Option<(Zeroizing<String>, Use)> {
+        let entry = self.entries().iter().find(|e| e.id == id && e.kind != Kind::SshKey)?;
+        Some((Zeroizing::new(entry.value.clone()), entry.use_))
     }
 
     /// Keeps a typed value as a suggestion while the vault is open; false when closed or already held.
@@ -148,6 +131,27 @@ fn save(ctx: &Context, vault: &Vault) -> Result<Option<Stamp>, String> {
         emit(&json!({ "trouble": text }));
         text
     })
+}
+
+/// Forgets the session's grants of entries the open vault no longer holds; a closed vault tells nothing of them.
+pub fn prune(state: &mut State) {
+    let Locker::Open(open) = &state.vault else { return };
+    let live = open.vault.entries.iter().map(|e| e.id.as_str()).collect();
+    if let Err(error) = state.access.keep_only(&live) {
+        emit(&json!({ "trouble": format!("vault: {error}") }));
+    }
+}
+
+/// Sets the session's grant of `id`; the hooks are told of a change. Allowing needs an entry used for the session.
+pub fn grant(state: &mut State, id: &str, grant: Grant) -> Result<(), String> {
+    let entry = state.vault.entries().iter().find(|e| e.id == id).ok_or_else(|| "no such entry, or the vault is closed".to_owned())?;
+    if grant == Grant::Allowed && entry.use_ == Use::Each {
+        return Err("an entry asked for on every use can't be allowed".to_owned());
+    }
+    if state.access.set(id, grant)? {
+        emit(&json!({ "vault": state.vault.shown() }));
+    }
+    Ok(())
 }
 
 /// The vault changed: masking takes its values, the hooks are told.
@@ -176,10 +180,9 @@ pub fn fresh(ctx: &Context, state: &mut State) {
     match reloaded {
         Ok(()) => {
             open.seen = now;
-            let Opened { vault, allowed, .. } = &mut **open;
             // a relay from before typed entries were dropped may still save them
-            vault.entries.retain(|e| e.kind != Kind::Typed);
-            allowed.retain(|id| vault.entries.iter().any(|e| e.id == *id));
+            open.vault.entries.retain(|e| e.kind != Kind::Typed);
+            prune(state);
         }
         Err(reason) => {
             emit(&json!({ "trouble": format!("vault: closed, since another session changed its file ({reason})") }));
@@ -234,7 +237,8 @@ pub async fn watch(ctx: Shared) {
 /// Takes the opened vault in. `seen` is the file's stamp from before it was read, so a save made since then is
 /// caught up with.
 fn opened(state: &mut State, vault: Vault, seen: Option<Stamp>) {
-    state.vault = Locker::Open(Box::new(Opened { vault, allowed: HashSet::new(), suggestions: Vec::new(), seen }));
+    state.vault = Locker::Open(Box::new(Opened { vault, suggestions: Vec::new(), seen }));
+    prune(state);
     changed(state);
 }
 
@@ -305,9 +309,9 @@ pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bo
     }
 }
 
-/// `POST /passphrase {passphrase}`: the open vault sealed under a new passphrase, its entries and this session's grants
-/// kept; 204 once saved, 409 when it isn't open, 400 for an empty passphrase, 500 with the reason when it can't be
-/// saved. Other sessions find a vault made anew and close theirs.
+/// `POST /passphrase {passphrase}`: the open vault sealed under a new passphrase, its entries kept; 204 once saved,
+/// 409 when it isn't open, 400 for an empty passphrase, 500 with the reason when it can't be saved. Other sessions
+/// find a vault made anew and close theirs.
 pub async fn rekey(stream: &mut UnixStream, ctx: &Shared, body: &[u8]) {
     let Ok(Passphrase { passphrase }) = serde_json::from_slice::<Passphrase>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let passphrase = Zeroizing::new(passphrase);
@@ -343,7 +347,7 @@ pub fn show(state: &State, upstream: bool) -> serde_json::Value {
             open.vault
                 .entries
                 .iter()
-                .map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "created": e.created, "allowed": open.allowed.contains(&e.id) }))
+                .map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "created": e.created, "access": state.access.of(&e.id) }))
                 .collect(),
             open.suggestions.iter().map(|s| json!({ "id": s.id, "prompt": s.prompt })).collect(),
         ),
@@ -358,7 +362,8 @@ enum Change {
     Add { name: String, #[serde(default)] tag: String, kind: Kind, #[serde(rename = "use")] use_: Use, value: String },
     Edit { id: String, name: Option<String>, tag: Option<String>, kind: Option<Kind>, #[serde(rename = "use")] use_: Option<Use>, value: Option<String> },
     Delete { id: String },
-    Allow { id: String, allowed: bool },
+    /// The session's grant of the entry, not the vault's.
+    Access { id: String, access: Grant },
     /// A suggestion becomes an entry under the name, tag, kind and use given.
     Save { id: String, name: String, #[serde(default)] tag: String, kind: Kind, #[serde(rename = "use")] use_: Use },
     Dismiss { id: String },
@@ -396,7 +401,7 @@ fn new_tag(kind: Kind, tag: String) -> Result<String, String> {
 
 /// Applies a change to the open vault; the changed entry's id, or why not.
 fn change(open: &mut Opened, change: Change) -> Result<String, String> {
-    let Opened { vault, allowed, suggestions, .. } = open;
+    let Opened { vault, suggestions, .. } = open;
     let taken = |tag: &str, except: &str| vault.entries.iter().any(|e| e.tag == tag && e.id != except);
     let bad_tag = |tag: &str| format!("tag {tag} is taken or not made of letters, digits, - _ .");
     let id = match change {
@@ -459,17 +464,9 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
         Change::Delete { id } => {
             let at = vault.entries.iter().position(|e| e.id == id).ok_or("no such entry")?;
             vault.entries.remove(at);
-            allowed.remove(&id);
             id
         }
-        Change::Allow { id, allowed: on } => {
-            if !vault.entries.iter().any(|e| e.id == id) {
-                return Err("no such entry".to_owned());
-            }
-            if on { allowed.insert(id.clone()) } else { allowed.remove(&id) };
-            return Ok(id);
-        }
-        Change::Forward { .. } => return Err("forwarding is not an entry change".to_owned()),
+        Change::Forward { .. } | Change::Access { .. } => return Err("not an entry change".to_owned()),
     };
     Ok(id)
 }
@@ -485,13 +482,19 @@ async fn apply(ctx: &Context, parsed: Change) -> Result<String, String> {
         emit(&json!({ "vault": state.vault.shown() }));
         return Ok("forward".to_owned());
     }
-    let saves = !matches!(parsed, Change::Allow { .. } | Change::Dismiss { .. });
+    if let Change::Access { id, access } = parsed {
+        let mut state = lock(ctx);
+        fresh(ctx, &mut state);
+        grant(&mut state, &id, access)?;
+        return Ok(id);
+    }
+    let saves = !matches!(parsed, Change::Dismiss { .. });
     // The change is made to what the file holds now, with no other session's relay writing meanwhile.
     let _held = if saves { Some(exclusive_waiting(&ctx.vault_path).await?) } else { None };
     let mut state = lock(ctx);
     fresh(ctx, &mut state);
     let Locker::Open(open) = &mut state.vault else { return Err("the vault is not open".to_owned()) };
-    let before = (open.vault.entries.clone(), open.allowed.clone(), open.suggestions.clone());
+    let before = (open.vault.entries.clone(), open.suggestions.clone());
     let done = change(open, parsed).and_then(|id| if saves { save(ctx, &open.vault).map(|seen| (id, Some(seen))) } else { Ok((id, None)) });
     let id = match done {
         Ok((id, seen)) => {
@@ -501,10 +504,11 @@ async fn apply(ctx: &Context, parsed: Change) -> Result<String, String> {
             id
         }
         Err(reason) => {
-            (open.vault.entries, open.allowed, open.suggestions) = before;
+            (open.vault.entries, open.suggestions) = before;
             return Err(reason);
         }
     };
+    prune(&mut state);
     changed(&mut state);
     Ok(id)
 }
@@ -540,7 +544,7 @@ pub async fn list(stream: &mut UnixStream, ctx: &Context) {
             .vault
             .entries()
             .iter()
-            .map(|e| json!({ "tag": e.tag, "name": e.name, "kind": e.kind, "use": e.use_, "allowed": state.vault.is_allowed(&e.id) }))
+            .map(|e| json!({ "tag": e.tag, "name": e.name, "kind": e.kind, "use": e.use_, "access": state.access.of(&e.id) }))
             .collect()
     };
     respond(stream, "200 OK", json!(listed).to_string().as_bytes()).await;

@@ -10,7 +10,10 @@ use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
-use crate::{Context, emit, hung_up, lock, peer, respond};
+use secrets::vault::Use;
+
+use crate::access::Grant;
+use crate::{Context, emit, hung_up, lock, locker, peer, respond};
 
 struct Asking {
     tx: oneshot::Sender<Option<Zeroizing<String>>>,
@@ -41,7 +44,7 @@ pub async fn ask(stream: &mut UnixStream, ctx: &Context, body: &[u8]) {
         let mut state = lock(ctx);
         state.pass.waiting.insert(id.clone(), Asking { tx, prompt: ask.prompt.clone(), call: by.inside.then_some(by.pid) });
         let tagged = ask.tag.as_deref().and_then(|tag| state.vault.tagged(tag));
-        let entry = tagged.map(|(e, allowed)| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "allowed": allowed }));
+        let entry = tagged.map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "access": state.access.of(&e.id) }));
         (entry, state.filter.live())
     };
     let event = json!({ "id": id, "prompt": ask.prompt, "tag": ask.tag, "entry": entry, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live });
@@ -90,12 +93,16 @@ fn take(ctx: &Context, answer: Answer) -> (&'static str, &'static str) {
     let typed = answer.secret.is_some() && answer.entry.is_none();
     let value = match (answer.entry, answer.secret) {
         (Some(entry), _) => {
-            let Some((value, granted)) = state.vault.hand_out(&entry, answer.session) else {
+            let Some((value, use_)) = state.vault.hand_out(&entry) else {
                 state.pass.waiting.insert(answer.id, asking);
                 return ("409 Conflict", "no such entry, or the vault is closed");
             };
-            if granted {
-                emit(&json!({ "vault": state.vault.shown() }));
+            // The value goes out either way: the person picked it; a grant that can't be kept is only told.
+            if answer.session
+                && use_ == Use::Session
+                && let Err(error) = locker::grant(&mut state, &entry, Grant::Allowed)
+            {
+                emit(&json!({ "trouble": format!("vault: not allowed for the session: {error}") }));
             }
             value
         }

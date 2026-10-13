@@ -23,7 +23,7 @@ export function callOf<C extends { command: string }>(cmdline: string, calls: re
 type Requester = { cmdline: string; inside: boolean }
 type Call = { command: string; agentId: string | undefined }
 type Calls = readonly Call[]
-type Granted = { allowed: boolean; use: 'session' | 'each' }
+type Granted = { access: 'ask' | 'allowed' | 'refused'; use: 'session' | 'each' }
 
 /**
  * The Bash call a requester runs in. Only one `inside` the session is matched: its command line is the one Claude
@@ -43,25 +43,27 @@ export function runsIn(cmdline: string, command: string): boolean {
 }
 
 /**
- * What a signature with a vault key gets: a subagent's or a teammate's command nothing, nor one that can't be told
- * from a subagent's; a main-loop command a key allowed for the session; anything else (a `!` command, a background
- * task, a process outside the session) the person's card.
+ * What a signature with a vault key gets: nothing with a key the session refused, nor for a subagent's or a
+ * teammate's command, nor one that can't be told from a subagent's; a main-loop command a key allowed for the
+ * session; anything else (a `!` command, a background task, a process outside the session) the person's card.
  */
 export function signDecision(sign: Requester & Granted, calls: Calls): 'refuse' | 'give' | 'ask' {
+  if (sign.access === 'refused') return 'refuse'
   const call = callFor(sign, calls)
   if (call === 'unknown' || call?.agentId !== undefined) return 'refuse'
-  return call !== undefined && sign.allowed && sign.use === 'session' ? 'give' : 'ask'
+  return call !== undefined && sign.access === 'allowed' && sign.use === 'session' ? 'give' : 'ask'
 }
 
 /**
- * How a `secrets ask` is answered: a main-loop command whose tagged entry is allowed for the session gets it without
- * a card; any other gets a card, with the vault's entries to pick unless it is, or may be, a subagent's or a
- * teammate's.
+ * How a `secrets ask` is answered: refused when its tag names an entry the session refused; a main-loop command
+ * whose tagged entry is allowed for the session gets it without a card; any other gets a card, with the vault's
+ * entries to pick unless it is, or may be, a subagent's or a teammate's.
  */
-export function askDecision(ask: Requester & { entry: Granted | null }, calls: Calls): 'give' | 'card' | 'typed card' {
+export function askDecision(ask: Requester & { entry: Granted | null }, calls: Calls): 'refuse' | 'give' | 'card' | 'typed card' {
+  if (ask.entry?.access === 'refused') return 'refuse'
   const call = callFor(ask, calls)
   if (call === 'unknown' || call?.agentId !== undefined) return 'typed card'
-  return call !== undefined && ask.entry !== null && ask.entry.allowed && ask.entry.use === 'session' ? 'give' : 'card'
+  return call !== undefined && ask.entry !== null && ask.entry.access === 'allowed' && ask.entry.use === 'session' ? 'give' : 'card'
 }
 
 /** The vault's tags and names: only to a main-loop command; refused to any other and to one that can't be matched. */

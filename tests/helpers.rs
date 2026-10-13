@@ -549,14 +549,14 @@ fn an_open_vault_hands_a_tagged_entry_out_as_decided_and_masks_it_everywhere() {
 
     let first = relay.secrets(&["ask", "--tag", "db", "Prod DB password"]).spawn().unwrap();
     let ask = relay.next_ask();
-    assert_eq!((ask["entry"]["id"].as_str(), ask["entry"]["allowed"].as_bool(), ask["inside"].as_bool()), (Some(id.as_str()), Some(false), Some(false)));
+    assert_eq!((ask["entry"]["id"].as_str(), ask["entry"]["access"].as_str(), ask["inside"].as_bool()), (Some(id.as_str()), Some("ask"), Some(false)));
     assert!(ask["cmdline"].as_str().unwrap().ends_with("secrets ask --tag db Prod DB password"), "{ask}");
     let picked = serde_json::json!({ "id": ask["id"], "entry": id, "session": true });
     assert_eq!(post(&relay.socket, "/answer", &picked), "204");
     assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }), "a session grant is told");
     assert_eq!(stdout(&first.wait_with_output().unwrap()), "hunter22x\n");
     let second = relay.secrets(&["ask", "--tag", "db", "Prod DB password"]).spawn().unwrap();
-    assert_eq!(relay.next_ask()["entry"]["allowed"], true);
+    assert_eq!(relay.next_ask()["entry"]["access"], "allowed");
     drop(second);
 
     let unknown = relay.secrets(&["ask", "--tag", "nope", "x"]).spawn().unwrap();
@@ -607,16 +607,67 @@ fn a_new_passphrase_keeps_the_entries_and_closes_the_vault_in_other_sessions() {
     first.create_vault("old phrase");
     let id = first.add("Login", "sudo", "password", "session", "sudo-pw-34");
     assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "old phrase" })), "204");
-    assert_eq!(post(&first.socket, "/vault", &serde_json::json!({ "op": "allow", "id": id, "allowed": true })), "200");
+    assert_eq!(post(&first.socket, "/vault", &serde_json::json!({ "op": "access", "id": id, "access": "allowed" })), "200");
     assert_eq!(post_reply(&first.socket, "/passphrase", &serde_json::json!({ "passphrase": "" })).0, "400");
     assert_eq!(post(&first.socket, "/passphrase", &serde_json::json!({ "passphrase": "new phrase" })), "204");
     let shown = first.get("/vault").1;
-    assert_eq!((shown["state"].as_str(), shown["entries"][0]["allowed"].as_bool()), (Some("open"), Some(true)), "{shown}");
+    assert_eq!((shown["state"].as_str(), shown["entries"][0]["access"].as_str()), (Some("open"), Some("allowed")), "{shown}");
     assert_eq!(second.get("/vault").1["state"], "locked", "the other session's key no longer fits");
     assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "old phrase" })), "403");
     assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "new phrase" })), "204");
     assert_eq!(second.get("/vault").1["entries"][0]["tag"], "sudo");
     drop((first, second));
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn a_sessions_access_outlives_its_relay_and_ends_with_its_transcript() {
+    let data = data_dir("access");
+    let projects = data.join("projects");
+    std::fs::create_dir_all(projects.join("-home-x")).unwrap();
+    std::fs::write(projects.join("-home-x").join("resumable.jsonl"), "").unwrap();
+    let mut relay = Relay::start_in("access", &data);
+    relay.create_vault("pass phrase");
+    let login = relay.add("Login", "sudo", "password", "session", "sudo-pw-56");
+    let each = relay.add("Deploy", "deploy", "token", "each", "deploy-tok-56");
+    let gone = relay.add("Old", "old", "password", "session", "old-pw-56");
+    let set = |relay: &Relay, id: &str, access: &str| post_reply(&relay.socket, "/vault", &serde_json::json!({ "op": "access", "id": id, "access": access }));
+    assert_eq!(set(&relay, &login, "allowed").0, "200", "before the session is named, kept in memory");
+    assert_eq!(post(&relay.socket, "/session", &serde_json::json!({ "id": "../x" })), "400");
+    assert_eq!(post(&relay.socket, "/session", &serde_json::json!({ "id": "first-session" })), "204");
+    assert_eq!(relay.get("/vault").1["entries"][0]["access"], "ask", "a named session starts from its own file");
+    for (id, access) in [(&login, "allowed"), (&each, "refused"), (&gone, "refused")] {
+        assert_eq!(set(&relay, id, access).0, "200");
+    }
+    assert_eq!(set(&relay, &each, "allowed"), ("400".to_owned(), "an entry asked for on every use can't be allowed".to_owned()));
+    assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "delete", "id": gone })), "200");
+    let file = data.join("secrets/sessions/first-session.json");
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(stored, serde_json::json!({ "allowed": [login], "refused": [each] }), "a deleted entry's grant goes with it");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    drop(relay);
+
+    let mut resumed = Relay::start_in("access-resumed", &data);
+    assert_eq!(post(&resumed.socket, "/unlock", &serde_json::json!({ "passphrase": "pass phrase" })), "204");
+    assert_eq!(resumed.next_event(), serde_json::json!({ "vault": "open" }));
+    assert_eq!(post(&resumed.socket, "/session", &serde_json::json!({ "id": "first-session" })), "204");
+    assert_eq!(resumed.next_event(), serde_json::json!({ "vault": "open" }));
+    let shown = resumed.get("/vault").1;
+    let access: Vec<_> = shown["entries"].as_array().unwrap().iter().map(|e| e["access"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(access, ["allowed", "refused"], "{shown}");
+    let list = resumed.secrets(&["list"]).spawn().unwrap();
+    resumed.decide_next("list", "give");
+    assert_eq!(stdout(&list.wait_with_output().unwrap()), "sudo\tpassword\tsession\tallowed\tLogin\ndeploy\ttoken\teach\trefused\tDeploy\n");
+
+    std::fs::write(data.join("secrets/sessions/ended.json"), r#"{"allowed":[],"refused":[]}"#).unwrap();
+    assert_eq!(post(&resumed.socket, "/session", &serde_json::json!({ "id": "resumable", "projects": projects })), "204");
+    let left = || std::fs::read_dir(data.join("secrets/sessions")).unwrap().count();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while left() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(left(), 0, "the files of sessions without a transcript go; the resumable one has none yet");
+    drop(resumed);
     std::fs::remove_dir_all(&data).unwrap();
 }
 

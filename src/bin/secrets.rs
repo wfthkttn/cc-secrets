@@ -1,9 +1,10 @@
 //! Usage: secrets ask [--tag TAG] PROMPT | secrets list
 //!
 //! `ask` asks the user for a secret and prints it and a newline: they type it, or pick a vault entry, the one
-//! tagged TAG offered first; an entry allowed for this session comes without asking. `list` prints one line per
-//! vault entry: tag, kind, use, whether it is allowed in this session, and its name, tab-separated; never a value.
-//! Both exit 1 with a line on stderr when refused, cancelled or the vault is closed.
+//! tagged TAG offered first; an entry allowed for this session comes without asking, one refused for it is refused.
+//! `list` prints one line per vault entry: tag, kind, use, this session's access (ask, allowed or refused), and its
+//! name, tab-separated; never a value. Both exit 1 with a line on stderr when refused, cancelled or the vault is
+//! closed.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -23,7 +24,7 @@ struct Listed {
     kind: String,
     #[serde(rename = "use")]
     use_: String,
-    allowed: bool,
+    access: String,
     name: String,
 }
 
@@ -60,8 +61,7 @@ fn list() -> ExitCode {
     let Ok(entries) = serde_json::from_slice::<Vec<Listed>>(&reply.body) else { return fail("the relay sent a list this version can't read") };
     let mut out = std::io::stdout().lock();
     for e in entries {
-        let allowed = if e.allowed { "allowed" } else { "ask" };
-        if writeln!(out, "{}\t{}\t{}\t{allowed}\t{}", e.tag, e.kind, e.use_, e.name).is_err() {
+        if writeln!(out, "{}\t{}\t{}\t{}\t{}", e.tag, e.kind, e.use_, e.access, e.name).is_err() {
             return fail("can't write the list to stdout");
         }
     }

@@ -2,7 +2,7 @@ import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
 import { cells, clip, displayed, pad } from './display'
 import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
-import type { Collision, EntryKind, EntryUse, Form, SecretField, Suggestion, ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
+import type { Access, Collision, EntryKind, EntryUse, Form, SecretField, Suggestion, TagChoice, ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
 type Field = 'name' | 'tag' | 'kind' | 'use' | 'value'
 type Door = 'passphrase' | 'again'
@@ -22,6 +22,8 @@ export type ViewState = {
   rekeying: boolean
   /** The selected list row (`rowKey`): it stays on its entry when another session's change moves the rows; null once it went. */
   selected: string | null
+  /** The form's tag as typed, kept while the tag field shows one of the offered tags. */
+  ownTag: string
   formEpoch: number
 }
 
@@ -30,6 +32,7 @@ export type Row =
   | { kind: 'closed'; text: string }
   | { kind: 'door'; field: Door }
   | { kind: 'add' | 'rekey' }
+  | { kind: 'entryHead' }
   | { kind: 'entry'; entry: ViewEntry }
   | { kind: 'suggestion'; suggestion: Suggestion }
   | { kind: 'suggestHead' | 'none' }
@@ -49,6 +52,10 @@ const LABEL_COLUMNS = 7
 const DOOR_LABEL_COLUMNS = 12
 const KINDS: readonly EntryKind[] = ['password', 'token', 'ssh-key']
 const USES: readonly EntryUse[] = ['session', 'each']
+/** An entry row's access column, at the row's left edge; a click there turns the access over. */
+const ACCESS_COLUMNS = 10
+const TAG_COLUMNS = 14
+const KIND_COLUMNS = 8
 const FIELD_BACKGROUND = '#1f2a3a'
 /** The show/hide mark at a held field's right end: shown, hidden. */
 const PEEK_MARKS = [' ◉', ' ○'] as const
@@ -61,7 +68,26 @@ function edge(side: 'top' | 'bottom', width: number): string {
 }
 
 export function initialState(formEpoch: number, instance: string, isClosed = false): ViewState {
-  return { instance, seq: 0, pending: [], form: null, field: 'name', door: 'passphrase', isClosed, rekeying: false, selected: 'add', formEpoch }
+  return { instance, seq: 0, pending: [], form: null, field: 'name', door: 'passphrase', isClosed, rekeying: false, selected: 'add', ownTag: '', formEpoch }
+}
+
+/** An entry's access as its row shows it; an entry asked for on every use can't be allowed. */
+export function accessLabel(entry: Pick<ViewEntry, 'access' | 'use'>): string {
+  if (entry.access === 'refused') return 'refused'
+  if (entry.use === 'each') return 'ask each'
+  return entry.access === 'allowed' ? 'allowed' : 'ask'
+}
+
+/** The access a click or Space turns an entry to: ask › allowed › refused, an entry asked for on every use skipping allowed. */
+export function nextAccess(entry: Pick<ViewEntry, 'access' | 'use'>): Access {
+  if (entry.access === 'refused') return 'ask'
+  return entry.use === 'session' && entry.access === 'ask' ? 'allowed' : 'refused'
+}
+
+/** The tags the form's tag field offers: none for an ssh key, which no ask names; not those other entries hold. */
+export function tagOptions(props: Pick<VaultProps, 'tagChoices' | 'entries'>, form: Form): TagChoice[] {
+  if (form.kind === 'ssh-key') return []
+  return props.tagChoices.filter(c => !props.entries.some(e => e.tag === c.tag && e.id !== form.id))
 }
 
 /** What a selectable list row is, whatever its position. */
@@ -93,11 +119,21 @@ export function rekeyRows(error: string | null): Row[] {
 
 export function listRows(props: Pick<VaultProps, 'entries' | 'suggestions'>): Row[] {
   const rows: Row[] = [{ kind: 'add' }, { kind: 'rekey' }]
-  if (props.entries.length === 0) rows.push({ kind: 'none' })
+  rows.push(props.entries.length === 0 ? { kind: 'none' } : { kind: 'entryHead' })
   for (const entry of props.entries) rows.push({ kind: 'entry', entry })
   if (props.suggestions.length > 0) rows.push({ kind: 'suggestHead' })
   for (const suggestion of props.suggestions) rows.push({ kind: 'suggestion', suggestion })
   return rows
+}
+
+/**
+ * The rows the view draws under its tabs. Open, as many as its tallest page (the list, the form, the new passphrase),
+ * so opening the form or the new passphrase doesn't wait for the view to grow.
+ */
+export function contentRows(props: Pick<VaultProps, 'state' | 'error' | 'collisions' | 'entries' | 'suggestions'>): number {
+  if (props.collisions.length > 0) return collisionRows(props.collisions).length
+  if (props.state !== 'open') return closedRows(props).length
+  return Math.max(listRows(props).length, formRows(props.error).length, rekeyRows(props.error).length)
 }
 
 export function formRows(error: string | null): Row[] {
@@ -221,7 +257,7 @@ function stopRekey(state: ViewState): Result {
 }
 
 /** Opens the form on a list row; the hooks drop any value left from an earlier form. */
-function open(state: ViewState, row: Row): Result {
+function open(state: ViewState, row: Row, choices: readonly TagChoice[]): Result {
   if (row.kind === 'rekey') return startRekey(state)
   const form: Form | null =
     row.kind === 'add'
@@ -232,7 +268,25 @@ function open(state: ViewState, row: Row): Result {
           ? { id: null, suggestion: row.suggestion.id, name: row.suggestion.prompt, tag: '', kind: 'password', use: 'session' }
           : null
   if (form === null) return { state }
-  return withEdit({ ...state, form, field: 'name' }, { field: 'value', kind: 'clear' })
+  const ownTag = choices.some(c => c.tag === form.tag) ? '' : form.tag
+  return withEdit({ ...state, form, field: 'name', ownTag }, { field: 'value', kind: 'clear' })
+}
+
+/** A key on the tag field: ←, → and Space step through the offered tags and the person's own; typing writes their own. */
+function onTagKey(state: ViewState, form: Form, options: readonly TagChoice[], k: ClientKeyEvent): Result {
+  const step = k.key === 'left' ? -1 : k.key === 'right' || k.key === 'space' ? 1 : 0
+  if (step !== 0) {
+    const tags = [...options.map(o => o.tag), null]
+    const at = tags.indexOf(options.some(o => o.tag === form.tag) ? form.tag : null)
+    const next = cycle(tags, tags[at]!, step)
+    return { state: { ...state, form: { ...form, tag: next ?? state.ownTag } } }
+  }
+  const own = options.some(o => o.tag === form.tag) ? '' : form.tag
+  const typed = (tag: string) => ({ state: { ...state, form: { ...form, tag }, ownTag: tag } })
+  if (k.key === 'backspace' || k.key === 'delete') return typed([...own].slice(0, -1).join(''))
+  if (k.ctrl && k.key === 'u') return typed('')
+  const text = typedText(k)
+  return text === null ? { state } : typed(own + text)
 }
 
 function act(state: ViewState, action: VaultAction): Result {
@@ -271,13 +325,14 @@ function onDoorKey(state: ViewState, fields: Door[], enter: VaultAction, k: Clie
   return edit === null ? { state } : withEdit(state, edit)
 }
 
-function onFormKey(state: ViewState, form: Form, k: ClientKeyEvent): Result {
+function onFormKey(state: ViewState, form: Form, options: readonly TagChoice[], k: ClientKeyEvent): Result {
   const at = FIELDS.indexOf(state.field)
   if (k.key === 'up' || k.key === 'down' || k.key === 'tab') {
     const step = k.key === 'up' || (k.key === 'tab' && k.shift) ? -1 : 1
     return moved({ ...state, field: FIELDS[Math.max(0, Math.min(FIELDS.length - 1, at + step))]! })
   }
   if (k.key === 'return' || k.key === '\n') return act(state, { kind: 'save', form })
+  if (state.field === 'tag') return onTagKey(state, form, options, k)
   if (state.field === 'kind' || state.field === 'use') {
     const step = k.key === 'left' ? -1 : k.key === 'right' || k.key === 'space' ? 1 : 0
     if (step === 0) return { state }
@@ -301,11 +356,11 @@ function onFormKey(state: ViewState, form: Form, k: ClientKeyEvent): Result {
   return text === null ? { state } : { state: { ...state, form: { ...form, [key]: value + text } } }
 }
 
-export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entries' | 'suggestions' | 'collisions'>, k: ClientKeyEvent): Result {
+export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entries' | 'suggestions' | 'collisions' | 'tagChoices'>, k: ClientKeyEvent): Result {
   if (props.collisions.length > 0) return { state }
   if (props.state !== 'open') return onDoorKey(state, doors(props.state), { kind: 'open' }, k)
   if (state.rekeying) return onDoorKey(state, ['passphrase', 'again'], { kind: 'rekey' }, k)
-  if (state.form !== null) return onFormKey(state, state.form, k)
+  if (state.form !== null) return onFormKey(state, state.form, tagOptions(props, state.form), k)
   const rows = listRows(props).filter(isSelectable)
   const selected = rows.findIndex(r => rowKey(r) === state.selected)
   if (k.key === 'up' || k.key === 'down') {
@@ -315,9 +370,9 @@ export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entri
   }
   const row = rows[selected]
   if (row === undefined) return { state }
-  if (row.kind === 'entry' && k.key === 'space') return act(state, { kind: 'allow', id: row.entry.id, allowed: !row.entry.allowed })
+  if (row.kind === 'entry' && k.key === 'space') return act(state, { kind: 'access', id: row.entry.id, access: nextAccess(row.entry) })
   if (k.key !== 'return' && k.key !== '\n') return { state }
-  return open(state, row)
+  return open(state, row, props.tagChoices)
 }
 
 function buttonAt<B extends { start: number; width: number }>(buttons: B[], x: number): B | undefined {
@@ -383,9 +438,8 @@ export function onClick(state: ViewState, props: VaultProps, y: number, x: numbe
   const row = window(listRows(props), props.rows - TAB_ROWS, state.selected)[at]
   if (row === undefined || !isSelectable(row)) return { state }
   const chosen = { ...state, selected: rowKey(row) }
-  // The dot at the row's start allows or revokes; the rest opens the entry.
-  if (row.kind === 'entry' && x <= 2) return act(chosen, { kind: 'allow', id: row.entry.id, allowed: !row.entry.allowed })
-  return open(chosen, row)
+  if (row.kind === 'entry' && x < ACCESS_COLUMNS) return act(chosen, { kind: 'access', id: row.entry.id, access: nextAccess(row.entry) })
+  return open(chosen, row, props.tagChoices)
 }
 
 /** The list rows that fit in `room`, scrolled so the selected one shows. */
@@ -421,6 +475,12 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   if (state !== surface.state) surface.setState(state)
 
   const line = (text: string, look: object = {}) => Text({ ...look, children: [pad(clip(text, columns), columns)] })
+  /** A list row of the entries, its access column first, as wide as the view; the name gets what the rest leaves. */
+  const entryLine = (access: string, name: string, tag: string, kind: string) => {
+    const tail = ` ${pad(clip(tag, TAG_COLUMNS), TAG_COLUMNS)} ${pad(kind, KIND_COLUMNS)}`
+    const room = Math.max(4, columns - ACCESS_COLUMNS - cells(tail))
+    return pad(clip(pad(' ' + access, ACCESS_COLUMNS) + pad(clip(name, room), room) + tail, columns), columns)
+  }
   const active = { color: 'claude' as const, bold: true }
   const held = (field: SecretField, isActive: boolean, room: number, empty: string) => {
     const length = shownLength(props.lengths[field], field, state.pending)
@@ -525,16 +585,23 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
           return line(' ⟳ Change passphrase', look)
         case 'none':
           return line(' No entries', { dimColor: true })
+        case 'entryHead':
+          return line(entryLine('Agent', 'Name', 'Tag', 'Kind'), { dimColor: true })
         case 'suggestHead':
           return line(' Typed this session; Enter keeps one', { dimColor: true })
         case 'suggestion':
           return line('   ' + displayed(row.suggestion.prompt), look)
         case 'entry': {
           const e = row.entry
-          const dot = e.allowed ? '✓ ' : '· '
-          const tail = ` ${pad(clip(displayed(e.tag), 14), 14)} ${pad(KIND_NAMES[e.kind], 8)} ${e.use === 'each' ? 'each' : ''}`
-          const name = clip(displayed(e.name), Math.max(4, columns - 1 - 2 - cells(tail)))
-          return line(' ' + dot + pad(name, columns - 3 - cells(tail)) + tail, look)
+          const shown = entryLine(accessLabel(e), displayed(e.name), displayed(e.tag), KIND_NAMES[e.kind])
+          const color = e.access === 'refused' ? 'error' : e.access === 'allowed' && e.use === 'session' ? 'success' : undefined
+          return Box({
+            flexDirection: 'row',
+            children: [
+              Text({ ...(color === undefined ? { dimColor: true } : { color }), bold: rowKey(row) === state.selected, children: [shown.slice(0, ACCESS_COLUMNS)] }),
+              Text({ ...look, children: [shown.slice(ACCESS_COLUMNS)] }),
+            ],
+          })
         }
         default:
           return line('')
@@ -556,6 +623,24 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
                 ? Text({ backgroundColor: FIELD_BACKGROUND, dimColor: true, children: [pad('typed this session', room)] })
                 : held('value', isActive, room, form.id === null ? '' : 'unchanged')
             return Box({ flexDirection: 'row', children: [label, value, Text({ children: ['  '] })] })
+          }
+          if (row.field === 'tag') {
+            const options = tagOptions(props, form)
+            const choice = options.find(o => o.tag === form.tag)
+            const cursor = isActive ? '▏' : ''
+            const own = clip(displayed(form.tag), room - 6) + cursor
+            const face = clip(choice !== undefined ? `‹ ${choice.tag} ›` : options.length > 0 ? `‹ ${own} ›` : own, room)
+            const what = choice !== undefined ? choice.what : form.tag === '' ? 'none: one is made up' : options.length > 0 ? 'your own' : ''
+            const rest = room - cells(face)
+            return Box({
+              flexDirection: 'row',
+              children: [
+                label,
+                Text({ backgroundColor: FIELD_BACKGROUND, bold: isActive, children: [face] }),
+                Text({ backgroundColor: FIELD_BACKGROUND, dimColor: true, children: [pad(clip('  ' + what, rest), rest)] }),
+                Text({ children: ['  '] }),
+              ],
+            })
           }
           const shown =
             row.field === 'kind'

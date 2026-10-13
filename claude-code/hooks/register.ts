@@ -11,7 +11,9 @@ import type { Offered, RequestEntry, RequestsMessage, RequestsProps } from './re
 import { fillSlot, hasSlot } from './slot'
 import { askDecision, listDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
-import type { Collision, SecretField, Suggestion, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
+import { layout } from './config-view'
+import { contentRows } from './vault-view'
+import type { Access, Collision, SecretField, Suggestion, TagChoice, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
 const SIDEBAR_ID = 'pass'
 const DRAWER_SLOT: SidebarDrawerSlot = `sidebar-drawer:${SIDEBAR_ID}`
@@ -30,6 +32,12 @@ const DEFAULT_MASK_MIN = 6
 const UNSEEN_PASTE = 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
 const UNTARGETED_PASTE = 'The paste went into the prompt: no request was selected. Click a request first.'
 const UNTYPED_PASTE = "The paste went into the prompt: the selected request doesn't take typing now."
+/** The tags the askpass helpers ask with (`secrets-askpass-*`), each with what asks. */
+const ASKPASS_TAGS: readonly TagChoice[] = [
+  { tag: 'sudo', what: 'sudo -A asks for your password' },
+  { tag: 'ssh', what: 'ssh asks for a password or passphrase' },
+  { tag: 'git', what: 'git asks for a username or password' },
+]
 const WRITE_BACK = 'secrets: this would write [secret], a masked value, over the real one; edit around the masked span instead.'
 const ROW_COMPONENTS = [
   'UserMessage',
@@ -42,7 +50,7 @@ const ROW_COMPONENTS = [
   'InfoNotice',
 ] as const satisfies readonly SidebarRowComponent[]
 
-type Granted = { id: string; name: string; tag: string; kind: string; use: 'session' | 'each'; allowed: boolean }
+type Granted = { id: string; name: string; tag: string; kind: string; use: 'session' | 'each'; access: Access }
 /** Who asks, and `live`: the command lines of the calls whose output runs through the relay then. */
 type Requester = { pid: number; cmdline: string; inside: boolean; live: string[] }
 type Asked = Requester & { id: string; prompt: string; tag: string | null; entry: Granted | null }
@@ -104,7 +112,13 @@ let formEpoch = 0
 let vaultError: string | null = null
 let vaultFocused: SecretField | null = null
 let vaultFormOpen = false
+/** Tags agents asked for this session that no entry held then, newest last. */
+let askedTags: readonly string[] = []
 let relaySocket: string | null = null
+/** The relay listens: calls to it can go out. */
+let relayReady = false
+/** Claude Code's transcripts folder, from the last classic session start; unknown before it. */
+let projectsDir: string | null = null
 /** Masking replaced something this session, so `[secret]` in content may be a masked read; kept across reloads in `$.state`. */
 let hasMasked = false
 /** The Config tab's options, in the plugin's store: changing them doesn't reload the module and its relay. */
@@ -258,6 +272,8 @@ export function register(on: On) {
     const upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
     // Commands see the relay only once it listens: before, secrets-mask-run would let their output through unmasked.
     const relay = await startRelay($, socket, upstream)
+    relayReady = true
+    await nameSession($, await $.session.id())
     vault = { state: relay.state, entries: [], suggestions: [], forward: upstream === '' ? null : false }
     await sendSettings($)
     // After a reload, the session's own switch in the Config tab stands, not the start setting.
@@ -294,6 +310,14 @@ export function register(on: On) {
     await readAutoMode($)
     configDraft = configApplied ?? SUGGESTED
     return started
+  })
+
+  // A /clear, a resume or a fork goes on under another session id, whose grants are the relay's now. The first start's
+  // id is named at session.start too, whichever of the two comes first.
+  on('classic.SessionStart', async ($, e, next) => {
+    projectsDir = e.transcript_path.split('/').slice(0, -2).join('/')
+    if (relayReady) await nameSession($, e.session_id)
+    return next(e)
   })
 
   on('tool.call', async ($, e, next) => {
@@ -512,30 +536,33 @@ export function register(on: On) {
       const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height }
       return Client({ key, module: './requests.ts', props, width: columns, height: height + tabRows })
     }
+    // The vault and config views get the whole room to lay out in, and are as tall as what they show.
     const vaultView = (columns: number, rows: number, tabs: Tabs) => {
-      const height = rows - VAULT_SPARE_ROWS
+      const room = rows - VAULT_SPARE_ROWS
       const props: VaultProps = {
         state: vault.state,
         collisions: collisions.map(({ name, carriers, refused }) => ({ name, carriers, refused })),
         entries: vault.entries.map(({ created: _created, ...entry }) => entry),
         suggestions: [...vault.suggestions],
+        tagChoices: tagChoices(),
         tabs,
         columns,
-        rows: height,
+        rows: room,
         applied: vaultApplied,
         lengths: { value: [...fields.value].length, passphrase: [...fields.passphrase].length, again: [...fields.again].length },
         peeked: Object.fromEntries([...vaultPeek].map(field => [field, fields[field]])),
         formEpoch,
         error: vaultError,
       }
+      const height = Math.min(room, TAB_ROWS + contentRows(props))
       return Client({ key: VAULT_KEY, module: './vault-view.ts', props, width: columns, height })
     }
     const configView = (columns: number, rows: number, tabs: Tabs) => {
-      const height = rows - VAULT_SPARE_ROWS
+      const room = rows - VAULT_SPARE_ROWS
       const props: ConfigProps = {
         tabs,
         columns,
-        rows: height,
+        rows: room,
         draft: configDraft,
         applied: configApplied,
         confirmed: configConfirmed,
@@ -545,6 +572,7 @@ export function register(on: On) {
         forwardAtStart,
         error: configError,
       }
+      const height = Math.min(room, TAB_ROWS + layout(props, configDraft, true).length)
       return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })
     }
     let filled = tree
@@ -635,14 +663,30 @@ function callsBy(requester: Requester): Call[] {
   return [...running, ...lingering]
 }
 
-/** The open vault's entries a request may be answered with; ssh keys answer signatures, not asks. */
+/** The open vault's entries a request may be answered with: not ssh keys, which answer signatures, nor those refused. */
 function vaultOffer(): Pickable[] {
-  return vault.entries.filter(e => e.kind !== 'ssh-key').map(e => ({ id: e.id, label: `${e.name} · ${e.tag}`, tag: e.tag }))
+  return vault.entries.filter(e => e.kind !== 'ssh-key' && e.access !== 'refused').map(e => ({ id: e.id, label: `${e.name} · ${e.tag}`, tag: e.tag }))
+}
+
+/** Offered in the vault form's tag field: the askpass helpers' tags, then those agents asked for with no entry. */
+function tagChoices(): TagChoice[] {
+  const asked = askedTags.filter(tag => !ASKPASS_TAGS.some(c => c.tag === tag)).map(tag => ({ tag, what: 'an agent asked for it this session' }))
+  return [...ASKPASS_TAGS, ...asked]
 }
 
 async function onAsk($: EngineInterface, ask: Asked) {
+  if (ask.tag !== null && ask.entry === null && !askedTags.includes(ask.tag)) askedTags = [...askedTags, ask.tag]
   const calls = callsBy(ask)
   const decision = askDecision(ask, calls)
+  if (decision === 'refuse') {
+    const source = requestSource(ask, calls.map(r => r.command))
+    // Refused, the asking program fails at once; one already gone needs no answer.
+    const reply = await callRelay($, 'POST', '/answer', { id: ask.id, cancel: true })
+    if (reply === null) return
+    if (reply.status !== 204 && reply.status !== 410) say($, `Not refused: the relay answered ${reply.status}.`, true)
+    else say($, `Refused ${ask.entry?.name ?? ask.prompt} to ${source}: this session refuses it (Vault tab).`, false)
+    return
+  }
   const request: Request = {
     id: ask.id,
     kind: 'secret',
@@ -662,7 +706,10 @@ async function onSign($: EngineInterface, sign: Sign) {
   const calls = callsBy(sign)
   const decision = signDecision(sign, calls)
   // A decision that fails leaves the program waiting: it gets the card instead.
-  if (decision !== 'ask' && (await decideRequest($, sign.id, decision))) return
+  if (decision !== 'ask' && (await decideRequest($, sign.id, decision))) {
+    if (sign.access === 'refused') say($, `Refused ${sign.name} to ${requestSource(sign, calls.map(r => r.command))}: this session refuses it (Vault tab).`, false)
+    return
+  }
   const source = requestSource(sign, calls.map(r => r.command))
   await addRequest($, { id: sign.id, kind: 'sign', prompt: `${sign.name} · ${sign.tag}`, source, since: clockTime(), pick: null, tag: null })
   await $.ui.notify(`Vault key wanted: ${sign.name}`, { title: 'secrets' })
@@ -717,6 +764,12 @@ async function maskResult<T>($: EngineInterface, result: T): Promise<T> {
   if (texts.length === 0) return result
   const masked = (await relayJson($, '/mask', { texts })) as { texts: string[] }
   return withStrings(result, masked.texts)
+}
+
+/** Tells the relay whose grants it keeps; with the transcripts folder known, those of sessions that ended go. */
+async function nameSession($: EngineInterface, id: string) {
+  const reply = await callRelay($, 'POST', '/session', projectsDir === null ? { id } : { id, projects: projectsDir })
+  if (reply !== null && reply.status !== 204) throw new Error(`secrets: the relay didn't take session ${id}: ${reply.text || reply.status}`)
 }
 
 async function sendSettings($: EngineInterface) {
@@ -786,7 +839,7 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
   }
   if (action.kind === 'open') await openVault($)
   else if (action.kind === 'rekey') await rekeyVault($)
-  else if (action.kind === 'allow') await changeVault($, { op: 'allow', id: action.id, allowed: action.allowed })
+  else if (action.kind === 'access') await changeVault($, { op: 'access', id: action.id, access: action.access })
   else if (action.kind === 'delete') {
     if (await changeVault($, { op: 'delete', id: action.id })) closeForm()
   } else if (action.kind === 'dismiss') {

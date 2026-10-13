@@ -14,8 +14,10 @@ export type RequestEntry = {
   since: string
   /** The length of the value the hooks hold for it so far. */
   length: number
-  /** The open vault's entries to pick from, the tagged one first; null when the vault is closed or the asker may not have them. */
+  /** The open vault's entries to pick from; null when the vault is closed or the asker may not have them. */
   offer: Offered[] | null
+  /** The entry the request named by its tag, shown ready to give; null when it named none or the vault has no such entry. */
+  preset: string | null
 }
 
 /** One change to a request's value, numbered per list instance; `session` and `once` answer with an entry. */

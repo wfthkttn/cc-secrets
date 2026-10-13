@@ -155,7 +155,7 @@ export function register(on: On) {
     const started = await next(e)
     await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
     popouts = new Popouts(POPOUT_MS, (ms, fn) => $.clock.after(ms, fn), () => syncPopout($))
-    await $.command.register({ name: 'pass-demo', description: 'Show three sample password requests; no program waits on them' })
+    await $.command.register({ name: 'pass-demo', description: 'Show one sample request of each kind; no program waits on them' })
     // A reload starts with no requests and a new relay; the host still shows what the old module set.
     await $.sidebar.badge({ id: SIDEBAR_ID, count: 0, level: 'urgent' })
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
@@ -317,15 +317,27 @@ export function register(on: On) {
   })
 
   on('command.run', { command: 'pass-demo' }, async $ => {
-    const samples = [
-      { prompt: '[sudo] password for alex', source: 'sudo -A systemctl restart nginx' },
-      { prompt: "Password for 'https://alex@git.example.org'", source: 'git push origin main' },
+    const names = ['Prod DB · db', 'Deploy API · deploy-api', 'Staging DB · db-staging', 'GitHub token · gh', 'SMTP · smtp', 'S3 backup · s3', 'Grafana · grafana', 'Sentry · sentry']
+    const offer = names.map((label, i) => ({ id: `demo-${i}`, label }))
+    const samples: Omit<Request, 'id' | 'since'>[] = [
+      { kind: 'secret', prompt: '[sudo] password for alex', source: 'sudo -A systemctl restart nginx', offer: null, preset: null },
       {
+        kind: 'secret',
+        prompt: 'Prod DB password',
+        source: 'psql "postgres://app:$(secrets ask --tag db "Prod DB password")@db.internal/app"',
+        offer,
+        preset: 'demo-0',
+      },
+      {
+        kind: 'secret',
         prompt: 'deploy token',
         source: 'TOKEN=$(secrets ask "deploy token") && curl -fsS -H "Authorization: Bearer $TOKEN" https://deploy.example.org/api/v1/releases --data @release.json',
+        offer,
+        preset: null,
       },
+      { kind: 'sign', prompt: 'Deploy key · deploy', source: 'git push origin main', offer: null, preset: null },
     ]
-    for (const sample of samples) await addRequest($, { id: 'demo-' + randomId(), kind: 'secret', ...sample, since: clockTime(), offer: null })
+    for (const sample of samples) await addRequest($, { ...sample, id: 'demo-' + randomId(), since: clockTime() })
     await syncBadge($)
     return {}
   })
@@ -450,22 +462,22 @@ async function readRelay($: EngineInterface, socket: string, upstream: string, r
   throw new Error('the relay exited')
 }
 
-/** The open vault's entries a request may be answered with, `first` leading; ssh keys answer signatures, not asks. */
-function offerOf(first: string | null): Offered[] {
-  const entries = vault.entries.filter(e => e.kind !== 'ssh-key')
-  const ordered = [...entries.filter(e => e.id === first), ...entries.filter(e => e.id !== first)]
-  return ordered.map(e => ({ id: e.id, label: `${e.name} · ${e.tag}` }))
+/** The open vault's entries a request may be answered with; ssh keys answer signatures, not asks. */
+function vaultOffer(): Offered[] {
+  return vault.entries.filter(e => e.kind !== 'ssh-key').map(e => ({ id: e.id, label: `${e.name} · ${e.tag}` }))
 }
 
 async function onAsk($: EngineInterface, ask: Asked) {
   const decision = askDecision(ask, running)
+  const offer = decision === 'card' && vault.state === 'open' ? vaultOffer() : null
   const request: Request = {
     id: ask.id,
     kind: 'secret',
     prompt: ask.prompt,
     source: requestSource(ask, running.map(r => r.command)),
     since: clockTime(),
-    offer: decision === 'card' && vault.state === 'open' ? offerOf(ask.entry?.id ?? null) : null,
+    offer,
+    preset: offer !== null && ask.entry !== null ? ask.entry.id : null,
   }
   if (decision === 'give' && ask.entry !== null) return answerRequest($, request, { entry: ask.entry.id, session: false })
   await addRequest($, request)
@@ -476,7 +488,7 @@ async function onSign($: EngineInterface, sign: Sign) {
   const decision = signDecision(sign, running)
   if (decision !== 'ask') return decideRequest($, sign.id, decision)
   const source = requestSource(sign, running.map(r => r.command))
-  await addRequest($, { id: sign.id, kind: 'sign', prompt: `${sign.name} · ${sign.tag}`, source, since: clockTime(), offer: null })
+  await addRequest($, { id: sign.id, kind: 'sign', prompt: `${sign.name} · ${sign.tag}`, source, since: clockTime(), offer: null, preset: null })
   await $.ui.notify(`Vault key wanted: ${sign.name}`, { title: 'secrets' })
 }
 

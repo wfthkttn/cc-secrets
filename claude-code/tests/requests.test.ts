@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  choiceOf,
   confirm,
   type Frame,
   geometry,
@@ -11,13 +12,15 @@ import {
   listHeight,
   onClick,
   onKey,
-  pickArrows,
+  MENU_ROWS,
+  menuOf,
   shownLength,
+  TYPE_OPTION,
   view,
 } from '../hooks/requests'
 import type { RequestEntry } from '../hooks/requests-props'
 
-const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, offer: null })
+const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, offer: null, preset: null })
 const ENTRIES = [entry('a', '[sudo] password for alex'), entry('b', 'test token')]
 const START = initialState(0, 'i1')
 const FRAME: Frame = { columns: 60, rows: 100, message: null }
@@ -133,13 +136,13 @@ test("a click on the message's ✕ dismisses it; elsewhere on it, only focuses",
 })
 
 test('cards past the room scroll in a window between markers counting the cards cut off', async () => {
-  const rows = view(MANY, SHORT, 0)
+  const rows = view(MANY, SHORT, START)
   expect(rows.length).toBe(17)
   expect(rows[0]).toEqual({ id: null, kind: 'more', dir: 'up', count: 0 })
   expect(rows[16]).toEqual({ id: null, kind: 'more', dir: 'down', count: 3 })
   expect(rows.slice(1, 16).map(r => r.id)).toEqual([...'aaaaaaa', null, ...'bbbbbbb'])
-  expect(view(MANY, SHORT, 999).slice(1, 16).map(r => r.id)).toEqual([...'ddddddd', null, ...'eeeeeee'])
-  expect(view(ENTRIES, SHORT, 5).map(r => r.kind)).toEqual(layout(ENTRIES, 60, null).map(r => r.kind))
+  expect(view(MANY, SHORT, { ...START, scroll: 999 }).slice(1, 16).map(r => r.id)).toEqual([...'ddddddd', null, ...'eeeeeee'])
+  expect(view(ENTRIES, SHORT, { ...START, scroll: 5 }).map(r => r.kind)).toEqual(layout(ENTRIES, 60, null).map(r => r.kind))
 })
 
 test('the arrows move the selection and the window follows to show the selected card whole', async () => {
@@ -149,7 +152,7 @@ test('the arrows move the selection and the window follows to show the selected 
   expect([state.selected, state.scroll]).toEqual(['b', 0])
   press('down')
   expect([state.selected, state.scroll]).toEqual(['c', 8])
-  expect(view(MANY, SHORT, state.scroll)[0]).toEqual({ id: null, kind: 'more', dir: 'up', count: 1 })
+  expect(view(MANY, SHORT, state)[0]).toEqual({ id: null, kind: 'more', dir: 'up', count: 1 })
   press('up')
   expect([state.selected, state.scroll]).toEqual(['b', 8])
   press('end')
@@ -177,7 +180,7 @@ test('the list stays its tallest card and gap short of the room; a list that fit
 
 test('a message stays on top while the cards under it scroll', async () => {
   const frame = { ...SHORT, message: 'Short.' }
-  const rows = view(MANY, frame, 999)
+  const rows = view(MANY, frame, { ...START, scroll: 999 })
   expect(rows.length).toBe(17)
   expect(rows.slice(0, 6).map(r => r.kind)).toEqual(['msgTop', 'msg', 'msg', 'msg', 'msgBottom', 'more'])
   expect(rows.at(-2)).toEqual({ id: 'e', kind: 'cardBottom' })
@@ -201,35 +204,81 @@ test('a card with no source command has no source row', async () => {
   expect(layout(entries, 60, null).map(r => r.kind)).toEqual(['cardTop', 'what', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
 })
 
-test('with the vault open, a card also offers its entries: on their row ←/→ or the arrows pick, Enter, Session or Once answers with it', async () => {
-  const offer = [
-    { id: 'e1', label: 'Prod DB · db' },
-    { id: 'e2', label: 'Deploy · deploy' },
-  ]
-  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer }]
+const OFFER = ['Prod DB · db', 'Deploy · deploy', 'S3 · s3', 'SMTP · smtp', 'Sentry · sentry', 'Grafana · grafana', 'GitHub · gh', 'Stage DB · db2'].map(
+  (label, i) => ({ id: `e${i}`, label }),
+)
+
+test('a request naming its key holds that entry in its field: Session, Once, or Enter gives it; typing does nothing', async () => {
+  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, preset: 'e0' }]
   const rows = layout(entries, 60, null)
   expect(rows.map(r => r.kind).slice(-4)).toEqual(['pickTop', 'pick', 'pickBottom', 'cardBottom'])
+  expect(choiceOf({}, entries[0]!)).toEqual(OFFER[0])
   const at = rows.findIndex(r => r.kind === 'pick')
   const [session, once] = grantButtons(60, false)
-  expect(onClick(START, entries, FRAME, at, session!.start + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'session', entry: 'e1' }])
-  const onPick = onKey(START, entries, FRAME, { key: 'down' }).state
-  expect(onPick.part).toBe('pick')
-  const next = onKey(onPick, entries, FRAME, { key: 'right' }).state
-  expect(onClick(next, entries, FRAME, at, once!.start + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e2' }])
-  expect(onKey(next, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e2' }])
-  expect(onKey(onPick, entries, FRAME, { key: 'up' }).state.part).toBe('field')
-  const arrows = pickArrows(60, 'Prod DB · db')
-  expect(onClick(START, entries, FRAME, at, arrows.more).state).toMatchObject({ picks: { a: 1 }, part: 'pick' })
-  expect(onClick(START, entries, FRAME, at, arrows.less).state.picks).toEqual({ a: 1 })
+  expect(onClick(START, entries, FRAME, at, session!.start + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'session', entry: 'e0' }])
+  expect(onClick(START, entries, FRAME, at, once!.start + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e0' }])
+  expect(onKey(START, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e0' }])
+  expect(onKey(START, entries, FRAME, { key: 'x' }).post).toBe(undefined)
+  expect(onKey(START, entries, FRAME, { key: 'backspace' }).post).toBe(undefined)
 })
 
-test('in the field, Enter sends what was typed, even empty, with entries offered below; ←/→ leave the entry alone', async () => {
-  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: [{ id: 'e1', label: 'Prod DB · db' }, { id: 'e2', label: 'Deploy · deploy' }] }]
-  expect(onKey(START, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'submit' }])
-  expect(onKey(START, entries, FRAME, { key: 'right' }).state.picks).toEqual({})
-  const typed = onKey(START, entries, FRAME, { key: 'pw' }).state
-  expect(onKey(typed, entries, FRAME, { key: 'return' }).post?.edits.at(-1)).toEqual({ seq: 2, id: 'a', kind: 'submit' })
-  const back = onKey(onKey(START, entries, FRAME, { key: 'down' }).state, entries, FRAME, { key: 'x' })
-  expect(back.state.part).toBe('field')
-  expect(back.post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'append', text: 'x' }])
+test('a request naming no key is a bare field that takes typing; a click on it opens the menu: Type, then the entries', async () => {
+  const entries: RequestEntry[] = [{ ...entry('a', 'deploy token'), offer: OFFER }]
+  const rows = layout(entries, 60, null)
+  expect(rows.map(r => r.kind)).toEqual(['cardTop', 'what', 'from', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
+  expect(onKey(START, entries, FRAME, { key: 'x' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'append', text: 'x' }])
+  const field = rows.findIndex(r => r.kind === 'field')
+  const opened = onClick(START, entries, FRAME, field, 6).state
+  expect(opened).toMatchObject({ isMenuOpen: true, cursor: 0, selected: 'a' })
+  const menu = menuOf(entries, FRAME, opened)!
+  expect(menu).toMatchObject({ id: 'a', top: field + 2, first: 0, shown: MENU_ROWS })
+  expect(menu.options).toEqual([TYPE_OPTION, ...OFFER.map(o => o.label)])
+  expect(menuOf(entries, FRAME, START)).toBe(null)
+})
+
+test('in the menu ↑/↓ move, Enter or a click chooses, Tab or a click outside shuts it', async () => {
+  const entries: RequestEntry[] = [{ ...entry('a', 'deploy token'), offer: OFFER }]
+  const field = layout(entries, 60, null).findIndex(r => r.kind === 'field')
+  const opened = onClick(START, entries, FRAME, field, 6).state
+  let state = opened
+  for (let i = 0; i < 7; i++) state = onKey(state, entries, FRAME, { key: 'down' }).state
+  expect(state.cursor).toBe(7)
+  expect(menuOf(entries, FRAME, state)!.first).toBe(2)
+  const chosen = onKey(state, entries, FRAME, { key: 'return' }).state
+  expect(chosen).toMatchObject({ isMenuOpen: false, choices: { a: 'e6' } })
+  expect(layout(entries, 60, null, chosen.choices).some(r => r.kind === 'pick')).toBe(true)
+  expect(onKey(chosen, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e6' }])
+  const menu = menuOf(entries, FRAME, opened)!
+  expect(onClick(opened, entries, FRAME, menu.top + 3, menu.left + 4).state).toMatchObject({ isMenuOpen: false, choices: { a: 'e1' } })
+  expect(onClick(opened, entries, FRAME, menu.top, menu.left + 4).state).toEqual(opened)
+  expect(onClick(opened, entries, FRAME, 1, 3).state).toMatchObject({ isMenuOpen: false, choices: {} })
+  expect(onKey(opened, entries, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(false)
+  expect(onKey(START, entries, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(true)
+  expect(onKey(opened, entries, FRAME, { key: 'x' }).post).toBe(undefined)
+})
+
+test('Type in the menu turns a chosen entry back into a field that takes typing; the menu opens on what the field holds', async () => {
+  const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, preset: 'e0' }]
+  const field = layout(entries, 60, null).findIndex(r => r.kind === 'field')
+  const opened = onClick(START, entries, FRAME, field, 6).state
+  expect(opened.cursor).toBe(1)
+  const typing = onKey(onKey(opened, entries, FRAME, { key: 'up' }).state, entries, FRAME, { key: 'return' }).state
+  expect(typing.choices).toEqual({ a: null })
+  expect(layout(entries, 60, null, typing.choices).some(r => r.kind === 'pick')).toBe(false)
+  expect(onKey(typing, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'submit' }])
+  expect(onClick(typing, entries, FRAME, field, 6).state.cursor).toBe(0)
+})
+
+test('the menu opens above its field when the room under it is short', async () => {
+  const entries: RequestEntry[] = [entry('a', 'p'), { ...entry('b', 'deploy token'), offer: OFFER }]
+  const frame: Frame = { columns: 60, rows: 18, message: null }
+  const fieldTop = layout(entries, 60, null).findIndex(r => r.id === 'b' && r.kind === 'fieldTop')
+  const opened = onClick(START, entries, frame, fieldTop + 1, 6).state
+  expect(menuOf(entries, frame, opened)!.top).toBe(fieldTop - 9)
+})
+
+test('a field with no vault entries to offer opens no menu', async () => {
+  const field = layout(ENTRIES, 60, null).findIndex(r => r.kind === 'field')
+  expect(onClick(START, ENTRIES, FRAME, field, 6).state.isMenuOpen).toBe(false)
+  expect(onKey(START, ENTRIES, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(false)
 })

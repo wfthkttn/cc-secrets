@@ -25,7 +25,14 @@ export type ValueEdit =
   | { seq: number; kind: 'action'; action: VaultAction }
   | { seq: number; kind: 'tab'; tab: Tab }
 
+/**
+ * A plugin loaded after this one whose hooks see the calls that carry secrets (`carriers`): while one is not
+ * allowed, nothing that would carry a secret through them runs. `refused`: it is refused from the next start.
+ */
+export type Collision = { name: string; carriers: string[]; refused: boolean }
+
 export type VaultAction =
+  | { kind: 'collision'; name: string; decision: 'allow' | 'refuse' }
   | { kind: 'save'; form: Form }
   | { kind: 'delete'; id: string }
   | { kind: 'dismiss'; id: string }
@@ -35,6 +42,8 @@ export type VaultAction =
 
 export type VaultProps = {
   state: 'absent' | 'locked' | 'open'
+  /** Shown instead of the vault while any is there. */
+  collisions: Collision[]
   entries: ViewEntry[]
   suggestions: Suggestion[]
   tabs: Tabs

@@ -1,7 +1,18 @@
 import { expect, test } from 'claude-code/testing'
 
 import { TAB_ROWS, tabSpans } from '../hooks/tabs'
-import VaultView, { closedRows, doorButtons, formButtons, initialState, listRows, onClick, onKey, type ViewState } from '../hooks/vault-view'
+import VaultView, {
+  closedRows,
+  collisionButtons,
+  collisionRows,
+  doorButtons,
+  formButtons,
+  initialState,
+  listRows,
+  onClick,
+  onKey,
+  type ViewState,
+} from '../hooks/vault-view'
 import type { ValueEdit, VaultProps, ViewEntry } from '../hooks/vault-view-props'
 
 const isAction = (e: ValueEdit): e is Extract<ValueEdit, { kind: 'action' }> => e.kind === 'action'
@@ -13,6 +24,7 @@ const ENTRIES: ViewEntry[] = [
 ]
 const PROPS: VaultProps = {
   state: 'open',
+  collisions: [],
   entries: ENTRIES,
   suggestions: [{ id: 's1', prompt: '[sudo] password for alex' }],
   tabs: { active: 'vault', requests: 1, vaultMark: true },
@@ -153,4 +165,20 @@ test('every drawn row is exactly as wide as the view: the list, the form, the cl
   for (const row of closed) expect([...row].length).toBe(60)
   expect(closed.some(r => r.includes('••••'))).toBe(true)
   expect(closed.some(r => r.includes('│ Create │'))).toBe(true)
+})
+
+test('a colliding plugin replaces the vault with what it hooks and Allow / Refuse; keys do nothing there', async () => {
+  const props = { ...PROPS, collisions: [{ name: 'tracer', carriers: ['http.fetch'], refused: false }] }
+  const rows = draw(props)
+  for (const row of rows) expect([...row].length).toBe(60)
+  expect(rows[TAB_ROWS]).toContain('⚠ tracer hooks http.fetch')
+  expect(rows.some(r => r.includes('+ Add'))).toBe(false)
+  const [allow, refuse] = collisionButtons()
+  const at = collisionRows(props.collisions).findIndex(r => r.kind === 'collisionButtons')
+  expect(click(START, at, allow!.start + 1, props).post?.edits.find(isAction)?.action).toEqual({ kind: 'collision', name: 'tracer', decision: 'allow' })
+  expect(click(START, at, refuse!.start + 1, props).post?.edits.find(isAction)?.action).toEqual({ kind: 'collision', name: 'tracer', decision: 'refuse' })
+  expect(onKey(START, props, { key: 'return' }).post).toBe(undefined)
+  const refused = draw({ ...props, collisions: [{ ...props.collisions[0]!, refused: true }] })
+  expect(refused.some(r => r.includes('│ Allow │'))).toBe(false)
+  expect(refused.some(r => r.includes('Refused from the next start'))).toBe(true)
 })

@@ -37,8 +37,8 @@ type Row =
 /** A row on screen: a layout row, or a marker for the cards cut off above or below. */
 type ViewRow = Row | { id: null; kind: 'more'; dir: 'up' | 'down'; count: number }
 
-/** The list's room, and the message pinned above its cards. */
-export type Frame = { columns: number; rows: number; message: string | null }
+/** The list's room, the message pinned above its cards, and why a typed value can't be sent now (null when it can). */
+export type Frame = { columns: number; rows: number; message: string | null; typingOff: string | null }
 
 /**
  * The open menu, a window over the rows under its card's field (above it when there is no room below): `top`
@@ -328,6 +328,7 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   if (entry.kind === 'sign') return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: null }) : { state }
   const chosen = choiceOf(entry, state.pending)
   if (chosen !== null) return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: chosen.id }) : { state }
+  if (frame.typingOff !== null) return { state }
   if (isEnter) return withEdit(state, selected, { id: selected, kind: 'submit' })
   if (k.key === 'backspace' || k.key === 'delete') return withEdit(state, selected, { id: selected, kind: 'back' })
   if (k.ctrl && k.key === 'u') return withEdit(state, selected, { id: selected, kind: 'clear' })
@@ -387,7 +388,7 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
 const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   const { Box, Text } = surface.elements
   const { columns } = props
-  const frame: Frame = { columns, rows: props.rows, message: props.message }
+  const frame: Frame = { columns, rows: props.rows, message: props.message, typingOff: props.typingOff }
   const tabRows = props.tabs === null ? 0 : TAB_ROWS
   surface.onPointer(p => {
     if (p.type !== 'down') return
@@ -468,16 +469,19 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
         const room = fieldColumns - 4 - (hasMenu ? 2 : 0)
         const chosen = choiceOf(entry, state.pending)
         const count = shownLength(entry, state.pending)
-        const typing = active(row.id) && chosen === null
+        const isOff = chosen === null && props.typingOff !== null
+        const typing = active(row.id) && chosen === null && !isOff
         const shown =
           chosen !== null
             ? clip(displayed(chosen.label), room)
-            : typing
-              ? (count + 1 > room ? '…' + '•'.repeat(room - 2) : '•'.repeat(count)) + '▏'
-              : count > 0
-                ? '•'.repeat(Math.min(count, room))
-                : 'password'
-        const isDim = chosen === null && !typing && count === 0
+            : isOff
+              ? clip(displayed(props.typingOff!), room)
+              : typing
+                ? (count + 1 > room ? '…' + '•'.repeat(room - 2) : '•'.repeat(count)) + '▏'
+                : count > 0
+                  ? '•'.repeat(Math.min(count, room))
+                  : 'password'
+        const isDim = chosen === null && !typing && (count === 0 || isOff)
         return line(row.id, [
           Text({ ...look(row.id), children: ['│ '] }),
           Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: isDim, children: [pad(shown, room) + (hasMenu ? ' ▾' : '')] }),

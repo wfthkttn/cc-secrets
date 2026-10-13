@@ -43,6 +43,8 @@ export type RequestsProps = {
   applied: Record<string, number>
   /** Shown above the cards with a ✕ that dismisses it. */
   message: string | null
+  /** Why a typed value can't be sent now (a plugin could read it); null when it can. A vault entry still can. */
+  typingOff: string | null
   /** The list's width. */
   columns: number
   /** The list's height; cards past it scroll. */

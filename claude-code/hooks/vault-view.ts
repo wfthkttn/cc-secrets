@@ -2,7 +2,7 @@ import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
 import { cells, clip, displayed, pad } from './display'
 import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
-import type { EntryKind, EntryUse, Form, SecretField, Suggestion, ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
+import type { Collision, EntryKind, EntryUse, Form, SecretField, Suggestion, ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
 type Field = 'name' | 'tag' | 'kind' | 'use' | 'value'
 type Door = 'passphrase' | 'again'
@@ -34,6 +34,9 @@ export type Row =
   | { kind: 'field'; field: Field }
   | { kind: 'gap' | 'buttonsTop' | 'buttons' | 'buttonsBottom' }
   | { kind: 'error'; text: string }
+  | { kind: 'collision'; collision: Collision }
+  | { kind: 'collisionNote'; collision: Collision }
+  | { kind: 'collisionTop' | 'collisionButtons' | 'collisionBottom'; collision: Collision }
 
 type Result = { state: ViewState; post?: VaultMessage }
 
@@ -85,11 +88,29 @@ export function formRows(error: string | null): Row[] {
   return rows
 }
 
+/** Each colliding plugin: what it hooks, what that means, and Allow / Refuse until refused. */
+export function collisionRows(collisions: readonly Collision[]): Row[] {
+  const rows: Row[] = []
+  for (const collision of collisions) {
+    rows.push({ kind: 'collision', collision }, { kind: 'collisionNote', collision })
+    if (!collision.refused) rows.push({ kind: 'collisionTop', collision }, { kind: 'collisionButtons', collision }, { kind: 'collisionBottom', collision })
+    rows.push({ kind: 'gap' })
+  }
+  return rows
+}
+
+export function collisionButtons() {
+  return laidOut([
+    { kind: 'allow', label: ' Allow ' },
+    { kind: 'refuse', label: ' Refuse ' },
+  ])
+}
+
 function isSelectable(row: Row): boolean {
   return row.kind === 'add' || row.kind === 'entry' || row.kind === 'suggestion'
 }
 
-type Button = { kind: 'save' | 'delete' | 'dismiss' | 'cancel' | 'open'; label: string }
+type Button = { kind: 'save' | 'delete' | 'dismiss' | 'cancel' | 'open' | 'allow' | 'refuse'; label: string }
 
 function laidOut(labels: readonly Button[]) {
   let start = 1
@@ -230,7 +251,8 @@ function onFormKey(state: ViewState, form: Form, k: ClientKeyEvent): Result {
   return text === null ? { state } : { state: { ...state, form: { ...form, [key]: value + text } } }
 }
 
-export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entries' | 'suggestions'>, k: ClientKeyEvent): Result {
+export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entries' | 'suggestions' | 'collisions'>, k: ClientKeyEvent): Result {
+  if (props.collisions.length > 0) return { state }
   if (props.state !== 'open') return onDoorKey(state, props, k)
   if (state.form !== null) return onFormKey(state, state.form, k)
   const rows = listRows(props).filter(isSelectable)
@@ -254,6 +276,13 @@ export function onClick(state: ViewState, props: VaultProps, y: number, x: numbe
     return tab !== null && tab !== 'vault' ? withEdit(state, { kind: 'tab', tab }) : { state }
   }
   const at = y - TAB_ROWS
+  if (props.collisions.length > 0) {
+    const row = collisionRows(props.collisions)[at]
+    if (row?.kind !== 'collisionTop' && row?.kind !== 'collisionButtons' && row?.kind !== 'collisionBottom') return { state }
+    const button = buttonAt(collisionButtons(), x)
+    if (button?.kind !== 'allow' && button?.kind !== 'refuse') return { state }
+    return act(state, { kind: 'collision', name: row.collision.name, decision: button.kind })
+  }
   const onButtons = (row: Row | undefined) => row?.kind === 'buttonsTop' || row?.kind === 'buttons' || row?.kind === 'buttonsBottom'
   if (props.state !== 'open') {
     const row = closedRows(props)[at]
@@ -326,7 +355,7 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const buttonRow = (kind: 'buttonsTop' | 'buttons' | 'buttonsBottom', buttons: ReturnType<typeof laidOut>) => {
     const faces = buttons.map(b =>
       Text({
-        ...(b.kind === 'cancel' || b.kind === 'delete' || b.kind === 'dismiss' ? { color: 'error' as const } : { color: 'claude' as const }),
+        ...(b.kind === 'cancel' || b.kind === 'delete' || b.kind === 'dismiss' || b.kind === 'refuse' ? { color: 'error' as const } : { color: 'claude' as const }),
         children: [' ' + (kind === 'buttonsTop' ? edge('top', b.width) : kind === 'buttonsBottom' ? edge('bottom', b.width) : '│' + b.label + '│')],
       }),
     )
@@ -335,7 +364,26 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   }
   const form = state.form
   let rows
-  if (isClosed) {
+  if (props.collisions.length > 0) {
+    const faces = { collisionTop: 'buttonsTop', collisionButtons: 'buttons', collisionBottom: 'buttonsBottom' } as const
+    rows = collisionRows(props.collisions).map(row => {
+      switch (row.kind) {
+        case 'collision':
+          return line(` ⚠ ${displayed(row.collision.name)} hooks ${row.collision.carriers.join(', ')}`, { color: 'error' })
+        case 'collisionNote':
+          return line(
+            row.collision.refused ? '   Refused from the next start; off until then.' : '   It could read secrets sent there: vault and typing off.',
+            { dimColor: true },
+          )
+        case 'collisionTop':
+        case 'collisionButtons':
+        case 'collisionBottom':
+          return buttonRow(faces[row.kind], collisionButtons())
+        default:
+          return line('')
+      }
+    })
+  } else if (isClosed) {
     rows = closedRows(props).map(row => {
       switch (row.kind) {
         case 'closed':

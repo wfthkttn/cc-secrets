@@ -1,0 +1,26 @@
+import { expect, test } from 'claude-code/testing'
+
+import { allowKey, carriersSeen, selects } from '../hooks/guard'
+
+test('a pattern selects by name, by *, by namespace glob, and a negation selects everything else', async () => {
+  expect(selects('http.fetch', 'http.fetch')).toBe(true)
+  expect(selects('http.*', 'http.fetch')).toBe(true)
+  expect(selects('*', 'env.set')).toBe(true)
+  expect(selects('!tool.describe', 'http.fetch')).toBe(true)
+  expect(selects('!http.*', 'http.fetch')).toBe(false)
+  expect(selects('process.spawn', 'process.run')).toBe(false)
+  expect(selects('env.*', 'environment.set')).toBe(false)
+})
+
+test("a plugin's hooks name the calls carrying secrets they see; the installed plugins' see none", async () => {
+  expect(carriersSeen(['tool.call', 'http.fetch'])).toEqual(['http.fetch'])
+  expect(carriersSeen(['*'])).toEqual(['http.fetch', 'process.spawn', 'env.set'])
+  expect(carriersSeen(['!http.fetch'])).toEqual(['process.spawn', 'env.set'])
+  expect(carriersSeen(['ui.render', 'ui.message', 'session.start', 'engine.create', 'command.run', 'classic.SessionStart'])).toEqual([])
+  expect(carriersSeen(['session.start', 'tool.call', 'session.append', 'classic.PermissionDenied'])).toEqual([])
+})
+
+test('an allow holds for exactly the hooks it was given, whatever their order', async () => {
+  expect(allowKey('tracer', ['http.fetch', 'tool.call'])).toBe(allowKey('tracer', ['tool.call', 'http.fetch']))
+  expect(allowKey('tracer', ['http.fetch'])).not.toBe(allowKey('tracer', ['http.fetch', 'env.set']))
+})

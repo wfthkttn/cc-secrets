@@ -3,6 +3,7 @@ import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from '
 
 import { appliedText, SUGGESTED, withText } from './auto-mode'
 import type { ConfigAction, ConfigMessage, ConfigProps } from './config-view-props'
+import { allowKey, carriersSeen } from './guard'
 import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
@@ -10,7 +11,7 @@ import type { Offered, RequestEntry, RequestsMessage, RequestsProps } from './re
 import { fillSlot, hasSlot } from './slot'
 import { askDecision, listDecision, requestSource, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
-import type { SecretField, Suggestion, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
+import type { Collision, SecretField, Suggestion, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
 const SIDEBAR_ID = 'pass'
 const DRAWER_SLOT: SidebarDrawerSlot = `sidebar-drawer:${SIDEBAR_ID}`
@@ -116,6 +117,8 @@ let listFocused = false
 /** The prompt's draft while the list holds the keyboard; a different draft at the prompt's next key or submit means a paste landed there unseen. */
 let draftAtFocus: string | null = null
 let listSelected: string | null = null
+/** Plugins loaded after this one that hook a call carrying secrets, until allowed; `events` are their hook patterns. */
+let collisions: readonly (Collision & { events: readonly string[] })[] = []
 /** Made at session start, where the hooks first have `$` for its timers. */
 let popouts: Popouts | null = null
 /** Shown above the cards; a sticky one stays until its ✕, any other also goes on the next action or after `NOTICE_MS`. */
@@ -153,6 +156,19 @@ function unsay($: EngineInterface, evenSticky: boolean) {
   syncPopout($)
 }
 
+/** A list of names from the plugin's store, empty when never set; anything else stored there is an error. */
+async function storedList($: EngineInterface, key: 'allowedPlugins' | 'refusedPlugins'): Promise<string[]> {
+  const stored = await $.store.get(key)
+  if (stored === undefined) return []
+  if (!Array.isArray(stored) || stored.some(s => typeof s !== 'string')) throw new Error(`secrets: the stored ${key} is not a list of strings`)
+  return stored as string[]
+}
+
+/** Why a typed value can't be sent now, naming the plugins that could read it; null when it can. */
+function typingOff(): string | null {
+  return collisions.length === 0 ? null : `off: ${collisions.map(c => c.name).join(', ')} could read it · Vault tab`
+}
+
 /** An option from the plugin's store, its default when never set; a stored value of the wrong type is an error. */
 async function option<T extends number | boolean>($: EngineInterface, key: string, fallback: T): Promise<T> {
   const stored = await $.store.get(key)
@@ -162,6 +178,21 @@ async function option<T extends number | boolean>($: EngineInterface, key: strin
 }
 
 export function register(on: On) {
+  // Judges the plugins loaded after this one (those before it are out of reach): one whose hooks see a call that
+  // carries secrets loads, but shows as a collision until allowed, and is refused from the next start once refused.
+  on('plugin.register', async ($, e, next) => {
+    collisions = collisions.filter(c => c.name !== e.name)
+    const carriers = carriersSeen(e.uses.events)
+    if (carriers.length === 0) return next(e)
+    if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
+      return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (Refuse in the Vault tab)` }
+    }
+    if (!(await storedList($, 'allowedPlugins')).includes(allowKey(e.name, e.uses.events))) {
+      collisions = [...collisions, { name: e.name, carriers, refused: false, events: e.uses.events }]
+    }
+    return next(e)
+  }).catch(($, e, next) => (next.called ? next(e) : { refuse: "secrets couldn't check what it hooks" }))
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
@@ -236,10 +267,19 @@ export function register(on: On) {
     const written =
       e.tool === 'Write' ? e.content : e.tool === 'Edit' ? e.new_string : e.tool === 'NotebookEdit' ? e.new_source : e.tool === 'Bash' ? e.command : null
     if (written !== null && hasMasked && holdsMask(written)) return { deny: WRITE_BACK }
-    if (e.tool !== 'Bash') return maskResult($, await next(e))
+    if (e.tool !== 'Bash') {
+      const result = await next(e)
+      // Masking would send the raw result through http.fetch, where a colliding plugin reads it.
+      if (vault.state === 'open' && collisions.length > 0 && stringsIn(result).length > 0) {
+        return { deny: `secrets: this result is withheld while ${collisions.map(c => c.name).join(', ')} could read it on its way to masking; see the Vault tab` }
+      }
+      return maskResult($, result)
+    }
     running.push({ id: e.tool_use_id, command: e.command, agentId: e.agentId })
     try {
-      return maskResult($, await next(e))
+      const result = await next(e)
+      // secrets-mask-run masked Bash output already; the extra pass through http.fetch waits until no plugin could read it.
+      return collisions.length > 0 ? result : maskResult($, result)
     } finally {
       running.splice(running.findIndex(r => r.id === e.tool_use_id), 1)
     }
@@ -293,7 +333,11 @@ export function register(on: On) {
       if (edit.kind === 'append') held.set(edit.id, value + edit.text)
       else if (edit.kind === 'back') held.set(edit.id, [...value].slice(0, -1).join(''))
       else if (edit.kind === 'clear') held.set(edit.id, '')
-      else if (edit.kind === 'submit') await answerRequest($, request, { secret: value })
+      else if (edit.kind === 'submit') {
+        const off = typingOff()
+        if (off !== null) say($, `Not sent: typing is ${off}.`, true)
+        else await answerRequest($, request, { secret: value })
+      }
       else if (edit.kind === 'cancel') await answerRequest($, request, { cancel: true })
       else if ((edit.kind === 'session' || edit.kind === 'once') && edit.entry !== null) {
         await answerRequest($, request, { entry: edit.entry, session: edit.kind === 'session' })
@@ -408,13 +452,14 @@ export function register(on: On) {
       const message = notice === null ? null : notice.text
       const tabRows = tabs === null ? 0 : TAB_ROWS
       const height = listHeight(entries, columns, message, rows - tabRows)
-      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, columns, rows: height }
+      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height }
       return Client({ key, module: './requests.ts', props, width: columns, height: height + tabRows })
     }
     const vaultView = (columns: number, rows: number, tabs: Tabs) => {
       const height = rows - VAULT_SPARE_ROWS
       const props: VaultProps = {
         state: vault.state,
+        collisions: collisions.map(({ name, carriers, refused }) => ({ name, carriers, refused })),
         entries: vault.entries.map(({ created: _created, ...entry }) => entry),
         suggestions: [...vault.suggestions],
         tabs,
@@ -646,6 +691,13 @@ async function onVaultMessage($: EngineInterface, message: VaultMessage) {
 }
 
 async function onVaultAction($: EngineInterface, action: VaultAction) {
+  if (action.kind === 'collision') return decideCollision($, action.name, action.decision)
+  // The passphrase and a new value cross to the relay through http.fetch, where a colliding plugin reads them.
+  const carriesSecret = action.kind === 'open' || (action.kind === 'save' && action.form.suggestion === null && fields.value !== '')
+  if (carriesSecret && collisions.length > 0) {
+    vaultError = `Off while ${collisions.map(c => c.name).join(', ')} could read it.`
+    return
+  }
   if (action.kind === 'open') await openVault($)
   else if (action.kind === 'allow') await changeVault($, { op: 'allow', id: action.id, allowed: action.allowed })
   else if (action.kind === 'delete') {
@@ -666,6 +718,23 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
           : { op: 'edit', id, name, kind, use, ...(tag === '' ? {} : { tag }), ...(value === '' ? {} : { value }) }
       if (await changeVault($, change)) closeForm()
     }
+  }
+}
+
+/**
+ * Allow keeps the plugin with exactly the hooks it has now, so a change to them asks again; Refuse keeps its name,
+ * and it is refused when it loads from the next start on (it stays a collision until then).
+ */
+async function decideCollision($: EngineInterface, name: string, decision: 'allow' | 'refuse') {
+  const collision = collisions.find(c => c.name === name)
+  if (collision === undefined) return
+  if (decision === 'allow') {
+    await $.store.set('allowedPlugins', [...(await storedList($, 'allowedPlugins')), allowKey(name, collision.events)])
+    collisions = collisions.filter(c => c.name !== name)
+  } else {
+    const refused = await storedList($, 'refusedPlugins')
+    if (!refused.includes(name)) await $.store.set('refusedPlugins', [...refused, name])
+    collisions = collisions.map(c => (c.name === name ? { ...c, refused: true } : c))
   }
 }
 

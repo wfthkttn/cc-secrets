@@ -23,11 +23,11 @@ import type { RequestEntry } from '../hooks/requests-props'
 const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, offer: null, chosen: null })
 const ENTRIES = [entry('a', '[sudo] password for alex'), entry('b', 'test token')]
 const START = initialState(0, 'i1')
-const FRAME: Frame = { columns: 60, rows: 100, message: null }
+const FRAME: Frame = { columns: 60, rows: 100, message: null, typingOff: null }
 /** Five 7-row cards with gaps between: 39 rows. */
 const MANY = ['a', 'b', 'c', 'd', 'e'].map(id => entry(id, 'token ' + id))
 /** Room for two cards and the gap between them under the two markers. */
-const SHORT: Frame = { columns: 60, rows: 17, message: null }
+const SHORT: Frame = { columns: 60, rows: 17, message: null, typingOff: null }
 
 function type(state: ListState, ...keys: string[]) {
   for (const key of keys) state = onKey(state, ENTRIES, FRAME, { key }).state
@@ -317,7 +317,7 @@ test('multi-line and wide text take the rows and cells counted for them', async 
 
 test('the menu opens above its field when the room under it is short', async () => {
   const entries: RequestEntry[] = [entry('a', 'p'), { ...entry('b', 'deploy token'), offer: OFFER }]
-  const frame: Frame = { columns: 60, rows: 18, message: null }
+  const frame: Frame = { columns: 60, rows: 18, message: null, typingOff: null }
   const fieldTop = layout(entries, 60, null).findIndex(r => r.id === 'b' && r.kind === 'fieldTop')
   const opened = onClick(START, entries, frame, fieldTop + 1, 6).state
   expect(menuOf(entries, frame, opened)!.top).toBe(fieldTop - 9)
@@ -327,4 +327,14 @@ test('a field with no vault entries to offer opens no menu', async () => {
   const field = layout(ENTRIES, 60, null).findIndex(r => r.kind === 'field')
   expect(onClick(START, ENTRIES, FRAME, field, 6).state.isMenuOpen).toBe(false)
   expect(onKey(START, ENTRIES, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(false)
+})
+
+test('with typing off, the field takes no keys and no Enter; ✕ and a vault entry still answer', async () => {
+  const off: Frame = { ...FRAME, typingOff: 'off: tracer could read it · Vault tab' }
+  expect(onKey(START, ENTRIES, off, { key: 'x' }).post).toBe(undefined)
+  expect(onKey(START, ENTRIES, off, { key: 'return' }).post).toBe(undefined)
+  const field = layout(ENTRIES, 60, null).findIndex(r => r.kind === 'field')
+  expect(onClick(START, ENTRIES, off, field, geometry(60).buttonStart + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'cancel' }])
+  const tagged: RequestEntry[] = [{ ...entry('a', 'DB'), offer: OFFER, chosen: 'e0' }]
+  expect(onKey(START, tagged, off, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e0' }])
 })

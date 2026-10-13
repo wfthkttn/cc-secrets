@@ -305,6 +305,37 @@ pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bo
     }
 }
 
+/// `POST /passphrase {passphrase}`: the open vault sealed under a new passphrase, its entries and this session's grants
+/// kept; 204 once saved, 409 when it isn't open, 400 for an empty passphrase, 500 with the reason when it can't be
+/// saved. Other sessions find a vault made anew and close theirs.
+pub async fn rekey(stream: &mut UnixStream, ctx: &Shared, body: &[u8]) {
+    let Ok(Passphrase { passphrase }) = serde_json::from_slice::<Passphrase>(body) else { return respond(stream, "400 Bad Request", b"").await };
+    let passphrase = Zeroizing::new(passphrase);
+    if passphrase.is_empty() {
+        return respond(stream, "400 Bad Request", b"the passphrase is empty").await;
+    }
+    let shared = Arc::clone(ctx);
+    let result = tokio::task::spawn_blocking(move || -> Result<(), (&'static str, String)> {
+        let path = &shared.vault_path;
+        let _held = exclusive(path).map_err(|reason| ("500 Internal Server Error", reason))?;
+        let mut state = lock(&shared);
+        fresh(&shared, &mut state);
+        let shown = state.vault.shown();
+        let Locker::Open(open) = &mut state.vault else { return Err(("409 Conflict", format!("the vault is {shown}"))) };
+        let failed = |error: secrets::vault::Error| ("500 Internal Server Error", format!("{}: {error}", path.display()));
+        open.vault.rekey(passphrase.as_bytes(), COSTS).map_err(failed)?;
+        open.seen = save(&shared, &open.vault).map_err(|reason| ("500 Internal Server Error", reason))?;
+        changed(&mut state);
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => respond(stream, "204 No Content", b"").await,
+        Ok(Err((status, reason))) => respond(stream, status, reason.as_bytes()).await,
+        Err(error) => respond(stream, "500 Internal Server Error", format!("changing the passphrase stopped: {error}").as_bytes()).await,
+    }
+}
+
 /// `GET /vault`: what the Vault tab shows; never a value.
 pub fn show(state: &State, upstream: bool) -> serde_json::Value {
     let (entries, suggestions) = match &state.vault {

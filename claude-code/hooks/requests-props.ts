@@ -14,6 +14,8 @@ export type RequestEntry = {
   since: string
   /** The length of the value the hooks hold for it so far. */
   length: number
+  /** That value itself while the person asked to see it; null otherwise. */
+  text: string | null
   /** The open vault's entries to pick from; null when the vault is closed or the asker may not have them. */
   offer: Offered[] | null
   /** The entry the field holds, as chosen in its menu or else named by the request's tag; null while it takes typing. */
@@ -22,12 +24,12 @@ export type RequestEntry = {
 
 /**
  * One change, numbered per list instance and carried in every post until the hooks confirm it, so a post replaced
- * before delivery loses none: a request's value, its answer (`session` and `once` with an entry), its menu choice
- * (`choose`, null for typing), and the list's own clicks (`dismiss` the message, `tab`).
+ * before delivery loses none: a request's value (`peek` shows or hides it), its answer (`session` and `once` with an
+ * entry), its menu choice (`choose`, null for typing), and the list's own clicks (`dismiss` the message, `tab`).
  */
 export type Edit =
   | { seq: number; id: string; kind: 'append'; text: string }
-  | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' }
+  | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' | 'peek' }
   | { seq: number; id: string; kind: 'session' | 'once'; entry: string | null }
   | { seq: number; id: string; kind: 'choose'; entry: string | null }
   | { seq: number; kind: 'dismiss' }

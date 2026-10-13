@@ -600,6 +600,27 @@ fn a_value_typed_while_the_vault_is_open_is_only_suggested_and_kept_when_saved()
 }
 
 #[test]
+fn a_new_passphrase_keeps_the_entries_and_closes_the_vault_in_other_sessions() {
+    let data = data_dir("rekey");
+    let mut first = Relay::start_in("rekey-a", &data);
+    let second = Relay::start_in("rekey-b", &data);
+    first.create_vault("old phrase");
+    let id = first.add("Login", "sudo", "password", "session", "sudo-pw-34");
+    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "old phrase" })), "204");
+    assert_eq!(post(&first.socket, "/vault", &serde_json::json!({ "op": "allow", "id": id, "allowed": true })), "200");
+    assert_eq!(post_reply(&first.socket, "/passphrase", &serde_json::json!({ "passphrase": "" })).0, "400");
+    assert_eq!(post(&first.socket, "/passphrase", &serde_json::json!({ "passphrase": "new phrase" })), "204");
+    let shown = first.get("/vault").1;
+    assert_eq!((shown["state"].as_str(), shown["entries"][0]["allowed"].as_bool()), (Some("open"), Some(true)), "{shown}");
+    assert_eq!(second.get("/vault").1["state"], "locked", "the other session's key no longer fits");
+    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "old phrase" })), "403");
+    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "new phrase" })), "204");
+    assert_eq!(second.get("/vault").1["entries"][0]["tag"], "sudo");
+    drop((first, second));
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
 fn typed_entries_another_relay_saves_are_dropped() {
     let data = data_dir("typedsave");
     let mut relay = Relay::start_in("typedsave", &data);

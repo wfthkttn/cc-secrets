@@ -21,7 +21,8 @@ export type SecretField = 'value' | 'passphrase' | 'again'
  */
 export type ValueEdit =
   | { seq: number; field: SecretField; kind: 'append'; text: string }
-  | { seq: number; field: SecretField; kind: 'back' | 'clear' }
+  /** `peek` shows the field's text, or hides it again. */
+  | { seq: number; field: SecretField; kind: 'back' | 'clear' | 'peek' }
   | { seq: number; kind: 'action'; action: VaultAction }
   | { seq: number; kind: 'tab'; tab: Tab }
 
@@ -39,6 +40,8 @@ export type VaultAction =
   | { kind: 'allow'; id: string; allowed: boolean }
   /** Unlocks the vault, or creates it when there is none. */
   | { kind: 'open' }
+  /** Seals the open vault under the passphrase typed twice. */
+  | { kind: 'rekey' }
 
 export type VaultProps = {
   state: 'absent' | 'locked' | 'open'
@@ -53,7 +56,9 @@ export type VaultProps = {
   applied: Record<string, number>
   /** The length of each held field. */
   lengths: Record<SecretField, number>
-  /** A change closes the form: the hooks saved or deleted what it showed. */
+  /** The text of each held field the person asked to see; the rest the view knows only by length. */
+  peeked: Partial<Record<SecretField, string>>
+  /** A change closes the form: the hooks saved or deleted what it showed, or changed the passphrase. */
   formEpoch: number
   /** Why the last save, delete or unlock failed. */
   error: string | null

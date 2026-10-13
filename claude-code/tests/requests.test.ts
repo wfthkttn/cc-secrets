@@ -3,6 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import {
   choiceOf,
   confirm,
+  fieldRoom,
   type Frame,
   geometry,
   grantButtons,
@@ -15,12 +16,13 @@ import {
   MENU_ROWS,
   menuOf,
   shownLength,
+  shownText,
   TYPE_OPTION,
   view,
 } from '../hooks/requests'
 import type { RequestEntry } from '../hooks/requests-props'
 
-const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, offer: null, chosen: null })
+const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, text: null, offer: null, chosen: null })
 const ENTRIES = [entry('a', '[sudo] password for alex'), entry('b', 'test token')]
 const START = initialState(0, 'i1')
 const FRAME: Frame = { columns: 60, rows: 100, message: null, typingOff: null }
@@ -69,6 +71,17 @@ test('backspace, ctrl+u and Enter are edits too, in order', async () => {
   const { post } = onKey(state, ENTRIES, FRAME, { key: 'return' })
   expect(post?.edits.map(e => e.kind)).toEqual(['append', 'back', 'clear', 'submit'])
   expect(shownLength(entry('a', 'p', 5), state.pending)).toBe(0)
+})
+
+test('Ctrl+R or a click on the mark asks to see the typed value; a card holding a vault entry has none', async () => {
+  expect(onKey(START, ENTRIES, FRAME, { key: 'r', ctrl: true }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'peek' }])
+  const fieldRow = view(ENTRIES, FRAME, START).findIndex(r => r.id === 'a' && r.kind === 'field')
+  const mark = 4 + fieldRoom(FRAME.columns, false)
+  expect(onClick(START, ENTRIES, FRAME, fieldRow, mark).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'peek' }])
+  expect(onClick(START, ENTRIES, FRAME, fieldRow, mark - 1).post?.edits).toEqual([])
+  const offered = [{ ...entry('a', 'db'), offer: [{ id: 'e1', label: 'Prod DB · db' }], chosen: 'e1' }]
+  expect(onClick(START, offered, FRAME, fieldRow, 4 + fieldRoom(FRAME.columns, true)).state.isMenuOpen).toBe(true)
+  expect(shownText('abc', entry('a', 'p'), [{ seq: 1, id: 'a', kind: 'append', text: 'd' }, { seq: 2, id: 'b', kind: 'clear' }])).toBe('abcd')
 })
 
 test('down switches requests and tells the hooks; typing then goes to the new one', async () => {

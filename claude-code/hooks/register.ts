@@ -70,7 +70,7 @@ type Pickable = Offered & { tag: string }
  * A waiting request. What its card offers is worked out each time the list is drawn: `pick` says whether its asker
  * may have vault entries (`vault`: the open vault's, as they are then) and `tag` which one it named.
  */
-type Request = Omit<RequestEntry, 'length' | 'offer' | 'chosen'> & { pick: 'vault' | Pickable[] | null; tag: string | null }
+type Request = Omit<RequestEntry, 'length' | 'text' | 'offer' | 'chosen'> & { pick: 'vault' | Pickable[] | null; tag: string | null }
 
 /** Replaced, never changed in place: render props freeze what they're handed. */
 let requests: readonly Request[] = []
@@ -95,6 +95,8 @@ let vault: { state: VaultState; entries: readonly VaultEntry[]; suggestions: rea
 let drawerTab: Tab = 'requests'
 /** The Vault tab's held fields, typed or pasted: an entry's value, the passphrase and its repeat; the view only learns their lengths. */
 let fields: Record<SecretField, string> = { value: '', passphrase: '', again: '' }
+/** The held fields the person asked to see in plain text; only these reach the view as text. */
+const vaultPeek = new Set<SecretField>()
 /** The last field edit applied per vault view instance; replaced, never changed in place. */
 let vaultApplied: Record<string, number> = {}
 /** Bumped when a save or delete went through, which closes the form. */
@@ -121,6 +123,21 @@ let configTextFocused = false
 let focusEpoch = 0
 /** The value typed or pasted for each request; the lists only learn its length. */
 const held = new Map<string, string>()
+/** The requests whose typed value the person asked to see in plain text. */
+const requestPeek = new Set<string>()
+
+function togglePeek<T>(peeking: Set<T>, key: T) {
+  if (peeking.has(key)) peeking.delete(key)
+  else peeking.add(key)
+}
+
+/** Empties held fields; one shown in plain text is hidden again. */
+function emptyFields(...names: SecretField[]) {
+  for (const name of names) {
+    fields = { ...fields, [name]: '' }
+    vaultPeek.delete(name)
+  }
+}
 /** The last edit applied per list instance; replaced, never changed in place. */
 let applied: Record<string, number> = {}
 /** Set by any message from the list (a click gives it the keyboard); cleared by a key the prompt takes. */
@@ -347,6 +364,10 @@ export function register(on: On) {
         choices.set(edit.id, edit.entry)
         continue
       }
+      if (edit.kind === 'peek') {
+        togglePeek(requestPeek, edit.id)
+        continue
+      }
       const request = requests.find(r => r.id === edit.id)
       if (request === undefined) continue
       if (request.kind === 'sign') {
@@ -358,7 +379,10 @@ export function register(on: On) {
       const value = held.get(edit.id) ?? ''
       if (edit.kind === 'append') held.set(edit.id, value + edit.text)
       else if (edit.kind === 'back') held.set(edit.id, [...value].slice(0, -1).join(''))
-      else if (edit.kind === 'clear') held.set(edit.id, '')
+      else if (edit.kind === 'clear') {
+        held.set(edit.id, '')
+        requestPeek.delete(edit.id)
+      }
       else if (edit.kind === 'submit') {
         const off = typingOff()
         if (off !== null) say($, `Not sent: typing is ${off}.`, true)
@@ -473,7 +497,14 @@ export function register(on: On) {
       const entries: RequestEntry[] = shown.map(request => {
         const { pick: _pick, tag: _tag, ...r } = request
         const offer = offerFor(request)
-        return { ...r, length: [...(held.get(r.id) ?? '')].length, offer: offer?.map(({ id, label }) => ({ id, label })) ?? null, chosen: chosenFor(request) }
+        const value = held.get(r.id) ?? ''
+        return {
+          ...r,
+          length: [...value].length,
+          text: requestPeek.has(r.id) ? value : null,
+          offer: offer?.map(({ id, label }) => ({ id, label })) ?? null,
+          chosen: chosenFor(request),
+        }
       })
       const message = notice === null ? null : notice.text
       const tabRows = tabs === null ? 0 : TAB_ROWS
@@ -493,6 +524,7 @@ export function register(on: On) {
         rows: height,
         applied: vaultApplied,
         lengths: { value: [...fields.value].length, passphrase: [...fields.passphrase].length, again: [...fields.again].length },
+        peeked: Object.fromEntries([...vaultPeek].map(field => [field, fields[field]])),
         formEpoch,
         error: vaultError,
       }
@@ -727,11 +759,13 @@ async function onVaultMessage($: EngineInterface, message: VaultMessage) {
       vaultFormOpen = false
       await turnTo($, edit.tab)
     } else if (edit.kind === 'action') await onVaultAction($, edit.action)
-    else {
+    else if (edit.kind === 'peek') togglePeek(vaultPeek, edit.field)
+    else if (edit.kind === 'clear') {
+      emptyFields(edit.field)
+      vaultError = null
+    } else {
       const text = fields[edit.field]
-      const next = edit.kind === 'append' ? text + edit.text : edit.kind === 'back' ? [...text].slice(0, -1).join('') : ''
-      fields = { ...fields, [edit.field]: next }
-      if (edit.kind === 'clear') vaultError = null
+      fields = { ...fields, [edit.field]: edit.kind === 'append' ? text + edit.text : [...text].slice(0, -1).join('') }
     }
   }
 }
@@ -744,12 +778,14 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
     return decided
   }
   // The passphrase and a new value cross to the relay through http.fetch, where a colliding plugin reads them.
-  const carriesSecret = action.kind === 'open' || (action.kind === 'save' && action.form.suggestion === null && fields.value !== '')
+  const carriesSecret =
+    action.kind === 'open' || action.kind === 'rekey' || (action.kind === 'save' && action.form.suggestion === null && fields.value !== '')
   if (carriesSecret && collisions.length > 0) {
     vaultError = `Off while ${collisions.map(c => c.name).join(', ')} could read it.`
     return
   }
   if (action.kind === 'open') await openVault($)
+  else if (action.kind === 'rekey') await rekeyVault($)
   else if (action.kind === 'allow') await changeVault($, { op: 'allow', id: action.id, allowed: action.allowed })
   else if (action.kind === 'delete') {
     if (await changeVault($, { op: 'delete', id: action.id })) closeForm()
@@ -798,13 +834,35 @@ async function openVault($: EngineInterface) {
   }
   if (create && fields.passphrase !== fields.again) {
     vaultError = 'The two differ.'
-    fields = { ...fields, again: '' }
+    emptyFields('again')
     return
   }
   const reply = await callRelay($, 'POST', create ? '/create' : '/unlock', { passphrase: fields.passphrase })
-  fields = { ...fields, passphrase: '', again: '' }
+  emptyFields('passphrase', 'again')
   if (reply === null) return
   vaultError = reply.status === 204 ? null : reply.status === 403 ? 'Wrong passphrase.' : reply.text || `The relay answered ${reply.status}.`
+}
+
+/** Seals the open vault under the new passphrase typed twice; the fields empty either way, the form closes once done. */
+async function rekeyVault($: EngineInterface) {
+  if (fields.passphrase === '') {
+    vaultError = 'Type the new passphrase.'
+    return
+  }
+  if (fields.passphrase !== fields.again) {
+    vaultError = 'The two differ.'
+    emptyFields('again')
+    return
+  }
+  const reply = await callRelay($, 'POST', '/passphrase', { passphrase: fields.passphrase })
+  emptyFields('passphrase', 'again')
+  if (reply === null) return
+  if (reply.status !== 204) {
+    vaultError = reply.text || `The relay answered ${reply.status}.`
+    return
+  }
+  vaultError = null
+  formEpoch += 1
 }
 
 /** True once the relay saved it; otherwise its reason shows in the form. */
@@ -886,7 +944,7 @@ async function applyAutoMode($: EngineInterface) {
 }
 
 function closeForm() {
-  fields = { ...fields, value: '' }
+  emptyFields('value')
   formEpoch += 1
   vaultError = null
   vaultFocused = null
@@ -909,6 +967,7 @@ async function decideRequest($: EngineInterface, id: string, decision: Decision)
 function dropRequest(id: string) {
   requests = requests.filter(r => r.id !== id)
   held.delete(id)
+  requestPeek.delete(id)
   choices.delete(id)
   if (listSelected === id) listSelected = null
   livePopouts().remove(id)

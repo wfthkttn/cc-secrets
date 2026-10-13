@@ -68,6 +68,11 @@ const GRANT_BUTTONS = [
   { kind: 'cancel', label: CANCEL_LABEL },
 ] as const
 const FIELD_BACKGROUND = '#1f2a3a'
+/** The show/hide mark after a typed value: shown, hidden. */
+const PEEK_MARKS = [' ◉', ' ○'] as const
+const PEEK_COLUMNS = 2
+/** Where a field's text starts: the card's edge, then the field's own. */
+const FIELD_TEXT_START = CARD_EDGE + 2
 /** Names a `Client` gets for special keys; any other `key` is typed text, a burst arriving whole. */
 const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
 
@@ -129,6 +134,27 @@ export function shownLength(entry: RequestEntry, pending: Edit[]): number {
     else if (edit.kind === 'clear') length = 0
   }
   return length
+}
+
+/** A peeked value as shown: what the hooks hold, with this instance's unconfirmed edits on top. */
+export function shownText(text: string, entry: RequestEntry, pending: Edit[]): string {
+  for (const edit of pending) {
+    if (!('id' in edit) || edit.id !== entry.id) continue
+    if (edit.kind === 'append') text += edit.text
+    else if (edit.kind === 'back') text = [...text].slice(0, -1).join('')
+    else if (edit.kind === 'clear') text = ''
+  }
+  return text
+}
+
+/** The columns of a card's field text: short of its menu mark and its show/hide mark. */
+export function fieldRoom(columns: number, hasMenu: boolean): number {
+  return geometry(columns).fieldColumns - 4 - (hasMenu ? 2 : 0) - PEEK_COLUMNS
+}
+
+/** Whether a card's field takes typing now: no vault entry in it, typing not off. */
+function takesTyping(entry: RequestEntry, pending: Edit[], frame: Frame): boolean {
+  return entry.kind === 'secret' && choiceOf(entry, pending) === null && frame.typingOff === null
 }
 
 function wrapWords(text: string, width: number, maxRows: number): string[] {
@@ -339,6 +365,7 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   if (isEnter) return withEdit(state, selected, { id: selected, kind: 'submit' })
   if (k.key === 'backspace' || k.key === 'delete') return withEdit(state, selected, { id: selected, kind: 'back' })
   if (k.ctrl && k.key === 'u') return withEdit(state, selected, { id: selected, kind: 'clear' })
+  if (k.ctrl && k.key === 'r') return withEdit(state, selected, { id: selected, kind: 'peek' })
   const text = typedText(k)
   return text === null ? { state } : withEdit(state, selected, { id: selected, kind: 'append', text })
 }
@@ -377,6 +404,10 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   const entry = entries.find(e => e.id === row.id)!
   const isField = row.kind === 'fieldTop' || row.kind === 'field' || row.kind === 'fieldBottom'
   if (isField && onButton) return withEdit(state, current, { id: row.id, kind: 'cancel' })
+  const peekStart = FIELD_TEXT_START + fieldRoom(frame.columns, offerOf(entry).length > 0)
+  if (row.kind === 'field' && x >= peekStart && x < peekStart + PEEK_COLUMNS && takesTyping(entry, state.pending, frame)) {
+    return withEdit(state, row.id, { id: row.id, kind: 'peek' })
+  }
   // A click on the field, whatever it holds, opens its menu.
   if (isField && offerOf(entry).length > 0) return openMenu(state, entries, frame, entry)
   if (row.kind === 'grantTop' || row.kind === 'grant' || row.kind === 'grantBottom') {
@@ -473,25 +504,31 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
       case 'field': {
         const entry = entriesById.get(row.id)!
         const hasMenu = offerOf(entry).length > 0
-        const room = fieldColumns - 4 - (hasMenu ? 2 : 0)
+        const room = fieldRoom(columns, hasMenu)
         const chosen = choiceOf(entry, state.pending)
         const count = shownLength(entry, state.pending)
         const isOff = chosen === null && props.typingOff !== null
         const typing = active(row.id) && chosen === null && !isOff
+        const value = entry.text === null ? '•'.repeat(count) : displayed(shownText(entry.text, entry, state.pending))
+        // the end stays in view, where typing goes on; the cursor takes a column
+        const textRoom = room - (typing ? 1 : 0)
+        const fitted = cells(value) <= textRoom ? value : '…' + [...value].slice(-(textRoom - 1)).join('')
         const shown =
           chosen !== null
             ? clip(displayed(chosen.label), room)
             : isOff
               ? clip(displayed(props.typingOff!), room)
               : typing
-                ? (count + 1 > room ? '…' + '•'.repeat(room - 2) : '•'.repeat(count)) + '▏'
+                ? fitted + '▏'
                 : count > 0
-                  ? '•'.repeat(Math.min(count, room))
+                  ? fitted
                   : 'password'
         const isDim = chosen === null && !typing && (count === 0 || isOff)
+        const mark = takesTyping(entry, state.pending, frame) ? PEEK_MARKS[entry.text === null ? 1 : 0] : ' '.repeat(PEEK_COLUMNS)
         return line(row.id, [
           Text({ ...look(row.id), children: ['│ '] }),
-          Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: isDim, children: [pad(shown, room) + (hasMenu ? ' ▾' : '')] }),
+          Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: isDim, children: [pad(shown, room)] }),
+          Text({ backgroundColor: FIELD_BACKGROUND, dimColor: entry.text === null, children: [mark + (hasMenu ? ' ▾' : '')] }),
           Text({ ...look(row.id), children: [' │ '] }),
           Text({ color: 'error', children: [BUTTON_ROW_TEXT[1]] }),
         ])

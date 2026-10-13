@@ -18,6 +18,8 @@ export type ViewState = {
   door: Door
   /** The vault is closed: keys go to its passphrase. */
   isClosed: boolean
+  /** The open vault's new passphrase is being typed: keys go to it as to a closed vault's. */
+  rekeying: boolean
   /** The selected list row (`rowKey`): it stays on its entry when another session's change moves the rows; null once it went. */
   selected: string | null
   formEpoch: number
@@ -27,7 +29,7 @@ export type ViewState = {
 export type Row =
   | { kind: 'closed'; text: string }
   | { kind: 'door'; field: Door }
-  | { kind: 'add' }
+  | { kind: 'add' | 'rekey' }
   | { kind: 'entry'; entry: ViewEntry }
   | { kind: 'suggestion'; suggestion: Suggestion }
   | { kind: 'suggestHead' | 'none' }
@@ -48,6 +50,9 @@ const DOOR_LABEL_COLUMNS = 12
 const KINDS: readonly EntryKind[] = ['password', 'token', 'ssh-key']
 const USES: readonly EntryUse[] = ['session', 'each']
 const FIELD_BACKGROUND = '#1f2a3a'
+/** The show/hide mark at a held field's right end: shown, hidden. */
+const PEEK_MARKS = [' ◉', ' ○'] as const
+const PEEK_COLUMNS = 2
 const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
 
 function edge(side: 'top' | 'bottom', width: number): string {
@@ -56,12 +61,13 @@ function edge(side: 'top' | 'bottom', width: number): string {
 }
 
 export function initialState(formEpoch: number, instance: string, isClosed = false): ViewState {
-  return { instance, seq: 0, pending: [], form: null, field: 'name', door: 'passphrase', isClosed, selected: 'add', formEpoch }
+  return { instance, seq: 0, pending: [], form: null, field: 'name', door: 'passphrase', isClosed, rekeying: false, selected: 'add', formEpoch }
 }
 
 /** What a selectable list row is, whatever its position. */
 function rowKey(row: Row): string | null {
-  return row.kind === 'add' ? 'add' : row.kind === 'entry' ? 'entry:' + row.entry.id : row.kind === 'suggestion' ? 'suggestion:' + row.suggestion.id : null
+  if (row.kind === 'add' || row.kind === 'rekey') return row.kind
+  return row.kind === 'entry' ? 'entry:' + row.entry.id : row.kind === 'suggestion' ? 'suggestion:' + row.suggestion.id : null
 }
 
 function doors(state: VaultProps['state']): Door[] {
@@ -77,8 +83,16 @@ export function closedRows(props: Pick<VaultProps, 'state' | 'error'>): Row[] {
   return rows
 }
 
+/** The open vault's new passphrase, typed twice, and its buttons. */
+export function rekeyRows(error: string | null): Row[] {
+  const rows: Row[] = [{ kind: 'closed', text: 'New passphrase' }, { kind: 'door', field: 'passphrase' }, { kind: 'door', field: 'again' }]
+  rows.push({ kind: 'gap' }, { kind: 'buttonsTop' }, { kind: 'buttons' }, { kind: 'buttonsBottom' })
+  if (error !== null) rows.push({ kind: 'error', text: error })
+  return rows
+}
+
 export function listRows(props: Pick<VaultProps, 'entries' | 'suggestions'>): Row[] {
-  const rows: Row[] = [{ kind: 'add' }]
+  const rows: Row[] = [{ kind: 'add' }, { kind: 'rekey' }]
   if (props.entries.length === 0) rows.push({ kind: 'none' })
   for (const entry of props.entries) rows.push({ kind: 'entry', entry })
   if (props.suggestions.length > 0) rows.push({ kind: 'suggestHead' })
@@ -112,10 +126,10 @@ export function collisionButtons() {
 }
 
 function isSelectable(row: Row): boolean {
-  return row.kind === 'add' || row.kind === 'entry' || row.kind === 'suggestion'
+  return rowKey(row) !== null
 }
 
-type Button = { kind: 'save' | 'delete' | 'dismiss' | 'cancel' | 'open' | 'allow' | 'refuse'; label: string }
+type Button = { kind: 'save' | 'delete' | 'dismiss' | 'cancel' | 'open' | 'allow' | 'refuse' | 'change'; label: string }
 
 function laidOut(labels: readonly Button[]) {
   let start = 1
@@ -140,8 +154,15 @@ export function doorButtons(state: VaultProps['state']) {
   return laidOut([{ kind: 'open', label: state === 'absent' ? ' Create ' : ' Unlock ' }])
 }
 
+export function rekeyButtons() {
+  return laidOut([
+    { kind: 'change', label: ' Change ' },
+    { kind: 'cancel', label: ' ✕ ' },
+  ])
+}
+
 function focusedOf(state: ViewState): SecretField | null {
-  if (state.isClosed) return state.door
+  if (state.isClosed || state.rekeying) return state.door
   return state.form !== null && state.form.suggestion === null && state.field === 'value' ? 'value' : null
 }
 
@@ -177,8 +198,31 @@ export function shownLength(length: number, field: SecretField, pending: ValueEd
   return length
 }
 
+/** A peeked field's text as shown: what the hooks hold, with this instance's unconfirmed edits on top. */
+export function shownText(text: string, field: SecretField, pending: ValueEdit[]): string {
+  for (const edit of pending) {
+    if (!('field' in edit) || edit.field !== field) continue
+    if (edit.kind === 'append') text += edit.text
+    else if (edit.kind === 'back') text = [...text].slice(0, -1).join('')
+    else if (edit.kind === 'clear') text = ''
+  }
+  return text
+}
+
+function startRekey(state: ViewState): Result {
+  const cleared = withEdit({ ...state, rekeying: true, door: 'passphrase' }, { field: 'passphrase', kind: 'clear' })
+  return withEdit(cleared.state, { field: 'again', kind: 'clear' })
+}
+
+/** Leaves the new passphrase; the hooks drop what was typed. */
+function stopRekey(state: ViewState): Result {
+  const cleared = withEdit({ ...state, rekeying: false }, { field: 'passphrase', kind: 'clear' })
+  return withEdit(cleared.state, { field: 'again', kind: 'clear' })
+}
+
 /** Opens the form on a list row; the hooks drop any value left from an earlier form. */
 function open(state: ViewState, row: Row): Result {
+  if (row.kind === 'rekey') return startRekey(state)
   const form: Form | null =
     row.kind === 'add'
       ? { id: null, suggestion: null, name: '', tag: '', kind: 'password', use: 'session' }
@@ -210,18 +254,19 @@ function typedText(k: ClientKeyEvent): string | null {
 function heldEdit(field: SecretField, k: ClientKeyEvent): EditBody | null {
   if (k.key === 'backspace' || k.key === 'delete') return { field, kind: 'back' }
   if (k.ctrl && k.key === 'u') return { field, kind: 'clear' }
+  if (k.ctrl && k.key === 'r') return { field, kind: 'peek' }
   const text = typedText(k)
   return text === null ? null : { field, kind: 'append', text }
 }
 
-function onDoorKey(state: ViewState, props: Pick<VaultProps, 'state'>, k: ClientKeyEvent): Result {
-  const fields = doors(props.state)
+/** A key on the passphrase fields: `fields` are those shown, Enter does `enter`. */
+function onDoorKey(state: ViewState, fields: Door[], enter: VaultAction, k: ClientKeyEvent): Result {
   if (k.key === 'up' || k.key === 'down' || k.key === 'tab') {
     const step = k.key === 'up' || (k.key === 'tab' && k.shift) ? -1 : 1
     const at = Math.max(0, fields.indexOf(state.door))
     return moved({ ...state, door: fields[Math.max(0, Math.min(fields.length - 1, at + step))]! })
   }
-  if (k.key === 'return' || k.key === '\n') return act(state, { kind: 'open' })
+  if (k.key === 'return' || k.key === '\n') return act(state, enter)
   const edit = heldEdit(state.door, k)
   return edit === null ? { state } : withEdit(state, edit)
 }
@@ -258,7 +303,8 @@ function onFormKey(state: ViewState, form: Form, k: ClientKeyEvent): Result {
 
 export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entries' | 'suggestions' | 'collisions'>, k: ClientKeyEvent): Result {
   if (props.collisions.length > 0) return { state }
-  if (props.state !== 'open') return onDoorKey(state, props, k)
+  if (props.state !== 'open') return onDoorKey(state, doors(props.state), { kind: 'open' }, k)
+  if (state.rekeying) return onDoorKey(state, ['passphrase', 'again'], { kind: 'rekey' }, k)
   if (state.form !== null) return onFormKey(state, state.form, k)
   const rows = listRows(props).filter(isSelectable)
   const selected = rows.findIndex(r => rowKey(r) === state.selected)
@@ -278,6 +324,17 @@ function buttonAt<B extends { start: number; width: number }>(buttons: B[], x: n
   return buttons.find(b => x >= b.start && x < b.start + b.width)
 }
 
+/** Whether column `x` is on a held field's show/hide mark: every held field ends two columns short of the row. */
+function onPeekMark(x: number, columns: number): boolean {
+  return x >= columns - 2 - PEEK_COLUMNS && x < columns - 2
+}
+
+/** A click on a passphrase field: the keyboard goes there, and its mark shows or hides it. */
+function doorClick(state: ViewState, field: Door, x: number, columns: number): Result {
+  const there = { ...state, door: field }
+  return onPeekMark(x, columns) ? withEdit(there, { field, kind: 'peek' }) : moved(there)
+}
+
 /** `y` and `x` count from the view's top left, the tab rows included. */
 export function onClick(state: ViewState, props: VaultProps, y: number, x: number): Result {
   if (y < TAB_ROWS) {
@@ -295,13 +352,24 @@ export function onClick(state: ViewState, props: VaultProps, y: number, x: numbe
   const onButtons = (row: Row | undefined) => row?.kind === 'buttonsTop' || row?.kind === 'buttons' || row?.kind === 'buttonsBottom'
   if (props.state !== 'open') {
     const row = closedRows(props)[at]
-    if (row?.kind === 'door') return moved({ ...state, door: row.field })
+    if (row?.kind === 'door') return doorClick(state, row.field, x, props.columns)
     if (onButtons(row) && buttonAt(doorButtons(props.state), x) !== undefined) return act(state, { kind: 'open' })
+    return moved(state)
+  }
+  if (state.rekeying) {
+    const row = rekeyRows(props.error)[at]
+    if (row?.kind === 'door') return doorClick(state, row.field, x, props.columns)
+    const button = onButtons(row) ? buttonAt(rekeyButtons(), x) : undefined
+    if (button?.kind === 'change') return act(state, { kind: 'rekey' })
+    if (button?.kind === 'cancel') return stopRekey(state)
     return moved(state)
   }
   if (state.form !== null) {
     const form = state.form
     const row = formRows(props.error)[at]
+    if (row?.kind === 'field' && row.field === 'value' && form.suggestion === null && onPeekMark(x, props.columns)) {
+      return withEdit({ ...state, field: 'value' }, { field: 'value', kind: 'peek' })
+    }
     if (row?.kind === 'field') return moved({ ...state, field: row.field })
     if (onButtons(row)) {
       const button = buttonAt(formButtons(form), x)
@@ -348,7 +416,7 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   let state = surface.state ?? initialState(props.formEpoch, Math.random().toString(36).slice(2), isClosed)
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
-  if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, formEpoch: props.formEpoch }
+  if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, rekeying: false, formEpoch: props.formEpoch }
   if (state.isClosed !== isClosed) state = { ...state, isClosed, door: 'passphrase' }
   if (state !== surface.state) surface.setState(state)
 
@@ -356,8 +424,31 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const active = { color: 'claude' as const, bold: true }
   const held = (field: SecretField, isActive: boolean, room: number, empty: string) => {
     const length = shownLength(props.lengths[field], field, state.pending)
-    const shown = length > 0 ? '•'.repeat(Math.min(length, room - 1)) : empty
-    return Text({ backgroundColor: FIELD_BACKGROUND, bold: isActive, dimColor: length === 0 && !isActive, children: [pad(shown + (isActive ? '▏' : ''), room)] })
+    const peeked = props.peeked[field]
+    const textRoom = room - PEEK_COLUMNS
+    const text = peeked === undefined ? '•'.repeat(length) : displayed(shownText(peeked, field, state.pending))
+    // the end of a long value stays in view, where typing goes on
+    const fitted = cells(text) < textRoom ? text : '…' + [...text].slice(-(textRoom - 2)).join('')
+    const shown = length > 0 ? fitted : empty
+    return Box({
+      flexDirection: 'row',
+      children: [
+        Text({ backgroundColor: FIELD_BACKGROUND, bold: isActive, dimColor: length === 0 && !isActive, children: [pad(shown + (isActive ? '▏' : ''), textRoom)] }),
+        Text({ backgroundColor: FIELD_BACKGROUND, dimColor: peeked === undefined, children: [PEEK_MARKS[peeked === undefined ? 1 : 0]] }),
+      ],
+    })
+  }
+  const doorRow = (field: Door) => {
+    const isActive = field === state.door
+    const room = columns - DOOR_LABEL_COLUMNS - 2
+    return Box({
+      flexDirection: 'row',
+      children: [
+        Text({ ...(isActive ? active : { dimColor: true }), children: [pad(' ' + DOOR_LABELS[field], DOOR_LABEL_COLUMNS)] }),
+        held(field, isActive, room, ''),
+        Text({ children: ['  '] }),
+      ],
+    })
   }
   const buttonRow = (kind: 'buttonsTop' | 'buttons' | 'buttonsBottom', buttons: ReturnType<typeof laidOut>) => {
     const faces = buttons.map(b =>
@@ -395,22 +486,29 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
       switch (row.kind) {
         case 'closed':
           return line(' ' + row.text)
-        case 'door': {
-          const isActive = row.field === state.door
-          const room = columns - DOOR_LABEL_COLUMNS - 2
-          return Box({
-            flexDirection: 'row',
-            children: [
-              Text({ ...(isActive ? active : { dimColor: true }), children: [pad(' ' + DOOR_LABELS[row.field], DOOR_LABEL_COLUMNS)] }),
-              held(row.field, isActive, room, ''),
-              Text({ children: ['  '] }),
-            ],
-          })
-        }
+        case 'door':
+          return doorRow(row.field)
         case 'buttonsTop':
         case 'buttons':
         case 'buttonsBottom':
           return buttonRow(row.kind, doorButtons(props.state))
+        case 'error':
+          return line(' ' + displayed(row.text), { color: 'error' })
+        default:
+          return line('')
+      }
+    })
+  } else if (state.rekeying) {
+    rows = rekeyRows(props.error).map(row => {
+      switch (row.kind) {
+        case 'closed':
+          return line(' ' + row.text)
+        case 'door':
+          return doorRow(row.field)
+        case 'buttonsTop':
+        case 'buttons':
+        case 'buttonsBottom':
+          return buttonRow(row.kind, rekeyButtons())
         case 'error':
           return line(' ' + displayed(row.text), { color: 'error' })
         default:
@@ -423,6 +521,8 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
       switch (row.kind) {
         case 'add':
           return line(' + Add', look)
+        case 'rekey':
+          return line(' ⟳ Change passphrase', look)
         case 'none':
           return line(' No entries', { dimColor: true })
         case 'suggestHead':

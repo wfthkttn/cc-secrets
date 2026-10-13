@@ -175,6 +175,15 @@ impl Vault {
         Ok(Self { costs, salt, key, entries })
     }
 
+    /// Seals the vault under `passphrase` from the next save on: a new salt and key, the same entries.
+    pub fn rekey(&mut self, passphrase: &[u8], costs: Costs) -> Result<(), Error> {
+        let salt = random_bytes::<SALT_LEN>()?;
+        self.key = derive(passphrase, &salt, costs)?;
+        self.salt = salt;
+        self.costs = costs;
+        Ok(())
+    }
+
     /// Takes in the entries the file at `path` holds now, which another session may have changed. A file sealed
     /// under another salt or costs is another vault (made anew meanwhile) and is refused.
     pub fn reload(&mut self, path: &Path) -> Result<(), Error> {
@@ -271,6 +280,19 @@ mod tests {
         assert_eq!(ours.entries, theirs.entries);
         Vault::create(b"pass", CHEAP).unwrap().save(&path).unwrap();
         assert!(matches!(ours.reload(&path), Err(Error::Unreadable(_))));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_rekeyed_vault_opens_with_the_new_passphrase_only() {
+        let path = scratch("rekey");
+        let mut vault = Vault::create(b"old pass", CHEAP).unwrap();
+        vault.entries.push(entry("sudo", "root-pw-1"));
+        vault.save(&path).unwrap();
+        vault.rekey(b"new pass", CHEAP).unwrap();
+        vault.save(&path).unwrap();
+        assert!(matches!(Vault::open(&path, b"old pass"), Err(Error::Refused)));
+        assert_eq!(Vault::open(&path, b"new pass").unwrap().entries, vault.entries);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

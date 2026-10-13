@@ -256,6 +256,7 @@ async fn serve(mut stream: UnixStream, ctx: Shared) {
         ("POST", "/answer") => pass::answer(&mut stream, &ctx, body).await,
         ("POST", "/unlock") => locker::open(&mut stream, &ctx, body, false).await,
         ("POST", "/create") => locker::open(&mut stream, &ctx, body, true).await,
+        ("POST", "/passphrase") => locker::rekey(&mut stream, &ctx, body).await,
         ("POST", "/decide") => decided(&mut stream, &ctx, body).await,
         ("GET", "/vault") => {
             let shown = locker::show(&lock(&ctx), ctx.upstream.is_some());

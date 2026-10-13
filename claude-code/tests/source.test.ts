@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { askDecision, listDecision, requestSource, runsIn, signDecision, sourceOf } from '../hooks/source'
+import { askDecision, listDecision, pasteTarget, requestSource, runsIn, signDecision, sourceOf } from '../hooks/source'
 
 const WRAPPER = (command: string, quote = `'"'"'`) =>
   `/run/current-system/sw/bin/zsh -c source /home/alex/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval '${command.split("'").join(quote)}' < /dev/null && pwd -P >| /tmp/claude-cwd`
@@ -70,15 +70,15 @@ test('a requester outside the session is never matched to a call: its own argv c
   expect(requestSource({ cmdline: WRAPPER(command), pid: 7, inside: true }, [])).toBe(command)
 })
 
-test('the same command running in the main loop and a subagent is neither given nor refused unseen: the person decides', async () => {
+test('the same command running in the main loop and a subagent gets no vault: a key is refused, an ask gets a typed card', async () => {
   const command = 'git push origin main'
   const both = [
     { command, agentId: undefined },
     { command, agentId: 'a-1' },
   ]
   const sign = { cmdline: WRAPPER(command), inside: true, allowed: true, use: 'session' as const }
-  expect(signDecision(sign, both)).toBe('ask')
-  expect(signDecision(sign, [...both].reverse())).toBe('ask')
+  expect(signDecision(sign, both)).toBe('refuse')
+  expect(signDecision(sign, [...both].reverse())).toBe('refuse')
   expect(askDecision({ ...sign, entry: { allowed: true, use: 'session' } }, both)).toBe('typed card')
   expect(listDecision(sign, both)).toBe('refuse')
   expect(signDecision(sign, [both[0]!, both[0]!])).toBe('give')
@@ -105,4 +105,12 @@ test("a mask-run's command line runs the command its wrapper holds, either way o
 
 test('a secrets list that matches no running call is refused, as from a background call', async () => {
   expect(listDecision({ cmdline: WRAPPER('secrets list'), inside: true }, [])).toBe('refuse')
+})
+
+test('a paste goes into a card only while its field takes typing', async () => {
+  expect(pasteTarget({ kind: 'secret', chosen: null }, null)).toBe('card')
+  expect(pasteTarget(undefined, null)).toBe('no card')
+  expect(pasteTarget({ kind: 'secret', chosen: 'entry-1' }, null)).toBe('untyped')
+  expect(pasteTarget({ kind: 'sign', chosen: null }, null)).toBe('untyped')
+  expect(pasteTarget({ kind: 'secret', chosen: null }, 'off: tracer could read it · Vault tab')).toBe('untyped')
 })

@@ -67,17 +67,29 @@ impl Filter {
         }
     }
 
-    fn masker_with(&self, values: &[Zeroizing<String>]) -> Masker {
+    /// The matcher of the call `pid` (none: `/mask`'s), which was handed `values`: those and the ones typed for it are
+    /// masked in its output whatever their length.
+    fn masker_for(&self, pid: Option<i32>, values: &[Zeroizing<String>]) -> Masker {
         let mut masker = Masker::new(self.min_length);
-        for value in values.iter().chain(&self.vault_values).chain(self.typed.iter().map(|(_, value)| value)) {
+        for value in values {
+            masker.add_any_length(value);
+        }
+        for value in &self.vault_values {
             masker.add(value);
+        }
+        for (owner, value) in &self.typed {
+            if Some(*owner) == pid {
+                masker.add_any_length(value);
+            } else {
+                masker.add(value);
+            }
         }
         masker
     }
 
     fn rebuild(&mut self) {
-        self.vault = self.masker_with(&[]);
-        let maskers: Vec<(i32, Masker)> = self.calls.iter().map(|(pid, call)| (*pid, self.masker_with(&call.values))).collect();
+        self.vault = self.masker_for(None, &[]);
+        let maskers: Vec<(i32, Masker)> = self.calls.iter().map(|(pid, call)| (*pid, self.masker_for(Some(*pid), &call.values))).collect();
         for (pid, masker) in maskers {
             if let Some(call) = self.calls.get_mut(&pid) {
                 call.masker = masker;
@@ -100,21 +112,26 @@ impl Filter {
         self.tell_masking();
     }
 
-    /// Masks the call `pid`'s output with `value` from now on, until the call ends.
+    /// Masks the call `pid`'s output with `value` from now on, whatever its length, until the call ends.
     pub fn hand_to(&mut self, pid: i32, value: &str) {
         if let Some(call) = self.calls.get_mut(&pid) {
-            call.masker.add(value);
+            call.masker.add_any_length(value);
             call.values.push(Zeroizing::new(value.to_owned()));
         }
     }
 
-    /// Masks every running call's output with a value typed for the call `pid`, until that call ends.
+    /// Masks every running call's output with a value typed for the call `pid`, until that call ends; the call `pid`
+    /// masks it whatever its length.
     pub fn type_for(&mut self, pid: i32, value: &str) {
         if !self.calls.contains_key(&pid) {
             return;
         }
-        for call in self.calls.values_mut() {
-            call.masker.add(value);
+        for (call_pid, call) in &mut self.calls {
+            if *call_pid == pid {
+                call.masker.add_any_length(value);
+            } else {
+                call.masker.add(value);
+            }
         }
         self.vault.add(value);
         self.typed.push((pid, Zeroizing::new(value.to_owned())));
@@ -143,8 +160,12 @@ impl Filter {
     fn take(&mut self, pid: i32, held: &mut Vec<u8>, kind: u8, body: &[u8]) -> Vec<u8> {
         held.extend_from_slice(body);
         let Some(masker) = self.calls.get(&pid).map(|call| &call.masker) else { return std::mem::take(held) };
-        let cut = if kind == frame::END { held.len() } else { masker.cut(held, kind == frame::IDLE) };
-        let (out, found) = masker.mask_found(held.get(..cut).unwrap_or_default());
+        let (cut, (out, found)) = if kind == frame::END {
+            (held.len(), masker.mask_end(held))
+        } else {
+            let cut = masker.cut(held, kind == frame::IDLE);
+            (cut, masker.mask_found(held.get(..cut).unwrap_or_default()))
+        };
         held.drain(..cut);
         self.found(found);
         out
@@ -159,7 +180,7 @@ pub async fn serve(stream: &mut UnixStream, ctx: &Context) {
     let cmdline = peer::cmdline_of(i64::from(pid));
     {
         let mut state = lock(ctx);
-        let masker = state.filter.masker_with(&[]);
+        let masker = state.filter.masker_for(Some(pid), &[]);
         state.filter.calls.insert(pid, Call { values: Vec::new(), masker, cmdline });
     }
     if stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.is_ok() {

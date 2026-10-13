@@ -8,6 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 
 pub const MASK: &[u8] = b"[secret]";
+/// A stream that ends on this many bytes or more of a form's start has that tail masked.
+const PARTIAL_MIN: usize = 4;
 /// Past this many bytes without whitespace, output goes out even mid-token.
 const MAX_HOLD: usize = 65536;
 
@@ -112,6 +114,19 @@ pub fn forms(value: &str) -> BTreeSet<Vec<u8>> {
     found
 }
 
+/// `data` with each span replaced by `MASK`, and whether there was any.
+fn masked(data: &[u8], spans: &[(usize, usize)]) -> (Vec<u8>, bool) {
+    let mut out = Vec::with_capacity(data.len());
+    let mut at = 0;
+    for &(start, end) in spans {
+        out.extend_from_slice(data.get(at..start).unwrap_or_default());
+        out.extend_from_slice(MASK);
+        at = end;
+    }
+    out.extend_from_slice(data.get(at..).unwrap_or_default());
+    (out, !spans.is_empty())
+}
+
 pub struct Masker {
     min_length: usize,
     patterns: BTreeSet<Vec<u8>>,
@@ -135,6 +150,11 @@ impl Masker {
         if value.chars().count() >= self.min_length {
             self.patterns.extend(forms(value));
         }
+    }
+
+    /// Adds `value` whatever its length: one known to be in this output, as the value a call was handed is in its own.
+    pub fn add_any_length(&mut self, value: &str) {
+        self.patterns.extend(forms(value));
     }
 
     /// Each token holding a form, as merged `(start, end)` ranges.
@@ -171,16 +191,23 @@ impl Masker {
 
     /// The masked data, and whether anything in it was masked.
     pub fn mask_found(&self, data: &[u8]) -> (Vec<u8>, bool) {
-        let spans = self.spans(data);
-        let mut out = Vec::with_capacity(data.len());
-        let mut at = 0;
-        for &(start, end) in &spans {
-            out.extend_from_slice(data.get(at..start).unwrap_or_default());
-            out.extend_from_slice(MASK);
-            at = end;
+        masked(data, &self.spans(data))
+    }
+
+    /// `mask_found` for the last of a stream: a tail of `PARTIAL_MIN` bytes or more that a form starts with is masked
+    /// too, with the rest of its token, since nothing more will come to tell it apart.
+    pub fn mask_end(&self, data: &[u8]) -> (Vec<u8>, bool) {
+        let mut spans = self.spans(data);
+        let tail = self.partial(data);
+        if tail >= PARTIAL_MIN {
+            let start = data.len() - tail;
+            let token = data.get(..start).unwrap_or_default().iter().rposition(|b| is_space(*b)).map_or(0, |at| at + 1);
+            // a form holding whitespace can reach into the tail's token
+            let from = spans.iter().filter(|&&(_, end)| end > token).map(|&(start, _)| start).fold(token, usize::min);
+            spans.retain(|&(_, end)| end <= from);
+            spans.push((from, data.len()));
         }
-        out.extend_from_slice(data.get(at..).unwrap_or_default());
-        (out, !spans.is_empty())
+        masked(data, &spans)
     }
 
     /// How many trailing bytes could still grow into a form.

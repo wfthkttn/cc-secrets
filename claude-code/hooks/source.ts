@@ -43,14 +43,13 @@ export function runsIn(cmdline: string, command: string): boolean {
 }
 
 /**
- * What a signature with a vault key gets: a subagent's or a teammate's command nothing; a main-loop command a key
- * allowed for the session; anything else (a `!` command, a background task, a process outside the session, a call
- * that can't be told from a subagent's) the person's card.
+ * What a signature with a vault key gets: a subagent's or a teammate's command nothing, nor one that can't be told
+ * from a subagent's; a main-loop command a key allowed for the session; anything else (a `!` command, a background
+ * task, a process outside the session) the person's card.
  */
 export function signDecision(sign: Requester & Granted, calls: Calls): 'refuse' | 'give' | 'ask' {
   const call = callFor(sign, calls)
-  if (call === 'unknown') return 'ask'
-  if (call?.agentId !== undefined) return 'refuse'
+  if (call === 'unknown' || call?.agentId !== undefined) return 'refuse'
   return call !== undefined && sign.allowed && sign.use === 'session' ? 'give' : 'ask'
 }
 
@@ -69,6 +68,15 @@ export function askDecision(ask: Requester & { entry: Granted | null }, calls: C
 export function listDecision(list: Requester, calls: Calls): 'give' | 'refuse' {
   const call = callFor(list, calls)
   return call !== undefined && call !== 'unknown' && call.agentId === undefined ? 'give' : 'refuse'
+}
+
+/**
+ * Where a paste into the list goes: the selected card's typed value, else the prompt, when no card is selected or the
+ * card takes no typing (a sign card, a vault entry in its field, typing off).
+ */
+export function pasteTarget(card: { kind: string; chosen: string | null } | undefined, typingOff: string | null): 'card' | 'no card' | 'untyped' {
+  if (card === undefined) return 'no card'
+  return card.kind === 'sign' || card.chosen !== null || typingOff !== null ? 'untyped' : 'card'
 }
 
 /** The source shown on a request's card; a requester outside the session is marked so. */

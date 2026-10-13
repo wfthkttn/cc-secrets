@@ -357,16 +357,18 @@ fn a_key_file_that_cannot_be_read_is_named_without_the_value() {
 }
 
 #[test]
-fn a_value_under_the_minimum_stays_until_the_minimum_changes() {
+fn a_short_value_is_masked_in_its_own_call_and_in_others_only_past_the_minimum() {
     let mut relay = Relay::start("short");
-    let command = r#"x=$("$SECRETS" ask t3); printf "%s and hunter2\n" "$x""#;
-    let child = relay.mask_run(command).spawn().unwrap();
-    assert_eq!(relay.answer_next("abc"), "204");
-    assert_eq!(stdout(&child.wait_with_output().unwrap()), "abc and hunter2\n");
+    let both = |relay: &mut Relay| {
+        let asking = relay.mask_run(r#"x=$("$SECRETS" ask t3); sleep 0.5; printf "%s and hunter2\n" "$x""#).spawn().unwrap();
+        let ask = relay.next_ask();
+        let other = relay.mask_run("sleep 0.2; echo abc").spawn().unwrap();
+        assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "abc" })), "204");
+        (stdout(&asking.wait_with_output().unwrap()), stdout(&other.wait_with_output().unwrap()))
+    };
+    assert_eq!(both(&mut relay), ("[secret] and hunter2\n".to_owned(), "abc\n".to_owned()));
     assert_eq!(post(&relay.socket, "/settings", &serde_json::json!({ "maskMinLength": 1 })), "204");
-    let child = relay.mask_run(command).spawn().unwrap();
-    assert_eq!(relay.answer_next("abc"), "204");
-    assert_eq!(stdout(&child.wait_with_output().unwrap()), "[secret] and hunter2\n");
+    assert_eq!(both(&mut relay), ("[secret] and hunter2\n".to_owned(), "[secret]\n".to_owned()));
     assert_eq!(post(&relay.socket, "/settings", &serde_json::json!({ "maskMinLength": 0 })), "400");
 }
 
@@ -375,7 +377,9 @@ fn split_values_encoded_forms_and_glued_tokens_are_masked() {
     let mut relay = Relay::start("forms");
     let cases = [
         (r#"printf "hun"; sleep 0.3; printf "ter2 and hunt"; sleep 0.3; printf "er2\n""#, "[secret] and [secret]\n"),
-        (r#"printf "hunt""#, "hunt"),
+        (r#"printf "hunt""#, "[secret]"),
+        (r#"printf "the hun""#, "the hun"),
+        (r#"printf "pw=hunter""#, "[secret]"),
         (r#"printf "auth: %s\n" "$(printf "alex:%s" "$x" | base64)""#, "auth: [secret]\n"),
         (r#"printf "pw=%s;rest more\n" "$x""#, "[secret] more\n"),
     ];
@@ -449,7 +453,7 @@ fn helpers_in_a_tree_that_can_change_are_copies_removed_when_the_relay_ends() {
     let mut relay = Relay::start("pinned");
     let built = Path::new(MASK_RUN).parent().unwrap();
     assert_eq!(relay.bin, PathBuf::from(format!("{}.bin", relay.socket.display())));
-    for helper in ["secrets-mask-run", "secrets", "secrets-askpass"] {
+    for helper in ["secrets-mask-run", "secrets", "secrets-askpass", "secrets-askpass-sudo", "secrets-askpass-ssh", "secrets-askpass-git"] {
         assert_eq!(std::fs::read(relay.bin.join(helper)).unwrap(), std::fs::read(built.join(helper)).unwrap(), "{helper}");
     }
     assert_eq!(stdout(&run(relay.mask_run("echo pinned"))), "pinned\n");
@@ -502,6 +506,33 @@ fn a_cancelled_ask_exits_1_with_a_line() {
         assert_eq!((out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned()), (Some(1), line.to_owned()));
         assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "late" })), "410");
     }
+}
+
+#[test]
+fn each_askpass_asks_with_its_programs_tag() {
+    let data = data_dir("askpass");
+    let mut relay = Relay::start_in("askpass", &data);
+    relay.create_vault("pass phrase");
+    let id = relay.add("Login", "sudo", "password", "session", "sudo-pw-12");
+    for (helper, tag) in [("secrets-askpass-ssh", "ssh"), ("secrets-askpass-git", "git")] {
+        let child = Command::new(relay.bin.join(helper)).arg("Password:").env("SECRETS_RELAY", &relay.socket).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let ask = relay.next_ask();
+        assert_eq!((ask["tag"].as_str(), ask["entry"].is_null()), (Some(tag), true), "{helper}");
+        assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "cancel": true })), "204");
+        child.wait_with_output().unwrap();
+    }
+    let sudo = Command::new(relay.bin.join("secrets-askpass-sudo"))
+        .arg("[sudo] password for alex: ")
+        .env("SECRETS_RELAY", &relay.socket)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ask = relay.next_ask();
+    assert_eq!((ask["tag"].as_str(), ask["entry"]["id"].as_str()), (Some("sudo"), Some(id.as_str())));
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "entry": id })), "204");
+    assert_eq!(stdout(&sudo.wait_with_output().unwrap()), "sudo-pw-12\n");
+    drop(relay);
+    std::fs::remove_dir_all(&data).unwrap();
 }
 
 #[test]
@@ -564,6 +595,23 @@ fn a_value_typed_while_the_vault_is_open_is_only_suggested_and_kept_when_saved()
     relay.next_event();
     let (_, shown) = relay.get("/vault");
     assert_eq!((shown["entries"][0]["tag"].as_str(), shown["suggestions"].as_array().map(Vec::len)), (Some("sudo"), Some(0)));
+    drop(relay);
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn typed_entries_another_relay_saves_are_dropped() {
+    let data = data_dir("typedsave");
+    let mut relay = Relay::start_in("typedsave", &data);
+    relay.create_vault("pass phrase");
+    relay.add("Kept", "kept", "password", "session", "kept-value-1");
+    let file = data.join("secrets/vault");
+    let mut older = Vault::open(&file, b"pass phrase").unwrap();
+    older.entries.push(Entry { id: "typed-1".to_owned(), name: "typed".to_owned(), tag: "typed-1".to_owned(), kind: Kind::Typed, use_: Use::Each, value: "old-typed-value".to_owned(), created: 0 });
+    older.save(&file).unwrap();
+    let tags: Vec<String> = relay.get("/vault").1["entries"].as_array().unwrap().iter().map(|e| e["tag"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(tags, ["kept"]);
+    assert_eq!(stdout(&run(relay.mask_run("echo old-typed-value kept-value-1"))), "old-typed-value [secret]\n");
     drop(relay);
     std::fs::remove_dir_all(&data).unwrap();
 }

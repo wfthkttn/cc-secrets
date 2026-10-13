@@ -64,8 +64,9 @@ const PARENT_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 const COSTS: Costs = Costs { memory_kib: 65536, time: 3, lanes: 1 };
 /// Masking's shortest value until the hooks send theirs.
 const MASK_MIN: usize = 6;
-/// What runs from `bin`: the shell prefix, the CLI on PATH, the askpass.
-const HELPERS: [&str; 3] = ["secrets-mask-run", "secrets", "secrets-askpass"];
+/// What runs from `bin`: the shell prefix, the CLI on PATH, the askpass helpers.
+const HELPERS: [&str; 6] =
+    ["secrets-mask-run", "secrets", "secrets-askpass", "secrets-askpass-sudo", "secrets-askpass-ssh", "secrets-askpass-git"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]

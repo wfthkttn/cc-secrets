@@ -9,7 +9,7 @@ import { Popouts } from './popouts'
 import { listHeight } from './requests'
 import type { Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { fillSlot, hasSlot } from './slot'
-import { askDecision, listDecision, requestSource, runsIn, signDecision } from './source'
+import { askDecision, listDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
 import type { Collision, SecretField, Suggestion, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
@@ -29,6 +29,7 @@ const RELAY_START_MS = 5000
 const DEFAULT_MASK_MIN = 6
 const UNSEEN_PASTE = 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
 const UNTARGETED_PASTE = 'The paste went into the prompt: no request was selected. Click a request first.'
+const UNTYPED_PASTE = "The paste went into the prompt: the selected request doesn't take typing now."
 const WRITE_BACK = 'secrets: this would write [secret], a masked value, over the real one; edit around the masked span instead.'
 const ROW_COMPONENTS = [
   'UserMessage',
@@ -179,6 +180,17 @@ function typingOff(): string | null {
   return collisions.length === 0 ? null : `off: ${collisions.map(c => c.name).join(', ')} could read it · Vault tab`
 }
 
+/** The entries a card offers, worked out now: an offer of the vault's follows its state. */
+function offerFor(request: Request): Pickable[] | null {
+  return request.pick === 'vault' ? (vault.state === 'open' ? vaultOffer() : null) : request.pick
+}
+
+/** The entry a card shows in its field: the user's choice, else the one its tag names; null when it takes typing. */
+function chosenFor(request: Request): string | null {
+  if (choices.has(request.id)) return choices.get(request.id)!
+  return offerFor(request)?.find(o => o.tag === request.tag)?.id ?? null
+}
+
 /** An option from the plugin's store, its default when never set; a stored value of the wrong type is an error. */
 async function option<T extends number | boolean>($: EngineInterface, key: string, fallback: T): Promise<T> {
   const stored = await $.store.get(key)
@@ -242,12 +254,11 @@ export function register(on: On) {
     // The relay's own resolved directory, not the plugin's: a rebuild moves the plugin's path to new binaries,
     // while this session's relay serves only the mask-run beside it.
     const bin = relay.bin
-    const askpass = bin + '/secrets-askpass'
     await $.env.set('SECRETS_RELAY', socket)
-    await $.env.set('SUDO_ASKPASS', askpass)
-    await $.env.set('SSH_ASKPASS', askpass)
+    await $.env.set('SUDO_ASKPASS', bin + '/secrets-askpass-sudo')
+    await $.env.set('SSH_ASKPASS', bin + '/secrets-askpass-ssh')
     await $.env.set('SSH_ASKPASS_REQUIRE', 'force')
-    await $.env.set('GIT_ASKPASS', askpass)
+    await $.env.set('GIT_ASKPASS', bin + '/secrets-askpass-git')
     const path = (await $.env.get('PATH')) ?? ''
     // On a reload the plugin's bin leads PATH already.
     if (!path.startsWith(bin + ':')) await $.env.set('PATH', `${bin}:${path}`)
@@ -383,9 +394,10 @@ export function register(on: On) {
       return { text: e.text, cursor: e.cursor }
     }
     const target = requests.find(r => r.id === listSelected)
-    if (!listFocused || target === undefined || e.inputText === '') {
+    const goes = pasteTarget(target && { kind: target.kind, chosen: chosenFor(target) }, typingOff())
+    if (!listFocused || target === undefined || goes !== 'card' || e.inputText === '') {
       const box = await next(e)
-      if (listFocused && e.inputText !== '') say($, UNTARGETED_PASTE, false)
+      if (listFocused && e.inputText !== '') say($, goes === 'no card' ? UNTARGETED_PASTE : UNTYPED_PASTE, false)
       if (listFocused) draftAtFocus = box.text
       return box
     }
@@ -458,11 +470,10 @@ export function register(on: On) {
     if (room === null) return tree
     const { Client } = $.ui.resolve(e)
     const list = (key: string, shown: readonly Request[], columns: number, rows: number, tabs: Tabs | null) => {
-      const entries: RequestEntry[] = shown.map(({ pick, tag, ...r }) => {
-        const offer = pick === 'vault' ? (vault.state === 'open' ? vaultOffer() : null) : pick
-        const named = offer?.find(o => o.tag === tag)?.id ?? null
-        const chosen = choices.has(r.id) ? choices.get(r.id)! : named
-        return { ...r, length: [...(held.get(r.id) ?? '')].length, offer: offer?.map(({ id, label }) => ({ id, label })) ?? null, chosen }
+      const entries: RequestEntry[] = shown.map(request => {
+        const { pick: _pick, tag: _tag, ...r } = request
+        const offer = offerFor(request)
+        return { ...r, length: [...(held.get(r.id) ?? '')].length, offer: offer?.map(({ id, label }) => ({ id, label })) ?? null, chosen: chosenFor(request) }
       })
       const message = notice === null ? null : notice.text
       const tabRows = tabs === null ? 0 : TAB_ROWS

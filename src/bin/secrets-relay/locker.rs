@@ -177,6 +177,8 @@ pub fn fresh(ctx: &Context, state: &mut State) {
         Ok(()) => {
             open.seen = now;
             let Opened { vault, allowed, .. } = &mut **open;
+            // a relay from before typed entries were dropped may still save them
+            vault.entries.retain(|e| e.kind != Kind::Typed);
             allowed.retain(|id| vault.entries.iter().any(|e| e.id == *id));
         }
         Err(reason) => {

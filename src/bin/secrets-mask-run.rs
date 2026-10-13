@@ -1,9 +1,9 @@
 //! Usage: secrets-mask-run '<shell invocation>'   (as `CLAUDE_CODE_SHELL_PREFIX`)
 //!
-//! Runs the invocation with `/bin/sh -c`, or through `$SECRETS_ORIG_PREFIX` when set, copying its stdout and
-//! stderr with every value the relay at `$SECRETS_RELAY` knows masked (`secrets::mask`). Values shorter than
-//! `$SECRETS_MASK_MIN` characters are skipped. Exits with the command's status, 128 + the signal when a signal
-//! ended it. Without a relay the command still runs; one line on stderr says its output is unmasked.
+//! Runs the invocation with `/bin/sh -c`, or through `$SECRETS_ORIG_PREFIX` when set, passing its stdout and
+//! stderr through the relay at `$SECRETS_RELAY`, which masks them (`secrets::filter`); this process holds no values.
+//! Exits with the command's status, 128 + the signal when a signal ended it. Without a relay, or refused by it, the
+//! command still runs; one line on stderr says its output is unmasked.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -12,82 +12,72 @@ use std::process::{Child, Command, ExitCode, Stdio};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::process::{Pid, Signal, kill_process};
-use secrets::mask::Masker;
+use secrets::filter::{self as frame, DATA, END, IDLE, STDERR, STDOUT};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-const IDLE: Timespec = Timespec { tv_sec: 0, tv_nsec: 50_000_000 };
+const IDLE_AFTER: Timespec = Timespec { tv_sec: 0, tv_nsec: 50_000_000 };
 const CHUNK: usize = 65536;
+const HEAD_MAX: usize = 4096;
 
 fn note(message: &str) {
     let _ = writeln!(std::io::stderr(), "secrets-mask-run: {message}");
 }
 
-/// The relay's `GET /watch` stream: an HTTP head, then one JSON string per line.
-struct Watch {
+/// The relay's `/filter` stream for this call.
+struct Filter {
     stream: UnixStream,
-    raw: Vec<u8>,
-    in_body: bool,
 }
 
-impl Watch {
-    fn connect(path: &std::ffi::OsStr) -> Option<Self> {
-        let mut stream = UnixStream::connect(path).ok()?;
-        stream.write_all(b"GET /watch HTTP/1.0\r\n\r\n").ok()?;
-        stream.set_nonblocking(true).ok()?;
-        Some(Self { stream, raw: Vec::new(), in_body: false })
+impl Filter {
+    /// Opens the stream; once this returns, the relay knows the call, so a value handed to it is masked.
+    fn connect(path: &std::ffi::OsStr) -> Result<Self, String> {
+        let mut stream = UnixStream::connect(path).map_err(|e| format!("no secrets relay ({e})"))?;
+        stream.write_all(b"POST /filter HTTP/1.0\r\nContent-Length: 0\r\n\r\n").map_err(|e| format!("the secrets relay can't be reached ({e})"))?;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if head.len() > HEAD_MAX || stream.read_exact(&mut byte).is_err() {
+                return Err("the secrets relay sent no answer".to_owned());
+            }
+            head.extend_from_slice(&byte);
+        }
+        let status = head.split(|b| *b == b' ').nth(1).unwrap_or_default();
+        if status != b"200" {
+            return Err(format!("the secrets relay refused this process ({})", String::from_utf8_lossy(status)));
+        }
+        Ok(Self { stream })
     }
 
-    /// Takes in what arrived; false once the stream is over or the relay refused this process.
-    fn drain(&mut self, masker: &mut Masker, buf: &mut [u8]) -> bool {
-        let is_open = loop {
-            match self.stream.read(buf) {
-                Ok(0) => break false,
-                Ok(n) => self.raw.extend_from_slice(buf.get(..n).unwrap_or_default()),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break true,
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(_) => break false,
-            }
-        };
-        self.take_in(masker) && is_open
-    }
-
-    fn take_in(&mut self, masker: &mut Masker) -> bool {
-        if !self.in_body {
-            let Some(end) = memchr::memmem::find(&self.raw, b"\r\n\r\n") else { return true };
-            let status = self.raw.split(|b| *b == b' ').nth(1).unwrap_or_default().to_vec();
-            if status != b"200" {
-                let status = String::from_utf8_lossy(&status);
-                note(&format!("the secrets relay refused this process ({status}); this output is not masked"));
-                return false;
-            }
-            self.raw.drain(..end + 4);
-            self.in_body = true;
-        }
-        while let Some(newline) = memchr::memchr(b'\n', &self.raw) {
-            let line: Vec<u8> = self.raw.drain(..=newline).collect();
-            if let Ok(value) = serde_json::from_slice::<String>(&line) {
-                masker.add(&value);
-            }
-        }
-        true
+    /// Sends one piece; what to write now, and whether the relay holds a tail of that stream back.
+    fn send(&mut self, kind: u8, which: u8, body: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
+        self.stream.write_all(&frame::request(kind, which, body))?;
+        let mut head = [0u8; 5];
+        self.stream.read_exact(&mut head)?;
+        let [holding, a, b, c, d] = head;
+        let length = usize::try_from(u32::from_be_bytes([a, b, c, d])).map_err(|_| ErrorKind::InvalidData)?;
+        let mut out = vec![0u8; length];
+        self.stream.read_exact(&mut out)?;
+        Ok((out, holding != 0))
     }
 }
 
-/// One of the command's output streams, with what it holds back.
+/// One of the command's output streams.
 struct Output {
+    which: u8,
     pipe: Option<Box<dyn Read>>,
     fd: Option<std::os::fd::OwnedFd>,
-    held: Vec<u8>,
-    /// What an idle flush kept back: only more output can change it.
+    /// The relay holds a tail back that only more output or an idle pass lets out.
+    holding: bool,
+    /// The idle pass went since the last output.
     settled: bool,
     sink: Box<dyn Write>,
 }
 
 impl Output {
-    fn new<P: Read + Into<std::os::fd::OwnedFd> + std::os::fd::AsFd + 'static>(pipe: Option<P>, sink: Box<dyn Write>) -> Self {
+    fn new<P: Read + Into<std::os::fd::OwnedFd> + std::os::fd::AsFd + 'static>(which: u8, pipe: Option<P>, sink: Box<dyn Write>) -> Self {
         let fd = pipe.as_ref().and_then(|p| p.as_fd().try_clone_to_owned().ok());
-        Self { pipe: pipe.map(|p| Box::new(p) as Box<dyn Read>), fd, held: Vec::new(), settled: false, sink }
+        Self { which, pipe: pipe.map(|p| Box::new(p) as Box<dyn Read>), fd, holding: false, settled: false, sink }
     }
 
     fn is_open(&self) -> bool {
@@ -95,33 +85,40 @@ impl Output {
     }
 
     fn waiting(&self) -> bool {
-        self.is_open() && !self.held.is_empty() && !self.settled
+        self.is_open() && self.holding && !self.settled
     }
 
     fn write(&mut self, bytes: &[u8]) {
         let _ = self.sink.write_all(bytes).and_then(|()| self.sink.flush());
     }
 
-    /// Masks and writes what can go out now; `idle` lets everything go but a tail that could become a value.
-    fn flush(&mut self, masker: &Masker, idle: bool) {
-        let data = std::mem::take(&mut self.held);
-        let cut = masker.cut(&data, idle);
-        self.write(&masker.mask(data.get(..cut).unwrap_or_default()));
-        self.held = data.get(cut..).unwrap_or_default().to_vec();
-        self.settled = idle;
+    /// Passes a piece through the relay; once the relay is gone, the rest goes out unmasked, after one line saying so.
+    fn pass(&mut self, filter: &mut Option<Filter>, kind: u8, body: &[u8]) {
+        let Some(open) = filter.as_mut() else { return self.write(body) };
+        match open.send(kind, self.which, body) {
+            Ok((out, holding)) => {
+                self.write(&out);
+                self.holding = holding;
+            }
+            Err(error) => {
+                *filter = None;
+                self.holding = false;
+                note(&format!("the secrets relay stopped ({error}); what it held back is dropped and the rest is not masked"));
+                self.write(body);
+            }
+        }
     }
 
-    fn read(&mut self, masker: &Masker, buf: &mut [u8]) {
+    fn read(&mut self, filter: &mut Option<Filter>, buf: &mut [u8]) {
         let Some(pipe) = self.pipe.as_mut() else { return };
         match pipe.read(buf) {
             Ok(n) if n > 0 => {
-                self.held.extend_from_slice(buf.get(..n).unwrap_or_default());
-                self.flush(masker, false);
+                self.settled = false;
+                self.pass(filter, DATA, buf.get(..n).unwrap_or_default());
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             _ => {
-                let rest = masker.mask(&std::mem::take(&mut self.held));
-                self.write(&rest);
+                self.pass(filter, END, &[]);
                 self.pipe = None;
                 self.fd = None;
             }
@@ -164,17 +161,14 @@ fn is_readable(fd: Option<&PollFd<'_>>) -> bool {
     fd.is_some_and(|fd| fd.revents().intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR))
 }
 
-/// Copies the command's output, masked, until both streams end.
-fn copy(outputs: &mut [Output; 2], mut watch: Option<Watch>, masker: &mut Masker) {
+/// Copies the command's output through the relay until both streams end.
+fn copy(outputs: &mut [Output; 2], mut filter: Option<Filter>) {
     let mut buf = vec![0u8; CHUNK];
     while outputs.iter().any(Output::is_open) {
         let waiting = outputs.iter().any(Output::waiting);
         let (ready, polled) = {
             let mut fds: Vec<PollFd<'_>> = outputs.iter().filter_map(|o| o.fd.as_ref()).map(|fd| PollFd::new(fd, PollFlags::IN)).collect();
-            if let Some(watch) = &watch {
-                fds.push(PollFd::new(&watch.stream, PollFlags::IN));
-            }
-            let polled = poll(&mut fds, waiting.then_some(&IDLE));
+            let polled = poll(&mut fds, waiting.then_some(&IDLE_AFTER));
             let mut at = fds.iter();
             let ready: Vec<bool> = outputs.iter().map(|o| o.fd.is_some() && is_readable(at.next())).collect();
             (ready, polled)
@@ -185,22 +179,18 @@ fn copy(outputs: &mut [Output; 2], mut watch: Option<Watch>, masker: &mut Masker
                 note(&format!("poll failed: {error}; the rest of the output is not shown"));
                 return;
             }
-            Ok(_) => {}
-        }
-        if let Some(stream) = watch.as_mut()
-            && !stream.drain(masker, &mut buf)
-        {
-            watch = None;
-        }
-        if polled == Ok(0) {
-            for output in outputs.iter_mut().filter(|o| o.waiting()) {
-                output.flush(masker, true);
+            Ok(0) => {
+                for output in outputs.iter_mut().filter(|o| o.waiting()) {
+                    output.pass(&mut filter, IDLE, &[]);
+                    output.settled = true;
+                }
+                continue;
             }
-            continue;
+            Ok(_) => {}
         }
         for (output, ready) in outputs.iter_mut().zip(ready) {
             if ready {
-                output.read(masker, &mut buf);
+                output.read(&mut filter, &mut buf);
             }
         }
     }
@@ -213,16 +203,22 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let mut command = command(invocation);
-    let Some(watch) = std::env::var_os("SECRETS_RELAY").filter(|p| !p.is_empty()).and_then(|p| Watch::connect(&p)) else {
-        note("no secrets relay; this output is not masked");
-        let error = command.exec();
-        note(&format!("can't run the command: {error}"));
-        return ExitCode::from(127);
+    let relay = std::env::var_os("SECRETS_RELAY").filter(|p| !p.is_empty());
+    let filter = match relay.as_deref().map(Filter::connect) {
+        Some(Ok(filter)) => filter,
+        Some(Err(reason)) => {
+            note(&format!("{reason}; this output is not masked"));
+            let error = command.exec();
+            note(&format!("can't run the command: {error}"));
+            return ExitCode::from(127);
+        }
+        None => {
+            note("no secrets relay; this output is not masked");
+            let error = command.exec();
+            note(&format!("can't run the command: {error}"));
+            return ExitCode::from(127);
+        }
     };
-    let min_length = std::env::var("SECRETS_MASK_MIN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| {
-        note("SECRETS_MASK_MIN is not a number; masking values of any length");
-        1
-    });
 
     let mut child = match command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
         Ok(child) => child,
@@ -233,10 +229,10 @@ fn main() -> ExitCode {
     };
     forward_signals(&child);
     let mut outputs = [
-        Output::new(child.stdout.take(), Box::new(std::io::stdout())),
-        Output::new(child.stderr.take(), Box::new(std::io::stderr())),
+        Output::new(STDOUT, child.stdout.take(), Box::new(std::io::stdout())),
+        Output::new(STDERR, child.stderr.take(), Box::new(std::io::stderr())),
     ];
-    copy(&mut outputs, Some(watch), &mut Masker::new(min_length));
+    copy(&mut outputs, Some(filter));
 
     match child.wait() {
         Ok(status) => match (status.code(), status.signal()) {

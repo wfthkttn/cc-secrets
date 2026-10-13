@@ -1,4 +1,4 @@
-// After `export default` this file is plain JSON: the Rust `secrets::mask` tests run the same cases.
+// The Rust `secrets::mask` tests read these cases; after `export default` this file is plain JSON.
 export default [
   { "values": ["hunter22"], "min": 6, "input": "pass=hunter22 ok", "output": "[secret] ok" },
   { "values": ["hunter22"], "min": 6, "input": "xhunter22y z", "output": "[secret] z" },

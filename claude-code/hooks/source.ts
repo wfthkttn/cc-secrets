@@ -13,17 +13,49 @@ export function callOf<C extends { command: string }>(cmdline: string, calls: re
   return calls.filter(c => unquoted.includes(c.command)).sort((a, b) => b.command.length - a.command.length)[0]
 }
 
+type Requester = { cmdline: string; inside: boolean }
+type Calls = readonly { command: string; agentId: string | undefined }[]
+type Granted = { allowed: boolean; use: 'session' | 'each' }
+
+/** The Bash call a requester runs in. Only one `inside` the session is matched: its command line is the one Claude Code ran. */
+function callFor(requester: Requester, calls: Calls) {
+  return !requester.inside || requester.cmdline === '' ? undefined : callOf(requester.cmdline, calls)
+}
+
 /**
- * What a vault get gets: a subagent's or a teammate's command nothing; a main-loop command an entry allowed
- * for the session; a command matching no running call (a `!` command, a background task) the person's card.
+ * What a signature with a vault key gets: a subagent's or a teammate's command nothing; a main-loop command a key
+ * allowed for the session; anything else (a `!` command, a background task, a process outside the session) the
+ * person's card.
  */
-export function vaultDecision(
-  get: { cmdline: string; allowed: boolean; use: 'session' | 'each' },
-  calls: readonly { command: string; agentId: string | undefined }[],
-): 'refuse' | 'give' | 'ask' {
-  const call = get.cmdline === '' ? undefined : callOf(get.cmdline, calls)
+export function signDecision(sign: Requester & Granted, calls: Calls): 'refuse' | 'give' | 'ask' {
+  const call = callFor(sign, calls)
   if (call?.agentId !== undefined) return 'refuse'
-  return call !== undefined && get.allowed && get.use === 'session' ? 'give' : 'ask'
+  return call !== undefined && sign.allowed && sign.use === 'session' ? 'give' : 'ask'
+}
+
+/**
+ * How a `secrets ask` is answered: a main-loop command whose tagged entry is allowed for the session gets it without
+ * a card; any other gets a card, with the vault's entries to pick unless it is a subagent's or a teammate's.
+ */
+export function askDecision(ask: Requester & { entry: Granted | null }, calls: Calls): 'give' | 'card' | 'typed card' {
+  const call = callFor(ask, calls)
+  if (call?.agentId !== undefined) return 'typed card'
+  return call !== undefined && ask.entry !== null && ask.entry.allowed && ask.entry.use === 'session' ? 'give' : 'card'
+}
+
+/** The vault's tags and names: refused to a subagent's command and to a process outside the session. */
+export function listDecision(
+  list: { cmdline: string; inside: boolean },
+  calls: readonly { command: string; agentId: string | undefined }[],
+): 'give' | 'refuse' {
+  if (!list.inside) return 'refuse'
+  return callOf(list.cmdline, calls)?.agentId === undefined ? 'give' : 'refuse'
+}
+
+/** The source shown on a request's card; a requester outside the session is marked so. */
+export function requestSource(request: { cmdline: string; pid: number; inside: boolean }, commands: string[]): string {
+  const source = sourceOf(request.cmdline || `pid ${request.pid}`, commands)
+  return request.inside ? source : `outside this session: ${source}`
 }
 
 /** The running Bash command a request came from, else the command out of the asker's wrapper, else its command line. */

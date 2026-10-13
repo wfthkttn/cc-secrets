@@ -3,14 +3,5 @@
   "version": "0.1.0",
   "description": "Passwords for the session's commands, typed into Claude Code",
   "author": { "name": "alex" },
-  "dependencies": ["sidebar"],
-  "userConfig": {
-    "maskMinLength": {
-      "type": "number",
-      "title": "Shortest value to mask",
-      "description": "Typed values shorter than this are delivered but not masked in output.",
-      "default": 6,
-      "min": 1
-    }
-  }
+  "dependencies": ["sidebar"]
 }

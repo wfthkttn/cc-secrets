@@ -14,11 +14,18 @@ export type ListState = {
   epoch: number
   /** The first card row shown; clamped when drawn. */
   scroll: number
+  /** The offered entry shown per request, an index into its `offer`. */
+  picks: Record<string, number>
+  /** The selected card's part with the keyboard: its field, or its row of vault entries. */
+  part: 'field' | 'pick'
 }
 
 /** One screen row of the list: a message row, a request card's row, a gap, or the empty note. */
 type Row =
-  | { id: string; kind: 'cardTop' | 'cardBottom' | 'fieldTop' | 'field' | 'fieldBottom' | 'grantTop' | 'grant' | 'grantBottom' }
+  | {
+      id: string
+      kind: 'cardTop' | 'cardBottom' | 'fieldTop' | 'field' | 'fieldBottom' | 'grantTop' | 'grant' | 'grantBottom' | 'pickTop' | 'pick' | 'pickBottom'
+    }
   | { id: string; kind: 'what'; text: string; since: string }
   | { id: string; kind: 'from'; text: string }
   | { id: null; kind: 'msgTop' | 'msgBottom' }
@@ -67,7 +74,20 @@ function pad(text: string, width: number): string {
 }
 
 export function initialState(focusEpoch: number, instance: string): ListState {
-  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0 }
+  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0, picks: {}, part: 'field' }
+}
+
+/** The offered entry the card shows now; null without an offer. */
+export function pickOf(state: ListState, entry: RequestEntry): string | null {
+  const offer = entry.offer ?? []
+  return offer[(state.picks[entry.id] ?? 0) % Math.max(1, offer.length)]?.id ?? null
+}
+
+function cyclePick(state: ListState, entry: RequestEntry, step: number): ListState {
+  const count = entry.offer?.length ?? 0
+  if (count === 0) return state
+  const at = ((state.picks[entry.id] ?? 0) + step + count) % count
+  return { ...state, picks: { ...state.picks, [entry.id]: at } }
 }
 
 function typedText(k: ClientKeyEvent): string | null {
@@ -141,17 +161,25 @@ export function geometry(columns: number) {
   return { inner, fieldColumns: inner - 1 - BUTTON_COLUMNS, buttonStart: CARD_EDGE + inner - BUTTON_COLUMNS }
 }
 
-/** The grant buttons, right-aligned in the card as the field's ✕ is, a column apart. */
-export function grantButtons(columns: number) {
+/** The grant buttons, right-aligned in the card as the field's ✕ is, a column apart; a pick row has no ✕. */
+export function grantButtons(columns: number, withCancel = true) {
   const { inner } = geometry(columns)
-  const widths = GRANT_BUTTONS.map(b => [...b.label].length + 2)
+  const shown = GRANT_BUTTONS.filter(b => withCancel || b.kind !== 'cancel')
+  const widths = shown.map(b => [...b.label].length + 2)
   const total = widths.reduce((sum, w) => sum + w, 0) + widths.length - 1
   let start = CARD_EDGE + inner - total
-  return GRANT_BUTTONS.map((b, i) => {
+  return shown.map((b, i) => {
     const button = { ...b, start, width: widths[i]! }
     start += widths[i]! + 1
     return button
   })
+}
+
+/** Where a pick row's `‹` and `›` sit, the label between them clipped to the room left of the buttons. */
+export function pickArrows(columns: number, label: string) {
+  const room = grantButtons(columns, false)[0]!.start - CARD_EDGE - 5
+  const shown = clip(label, Math.max(1, room))
+  return { less: CARD_EDGE, more: CARD_EDGE + 2 + [...shown].length + 1, shown }
 }
 
 export function layout(entries: RequestEntry[], columns: number, message: string | null): Row[] {
@@ -171,8 +199,9 @@ export function layout(entries: RequestEntry[], columns: number, message: string
     rows.push({ id: entry.id, kind: 'cardTop' })
     rows.push({ id: entry.id, kind: 'what', text: entry.prompt, since: entry.since })
     if (entry.source !== '') for (const text of wrap(entry.source, inner, FROM_MAX_ROWS)) rows.push({ id: entry.id, kind: 'from', text })
-    const answer = entry.kind === 'grant' ? (['grantTop', 'grant', 'grantBottom'] as const) : (['fieldTop', 'field', 'fieldBottom'] as const)
+    const answer = entry.kind === 'sign' ? (['grantTop', 'grant', 'grantBottom'] as const) : (['fieldTop', 'field', 'fieldBottom'] as const)
     for (const kind of answer) rows.push({ id: entry.id, kind })
+    if (entry.kind === 'secret' && (entry.offer?.length ?? 0) > 0) for (const kind of ['pickTop', 'pick', 'pickBottom'] as const) rows.push({ id: entry.id, kind })
     rows.push({ id: entry.id, kind: 'cardBottom' })
   }
   return rows
@@ -228,7 +257,7 @@ function reveal(entries: RequestEntry[], frame: Frame, scroll: number, id: strin
 
 /** Selects the card and scrolls to it; tells the hooks when the selection changed, or always when `tell`. */
 function selectCard(state: ListState, entries: RequestEntry[], frame: Frame, id: string, tell = false): Result {
-  const moved = { ...state, selected: id, isFocused: true, scroll: reveal(entries, frame, state.scroll, id) }
+  const moved = { ...state, selected: id, isFocused: true, part: 'field' as const, scroll: reveal(entries, frame, state.scroll, id) }
   return tell || id !== selectedOf(state, entries) ? { state: moved, post: postOf(state, id) } : { state: moved }
 }
 
@@ -244,16 +273,27 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   const selected = selectedOf(state, entries)
   if (selected === null) return { state }
   const at = entries.findIndex(e => e.id === selected)
+  const entry = entries[at]!
+  const pick = entry.kind === 'secret' ? pickOf(state, entry) : null
+  const onPick = pick !== null && state.part === 'pick'
+  // ↓ from a field goes to the card's entries first, ↑ from them back to the field.
+  if (k.key === 'down' && pick !== null && !onPick) return { state: { ...state, part: 'pick', isFocused: true } }
+  if (k.key === 'up' && onPick) return { state: { ...state, part: 'field', isFocused: true } }
   const jumps: Record<string, number> = { up: at - 1, down: at + 1, home: 0, end: entries.length - 1 }
   const to = jumps[k.key]
   if (to !== undefined) return selectCard(state, entries, frame, entries[Math.max(0, Math.min(entries.length - 1, to))]!.id)
   const isEnter = k.key === 'return' || k.key === '\n'
-  if (entries[at]!.kind === 'grant') return isEnter ? withEdit(state, selected, { id: selected, kind: 'once' }) : { state }
-  if (isEnter) return withEdit(state, selected, { id: selected, kind: 'submit' })
-  if (k.key === 'backspace' || k.key === 'delete') return withEdit(state, selected, { id: selected, kind: 'back' })
-  if (k.ctrl && k.key === 'u') return withEdit(state, selected, { id: selected, kind: 'clear' })
+  if (entry.kind === 'sign') return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: null }) : { state }
+  if (onPick) {
+    if (k.key === 'left' || k.key === 'right') return { state: cyclePick(state, entry, k.key === 'left' ? -1 : 1) }
+    if (isEnter) return withEdit(state, selected, { id: selected, kind: 'once', entry: pick })
+  }
+  const inField = { ...state, part: 'field' as const }
+  if (isEnter) return withEdit(inField, selected, { id: selected, kind: 'submit' })
+  if (k.key === 'backspace' || k.key === 'delete') return withEdit(inField, selected, { id: selected, kind: 'back' })
+  if (k.ctrl && k.key === 'u') return withEdit(inField, selected, { id: selected, kind: 'clear' })
   const text = typedText(k)
-  return text === null ? { state } : withEdit(state, selected, { id: selected, kind: 'append', text })
+  return text === null ? { state } : withEdit(inField, selected, { id: selected, kind: 'append', text })
 }
 
 /** A click gives the list the keyboard, so it always tells the hooks what is selected. */
@@ -278,9 +318,20 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   }
   if (row.kind === 'grantTop' || row.kind === 'grant' || row.kind === 'grantBottom') {
     const button = grantButtons(frame.columns).find(b => x >= b.start && x < b.start + b.width)
-    if (button !== undefined) return withEdit(state, current, { id: row.id, kind: button.kind })
+    if (button?.kind === 'cancel') return withEdit(state, current, { id: row.id, kind: 'cancel' })
+    if (button !== undefined) return withEdit(state, current, { id: row.id, kind: button.kind, entry: null })
   }
-  return { state: { ...focused, selected: row.id }, post: postOf(state, row.id) }
+  const entry = entries.find(e => e.id === row.id)
+  const pick = entry === undefined ? null : pickOf(state, entry)
+  if (entry !== undefined && pick !== null && (row.kind === 'pickTop' || row.kind === 'pick' || row.kind === 'pickBottom')) {
+    const button = grantButtons(frame.columns, false).find(b => x >= b.start && x < b.start + b.width)
+    if (button !== undefined && button.kind !== 'cancel') return withEdit(state, current, { id: row.id, kind: button.kind, entry: pick })
+    const arrows = pickArrows(frame.columns, entry.offer!.find(o => o.id === pick)!.label)
+    const step = row.kind !== 'pick' ? 0 : x === arrows.less ? -1 : x === arrows.more ? 1 : 0
+    const picked = step === 0 ? focused : cyclePick(focused, entry, step)
+    return { state: { ...picked, selected: row.id, part: 'pick' }, post: postOf(state, row.id) }
+  }
+  return { state: { ...focused, selected: row.id, part: 'field' }, post: postOf(state, row.id) }
 }
 
 const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
@@ -292,7 +343,8 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
     if (p.type !== 'down') return
     if (p.y < tabRows) {
       const current = surface.state as ListState
-      if (p.y === 0 && props.tabs !== null && tabAt(props.tabs, p.x) === 'vault') surface.post({ ...postOf(current, selectedOf(current, props.entries)), tab: 'vault' })
+      const tab = p.y === 0 && props.tabs !== null ? tabAt(props.tabs, p.x) : null
+      if (tab !== null && tab !== 'requests') surface.post({ ...postOf(current, selectedOf(current, props.entries)), tab })
       return
     }
     const result = onClick(surface.state as ListState, props.entries, frame, p.y - tabRows, p.x)
@@ -361,16 +413,15 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
       case 'field': {
         const count = shownLength(entriesById.get(row.id)!, state.pending)
         const room = fieldColumns - 4
-        const shown = active(row.id)
+        const typing = active(row.id) && state.part === 'field'
+        const shown = typing
           ? (count + 1 > room ? '…' + '•'.repeat(room - 2) : '•'.repeat(count)) + '▏'
           : count > 0
             ? '•'.repeat(Math.min(count, room))
-            : entriesById.get(row.id)!.kind === 'unlock'
-              ? 'passphrase'
-              : 'password'
+            : 'password'
         return line(row.id, [
           Text({ ...look(row.id), children: ['│ '] }),
-          Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: !active(row.id) && count === 0, children: [pad(shown, room)] }),
+          Text({ backgroundColor: FIELD_BACKGROUND, bold: typing, dimColor: !typing && count === 0, children: [pad(shown, room)] }),
           Text({ ...look(row.id), children: [' │ '] }),
           Text({ color: 'error', children: [BUTTON_ROW_TEXT[1]] }),
         ])
@@ -387,6 +438,22 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
           ...buttons.map((b, i) =>
             Text({ ...(b.kind === 'cancel' ? { color: 'error' as const } : look(row.id)), children: [(i > 0 ? ' ' : '') + face(b.label, b.width)] }),
           ),
+        ])
+      }
+      case 'pickTop':
+      case 'pick':
+      case 'pickBottom': {
+        const entry = entriesById.get(row.id)!
+        const pick = pickOf(state, entry)
+        const buttons = grantButtons(columns, false)
+        const lead = buttons[0]!.start - CARD_EDGE
+        const face = (label: string, width: number) =>
+          row.kind === 'pickTop' ? edge('top', width) : row.kind === 'pickBottom' ? edge('bottom', width) : '│' + label + '│'
+        const label = row.kind === 'pick' ? '‹ ' + pickArrows(columns, entry.offer!.find(o => o.id === pick)!.label).shown + ' ›' : ''
+        const picking = active(row.id) && state.part === 'pick' ? { color: 'claude' as const, bold: true } : { dimColor: true }
+        return line(row.id, [
+          Text({ ...picking, children: [pad(label, lead)] }),
+          ...buttons.map((b, i) => Text({ ...picking, children: [(i > 0 ? ' ' : '') + face(b.label, b.width)] })),
         ])
       }
     }

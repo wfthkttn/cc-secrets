@@ -1,9 +1,10 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
 import { drawTabs, TAB_ROWS, tabAt } from './tabs'
-import type { EntryKind, EntryUse, Form, ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
+import type { EntryKind, EntryUse, Form, SecretField, Suggestion, ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
 type Field = 'name' | 'tag' | 'kind' | 'use' | 'value'
+type Door = 'passphrase' | 'again'
 
 export type ViewState = {
   instance: string
@@ -12,18 +13,23 @@ export type ViewState = {
   pending: ValueEdit[]
   form: Form | null
   field: Field
+  /** The closed vault's field with the keyboard. */
+  door: Door
+  /** The vault is closed: keys go to its passphrase. */
+  isClosed: boolean
   /** The selected row among the list's selectable ones. */
   selected: number
   formEpoch: number
 }
 
-/** One row under the tabs: the list's, or the form's. */
+/** One row under the tabs: the closed vault's, the list's, or the form's. */
 export type Row =
+  | { kind: 'closed'; text: string }
+  | { kind: 'door'; field: Door }
   | { kind: 'add' }
-  | { kind: 'entry' | 'typed'; entry: ViewEntry }
-  | { kind: 'typedHead' | 'none' }
-  | { kind: 'closed'; text: string; button: string }
-  | { kind: 'forward'; on: boolean }
+  | { kind: 'entry'; entry: ViewEntry }
+  | { kind: 'suggestion'; suggestion: Suggestion }
+  | { kind: 'suggestHead' | 'none' }
   | { kind: 'field'; field: Field }
   | { kind: 'gap' | 'buttonsTop' | 'buttons' | 'buttonsBottom' }
   | { kind: 'error'; text: string }
@@ -32,8 +38,10 @@ type Result = { state: ViewState; post?: VaultMessage }
 
 const FIELDS: readonly Field[] = ['name', 'tag', 'kind', 'use', 'value']
 const LABELS: Record<Field, string> = { name: 'Name', tag: 'Tag', kind: 'Kind', use: 'Use', value: 'Value' }
+const DOOR_LABELS: Record<Door, string> = { passphrase: 'Passphrase', again: 'Again' }
 const LABEL_COLUMNS = 7
-const KINDS: readonly Form['kind'][] = ['password', 'token', 'ssh-key']
+const DOOR_LABEL_COLUMNS = 12
+const KINDS: readonly EntryKind[] = ['password', 'token', 'ssh-key']
 const USES: readonly EntryUse[] = ['session', 'each']
 const FIELD_BACKGROUND = '#1f2a3a'
 const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
@@ -52,22 +60,29 @@ function edge(side: 'top' | 'bottom', width: number): string {
   return left + '─'.repeat(width - 2) + right
 }
 
-export function initialState(formEpoch: number, instance: string): ViewState {
-  return { instance, seq: 0, pending: [], form: null, field: 'name', selected: 0, formEpoch }
+export function initialState(formEpoch: number, instance: string, isClosed = false): ViewState {
+  return { instance, seq: 0, pending: [], form: null, field: 'name', door: 'passphrase', isClosed, selected: 0, formEpoch }
 }
 
-export function listRows(props: Pick<VaultProps, 'state' | 'entries' | 'forward'>): Row[] {
-  const forward: Row[] = props.forward === null ? [] : [{ kind: 'forward', on: props.forward }]
-  if (props.state === 'absent') return [{ kind: 'closed', text: 'No vault yet.', button: ' Create ' }, ...forward]
-  if (props.state === 'locked') return [{ kind: 'closed', text: 'Vault locked.', button: ' Unlock ' }, ...forward]
-  const full = props.entries.filter(e => e.kind !== 'typed')
-  const typed = props.entries.filter(e => e.kind === 'typed')
+function doors(state: VaultProps['state']): Door[] {
+  return state === 'absent' ? ['passphrase', 'again'] : ['passphrase']
+}
+
+/** The closed vault's rows: what it is, its passphrase field (twice for a new one), its button, why the last try failed. */
+export function closedRows(props: Pick<VaultProps, 'state' | 'error'>): Row[] {
+  const rows: Row[] = [{ kind: 'closed', text: props.state === 'absent' ? 'No vault yet.' : 'Vault locked.' }]
+  for (const field of doors(props.state)) rows.push({ kind: 'door', field })
+  rows.push({ kind: 'gap' }, { kind: 'buttonsTop' }, { kind: 'buttons' }, { kind: 'buttonsBottom' })
+  if (props.error !== null) rows.push({ kind: 'error', text: props.error })
+  return rows
+}
+
+export function listRows(props: Pick<VaultProps, 'entries' | 'suggestions'>): Row[] {
   const rows: Row[] = [{ kind: 'add' }]
-  if (full.length === 0 && typed.length === 0) rows.push({ kind: 'none' })
-  for (const entry of full) rows.push({ kind: 'entry', entry })
-  rows.push(...forward)
-  if (typed.length > 0) rows.push({ kind: 'typedHead' })
-  for (const entry of typed) rows.push({ kind: 'typed', entry })
+  if (props.entries.length === 0) rows.push({ kind: 'none' })
+  for (const entry of props.entries) rows.push({ kind: 'entry', entry })
+  if (props.suggestions.length > 0) rows.push({ kind: 'suggestHead' })
+  for (const suggestion of props.suggestions) rows.push({ kind: 'suggestion', suggestion })
   return rows
 }
 
@@ -79,16 +94,12 @@ export function formRows(error: string | null): Row[] {
 }
 
 function isSelectable(row: Row): boolean {
-  return row.kind === 'add' || row.kind === 'entry' || row.kind === 'typed' || row.kind === 'closed' || row.kind === 'forward'
+  return row.kind === 'add' || row.kind === 'entry' || row.kind === 'suggestion'
 }
 
-/** The form's buttons from the left, each boxed, a column apart; Delete only on an entry that exists. */
-export function formButtons(form: Form) {
-  const labels = [
-    { kind: 'save', label: ' Save ' },
-    ...(form.id === null ? [] : [{ kind: 'delete', label: ' Delete ' }]),
-    { kind: 'cancel', label: ' ✕ ' },
-  ] as const
+type Button = { kind: 'save' | 'delete' | 'dismiss' | 'cancel' | 'open'; label: string }
+
+function laidOut(labels: readonly Button[]) {
   let start = 1
   return labels.map(b => {
     const button = { ...b, start, width: [...b.label].length + 2 }
@@ -97,20 +108,32 @@ export function formButtons(form: Form) {
   })
 }
 
-/** The row's button under the closed vault's text: where it starts. */
-function closedButtonStart(text: string): number {
-  return 1 + [...text].length + 2
+/** The form's buttons from the left, each boxed, a column apart; Delete on an entry that exists, Dismiss on a suggestion. */
+export function formButtons(form: Form) {
+  return laidOut([
+    { kind: 'save', label: ' Save ' },
+    ...(form.id !== null ? [{ kind: 'delete', label: ' Delete ' } as const] : []),
+    ...(form.suggestion !== null ? [{ kind: 'dismiss', label: ' Dismiss ' } as const] : []),
+    { kind: 'cancel', label: ' ✕ ' },
+  ])
+}
+
+export function doorButtons(state: VaultProps['state']) {
+  return laidOut([{ kind: 'open', label: state === 'absent' ? ' Create ' : ' Unlock ' }])
+}
+
+function focusedOf(state: ViewState): SecretField | null {
+  if (state.isClosed) return state.door
+  return state.form !== null && state.form.suggestion === null && state.field === 'value' ? 'value' : null
 }
 
 function postOf(state: ViewState, edits = state.pending, action?: VaultAction): VaultMessage {
-  const valueFocused = state.form !== null && state.field === 'value'
-  return { instance: state.instance, edits, valueFocused, formOpen: state.form !== null, ...(action === undefined ? {} : { action }) }
+  return { instance: state.instance, edits, focused: focusedOf(state), formOpen: state.form !== null, ...(action === undefined ? {} : { action }) }
 }
 
-/** Moves the form's keyboard to `field`; the hooks learn whether a paste now goes to the value. */
-function focusField(state: ViewState, field: Field): Result {
-  const moved = { ...state, field }
-  return { state: moved, post: postOf(moved) }
+/** Moves the keyboard; the hooks learn which held field a paste now goes to. */
+function moved(state: ViewState): Result {
+  return { state, post: postOf(state) }
 }
 
 type EditBody = ValueEdit extends infer E ? (E extends ValueEdit ? Omit<E, 'seq'> : never) : never
@@ -126,8 +149,9 @@ export function confirm(state: ViewState, applied: number | undefined): ViewStat
   return { ...state, pending: state.pending.filter(e => e.seq > applied) }
 }
 
-export function shownLength(length: number, pending: ValueEdit[]): number {
+export function shownLength(length: number, field: SecretField, pending: ValueEdit[]): number {
   for (const edit of pending) {
+    if (edit.field !== field) continue
     if (edit.kind === 'append') length += [...edit.text].length
     else if (edit.kind === 'back') length = Math.max(0, length - 1)
     else length = 0
@@ -139,14 +163,14 @@ export function shownLength(length: number, pending: ValueEdit[]): number {
 function open(state: ViewState, row: Row): Result {
   const form: Form | null =
     row.kind === 'add'
-      ? { id: null, name: '', tag: '', kind: 'password', use: 'session' }
+      ? { id: null, suggestion: null, name: '', tag: '', kind: 'password', use: 'session' }
       : row.kind === 'entry'
-        ? { id: row.entry.id, name: row.entry.name, tag: row.entry.tag, kind: row.entry.kind === 'typed' ? 'password' : row.entry.kind, use: row.entry.use }
-        : row.kind === 'typed'
-          ? { id: row.entry.id, name: row.entry.name, tag: '', kind: 'password', use: 'session' }
+        ? { id: row.entry.id, suggestion: null, name: row.entry.name, tag: row.entry.tag, kind: row.entry.kind, use: row.entry.use }
+        : row.kind === 'suggestion'
+          ? { id: null, suggestion: row.suggestion.id, name: row.suggestion.prompt, tag: '', kind: 'password', use: 'session' }
           : null
   if (form === null) return { state }
-  return withEdit({ ...state, form, field: 'name' }, { kind: 'clear' })
+  return withEdit({ ...state, form, field: 'name' }, { field: 'value', kind: 'clear' })
 }
 
 function act(state: ViewState, action: VaultAction): Result {
@@ -164,24 +188,44 @@ function typedText(k: ClientKeyEvent): string | null {
   return k.key
 }
 
+/** A key on a held field: an edit the hooks apply; null for a key that edits nothing. */
+function heldEdit(field: SecretField, k: ClientKeyEvent): EditBody | null {
+  if (k.key === 'backspace' || k.key === 'delete') return { field, kind: 'back' }
+  if (k.ctrl && k.key === 'u') return { field, kind: 'clear' }
+  const text = typedText(k)
+  return text === null ? null : { field, kind: 'append', text }
+}
+
+function onDoorKey(state: ViewState, props: Pick<VaultProps, 'state'>, k: ClientKeyEvent): Result {
+  const fields = doors(props.state)
+  if (k.key === 'up' || k.key === 'down' || k.key === 'tab') {
+    const step = k.key === 'up' || (k.key === 'tab' && k.shift) ? -1 : 1
+    const at = Math.max(0, fields.indexOf(state.door))
+    return moved({ ...state, door: fields[Math.max(0, Math.min(fields.length - 1, at + step))]! })
+  }
+  if (k.key === 'return' || k.key === '\n') return act(state, { kind: 'open' })
+  const edit = heldEdit(state.door, k)
+  return edit === null ? { state } : withEdit(state, edit)
+}
+
 function onFormKey(state: ViewState, form: Form, k: ClientKeyEvent): Result {
   const at = FIELDS.indexOf(state.field)
   if (k.key === 'up' || k.key === 'down' || k.key === 'tab') {
     const step = k.key === 'up' || (k.key === 'tab' && k.shift) ? -1 : 1
-    return focusField(state, FIELDS[Math.max(0, Math.min(FIELDS.length - 1, at + step))]!)
+    return moved({ ...state, field: FIELDS[Math.max(0, Math.min(FIELDS.length - 1, at + step))]! })
   }
   if (k.key === 'return' || k.key === '\n') return act(state, { kind: 'save', form })
   if (state.field === 'kind' || state.field === 'use') {
     const step = k.key === 'left' ? -1 : k.key === 'right' || k.key === 'space' ? 1 : 0
     if (step === 0) return { state }
-    const next = state.field === 'kind' ? { ...form, kind: cycle(KINDS, form.kind, step) } : { ...form, use: cycle(USES, form.use, step) }
+    // A suggestion is a typed value: it can't become an ssh key.
+    const kinds = form.suggestion === null ? KINDS : KINDS.filter(kind => kind !== 'ssh-key')
+    const next = state.field === 'kind' ? { ...form, kind: cycle(kinds, form.kind, step) } : { ...form, use: cycle(USES, form.use, step) }
     return { state: { ...state, form: next } }
   }
   if (state.field === 'value') {
-    if (k.key === 'backspace' || k.key === 'delete') return withEdit(state, { kind: 'back' })
-    if (k.ctrl && k.key === 'u') return withEdit(state, { kind: 'clear' })
-    const text = typedText(k)
-    return text === null ? { state } : withEdit(state, { kind: 'append', text })
+    const edit = form.suggestion === null ? heldEdit('value', k) : null
+    return edit === null ? { state } : withEdit(state, edit)
   }
   const key = state.field
   const value = form[key]
@@ -191,7 +235,8 @@ function onFormKey(state: ViewState, form: Form, k: ClientKeyEvent): Result {
   return text === null ? { state } : { state: { ...state, form: { ...form, [key]: value + text } } }
 }
 
-export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entries' | 'forward'>, k: ClientKeyEvent): Result {
+export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entries' | 'suggestions'>, k: ClientKeyEvent): Result {
+  if (props.state !== 'open') return onDoorKey(state, props, k)
   if (state.form !== null) return onFormKey(state, state.form, k)
   const rows = listRows(props).filter(isSelectable)
   const selected = Math.min(state.selected, rows.length - 1)
@@ -199,25 +244,38 @@ export function onKey(state: ViewState, props: Pick<VaultProps, 'state' | 'entri
   const row = rows[selected]
   if (row === undefined) return { state }
   if (row.kind === 'entry' && k.key === 'space') return act(state, { kind: 'allow', id: row.entry.id, allowed: !row.entry.allowed })
-  if (k.key !== 'return' && k.key !== '\n' && !(row.kind === 'forward' && k.key === 'space')) return { state }
-  if (row.kind === 'forward') return act(state, { kind: 'forward', on: !row.on })
-  return row.kind === 'closed' ? act(state, { kind: 'unlock' }) : open(state, row)
+  if (k.key !== 'return' && k.key !== '\n') return { state }
+  return open(state, row)
+}
+
+function buttonAt<B extends { start: number; width: number }>(buttons: B[], x: number): B | undefined {
+  return buttons.find(b => x >= b.start && x < b.start + b.width)
 }
 
 /** `y` and `x` count from the view's top left, the tab rows included. */
 export function onClick(state: ViewState, props: VaultProps, y: number, x: number): Result {
   if (y < TAB_ROWS) {
-    return y === 0 && tabAt(props.tabs, x) === 'requests' ? { state, post: { ...postOf(state), tab: 'requests' } } : { state }
+    const tab = y === 0 ? tabAt(props.tabs, x) : null
+    return tab !== null && tab !== 'vault' ? { state, post: { ...postOf(state), tab } } : { state }
   }
   const at = y - TAB_ROWS
+  const onButtons = (row: Row | undefined) => row?.kind === 'buttonsTop' || row?.kind === 'buttons' || row?.kind === 'buttonsBottom'
+  if (props.state !== 'open') {
+    const row = closedRows(props)[at]
+    if (row?.kind === 'door') return moved({ ...state, door: row.field })
+    if (onButtons(row) && buttonAt(doorButtons(props.state), x) !== undefined) return act(state, { kind: 'open' })
+    return moved(state)
+  }
   if (state.form !== null) {
+    const form = state.form
     const row = formRows(props.error)[at]
-    if (row?.kind === 'field') return focusField(state, row.field)
-    if (row?.kind === 'buttonsTop' || row?.kind === 'buttons' || row?.kind === 'buttonsBottom') {
-      const button = formButtons(state.form).find(b => x >= b.start && x < b.start + b.width)
-      if (button?.kind === 'save') return act(state, { kind: 'save', form: state.form })
-      if (button?.kind === 'delete' && state.form.id !== null) return act(state, { kind: 'delete', id: state.form.id })
-      if (button?.kind === 'cancel') return withEdit({ ...state, form: null }, { kind: 'clear' })
+    if (row?.kind === 'field') return moved({ ...state, field: row.field })
+    if (onButtons(row)) {
+      const button = buttonAt(formButtons(form), x)
+      if (button?.kind === 'save') return act(state, { kind: 'save', form })
+      if (button?.kind === 'delete' && form.id !== null) return act(state, { kind: 'delete', id: form.id })
+      if (button?.kind === 'dismiss' && form.suggestion !== null) return act(state, { kind: 'dismiss', id: form.suggestion })
+      if (button?.kind === 'cancel') return withEdit({ ...state, form: null }, { field: 'value', kind: 'clear' })
     }
     return { state }
   }
@@ -225,12 +283,10 @@ export function onClick(state: ViewState, props: VaultProps, y: number, x: numbe
   const row = window(all, props.rows - TAB_ROWS, state.selected)[at]
   if (row === undefined || !isSelectable(row)) return { state }
   const selected = all.filter(isSelectable).indexOf(row)
-  const moved = { ...state, selected }
-  if (row.kind === 'closed') return x >= closedButtonStart(row.text) ? act(moved, { kind: 'unlock' }) : { state: moved }
-  if (row.kind === 'forward') return act(moved, { kind: 'forward', on: !row.on })
+  const chosen = { ...state, selected }
   // The dot at the row's start allows or revokes; the rest opens the entry.
-  if (row.kind === 'entry' && x <= 2) return act(moved, { kind: 'allow', id: row.entry.id, allowed: !row.entry.allowed })
-  return open(moved, row)
+  if (row.kind === 'entry' && x <= 2) return act(chosen, { kind: 'allow', id: row.entry.id, allowed: !row.entry.allowed })
+  return open(chosen, row)
 }
 
 /** The list rows that fit in `room`, scrolled so the selected one shows. */
@@ -241,7 +297,7 @@ export function window(rows: Row[], room: number, selected: number): Row[] {
   return rows.slice(top, top + room)
 }
 
-const KIND_NAMES: Record<EntryKind, string> = { password: 'password', token: 'token', 'ssh-key': 'ssh key', typed: 'typed' }
+const KIND_NAMES: Record<EntryKind, string> = { password: 'password', token: 'token', 'ssh-key': 'ssh key' }
 
 const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const { Box, Text } = surface.elements
@@ -257,38 +313,78 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
     surface.setState(result.state)
     if (result.post) surface.post(result.post)
   })
-  let state = surface.state ?? initialState(props.formEpoch, Math.random().toString(36).slice(2))
+  const isClosed = props.state !== 'open'
+  let state = surface.state ?? initialState(props.formEpoch, Math.random().toString(36).slice(2), isClosed)
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, formEpoch: props.formEpoch }
+  if (state.isClosed !== isClosed) state = { ...state, isClosed, door: 'passphrase' }
   if (state !== surface.state) surface.setState(state)
 
   const line = (text: string, look: object = {}) => Text({ ...look, children: [pad(clip(text, columns), columns)] })
+  const active = { color: 'claude' as const, bold: true }
+  const held = (field: SecretField, isActive: boolean, room: number, empty: string) => {
+    const length = shownLength(props.lengths[field], field, state.pending)
+    const shown = length > 0 ? '•'.repeat(Math.min(length, room - 1)) : empty
+    return Text({ backgroundColor: FIELD_BACKGROUND, bold: isActive, dimColor: length === 0 && !isActive, children: [pad(shown + (isActive ? '▏' : ''), room)] })
+  }
+  const buttonRow = (kind: 'buttonsTop' | 'buttons' | 'buttonsBottom', buttons: ReturnType<typeof laidOut>) => {
+    const faces = buttons.map(b =>
+      Text({
+        ...(b.kind === 'cancel' || b.kind === 'delete' || b.kind === 'dismiss' ? { color: 'error' as const } : { color: 'claude' as const }),
+        children: [' ' + (kind === 'buttonsTop' ? edge('top', b.width) : kind === 'buttonsBottom' ? edge('bottom', b.width) : '│' + b.label + '│')],
+      }),
+    )
+    const used = buttons.reduce((sum, b) => sum + b.width + 1, 0)
+    return Box({ flexDirection: 'row', children: [...faces, Text({ children: [' '.repeat(Math.max(0, columns - used))] })] })
+  }
   const form = state.form
   let rows
-  if (form === null) {
+  if (isClosed) {
+    rows = closedRows(props).map(row => {
+      switch (row.kind) {
+        case 'closed':
+          return line(' ' + row.text)
+        case 'door': {
+          const isActive = row.field === state.door
+          const room = columns - DOOR_LABEL_COLUMNS - 2
+          return Box({
+            flexDirection: 'row',
+            children: [
+              Text({ ...(isActive ? active : { dimColor: true }), children: [pad(' ' + DOOR_LABELS[row.field], DOOR_LABEL_COLUMNS)] }),
+              held(row.field, isActive, room, ''),
+              Text({ children: ['  '] }),
+            ],
+          })
+        }
+        case 'buttonsTop':
+        case 'buttons':
+        case 'buttonsBottom':
+          return buttonRow(row.kind, doorButtons(props.state))
+        case 'error':
+          return line(' ' + row.text, { color: 'error' })
+        default:
+          return line('')
+      }
+    })
+  } else if (form === null) {
     const all = listRows(props)
     const chosen = all.filter(isSelectable)[Math.min(state.selected, all.filter(isSelectable).length - 1)]
     rows = window(all, props.rows - TAB_ROWS, state.selected).map(row => {
-      const look = row === chosen ? { color: 'claude' as const, bold: true } : {}
+      const look = row === chosen ? active : {}
       switch (row.kind) {
-        case 'closed': {
-          const lead = ' ' + row.text + '  '
-          return Box({ flexDirection: 'row', children: [Text({ children: [lead] }), Text({ ...look, children: ['[' + row.button + ']'] }), Text({ children: [' '.repeat(Math.max(0, columns - [...lead].length - [...row.button].length - 2))] })] })
-        }
         case 'add':
           return line(' + Add', look)
         case 'none':
           return line(' No entries', { dimColor: true })
-        case 'typedHead':
-          return line(' Typed, masking only; Enter saves one as an entry', { dimColor: true })
-        case 'forward':
-          return line(` ${row.on ? '✓' : '·'} Your ssh-agent's keys too`, look)
-        case 'entry':
-        case 'typed': {
+        case 'suggestHead':
+          return line(' Typed this session; Enter keeps one', { dimColor: true })
+        case 'suggestion':
+          return line('   ' + row.suggestion.prompt, look)
+        case 'entry': {
           const e = row.entry
-          const dot = row.kind === 'typed' ? '  ' : e.allowed ? '✓ ' : '· '
-          const tail = row.kind === 'typed' ? '' : ` ${pad(e.tag, 14)} ${pad(KIND_NAMES[e.kind], 8)} ${e.use === 'each' ? 'each' : ''}`
+          const dot = e.allowed ? '✓ ' : '· '
+          const tail = ` ${pad(e.tag, 14)} ${pad(KIND_NAMES[e.kind], 8)} ${e.use === 'each' ? 'each' : ''}`
           const name = clip(e.name, Math.max(4, columns - 1 - 2 - [...tail].length))
           return line(' ' + dot + pad(name, columns - 3 - [...tail].length) + tail, look)
         }
@@ -297,48 +393,38 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
       }
     })
   } else {
-    const valueLength = shownLength(props.valueLength, state.pending)
     rows = formRows(props.error).map(row => {
       switch (row.kind) {
         case 'field': {
           const isActive = row.field === state.field
           const room = columns - LABEL_COLUMNS - 2
+          const label = Text({
+            ...(isActive ? active : { dimColor: true }),
+            children: [pad(' ' + (row.field === 'value' && form.kind === 'ssh-key' ? 'File' : LABELS[row.field]), LABEL_COLUMNS)],
+          })
+          if (row.field === 'value') {
+            const value =
+              form.suggestion !== null
+                ? Text({ backgroundColor: FIELD_BACKGROUND, dimColor: true, children: [pad('typed this session', room)] })
+                : held('value', isActive, room, form.id === null ? '' : 'unchanged')
+            return Box({ flexDirection: 'row', children: [label, value, Text({ children: ['  '] })] })
+          }
           const shown =
-            row.field === 'value'
-              ? valueLength > 0
-                ? '•'.repeat(Math.min(valueLength, room - 1))
-                : form.id === null
-                  ? ''
-                  : 'unchanged'
-              : row.field === 'kind'
-                ? `‹ ${KIND_NAMES[form.kind]} ›`
-                : row.field === 'use'
-                  ? `‹ ${form.use === 'each' ? 'ask every use' : 'session once allowed'} ›`
-                  : clip(form[row.field], room - 1)
+            row.field === 'kind'
+              ? `‹ ${KIND_NAMES[form.kind]} ›`
+              : row.field === 'use'
+                ? `‹ ${form.use === 'each' ? 'ask every use' : 'session once allowed'} ›`
+                : clip(form[row.field], room - 1)
+          const cursor = isActive && row.field !== 'kind' && row.field !== 'use' ? '▏' : ''
           return Box({
             flexDirection: 'row',
-            children: [
-              Text({
-                ...(isActive ? { color: 'claude' as const, bold: true } : { dimColor: true }),
-                children: [pad(' ' + (row.field === 'value' && form.kind === 'ssh-key' ? 'File' : LABELS[row.field]), LABEL_COLUMNS)],
-              }),
-              Text({ backgroundColor: FIELD_BACKGROUND, bold: isActive, children: [pad(shown + (isActive && row.field !== 'kind' && row.field !== 'use' ? '▏' : ''), room)] }),
-              Text({ children: ['  '] }),
-            ],
+            children: [label, Text({ backgroundColor: FIELD_BACKGROUND, bold: isActive, children: [pad(shown + cursor, room)] }), Text({ children: ['  '] })],
           })
         }
         case 'buttonsTop':
         case 'buttons':
-        case 'buttonsBottom': {
-          const faces = formButtons(form).map(b =>
-            Text({
-              ...(b.kind === 'cancel' || b.kind === 'delete' ? { color: 'error' as const } : { color: 'claude' as const }),
-              children: [' ' + (row.kind === 'buttonsTop' ? edge('top', b.width) : row.kind === 'buttonsBottom' ? edge('bottom', b.width) : '│' + b.label + '│')],
-            }),
-          )
-          const used = formButtons(form).reduce((sum, b) => sum + b.width + 1, 0)
-          return Box({ flexDirection: 'row', children: [...faces, Text({ children: [' '.repeat(Math.max(0, columns - used))] })] })
-        }
+        case 'buttonsBottom':
+          return buttonRow(row.kind, formButtons(form))
         case 'error':
           return line(' ' + row.text, { color: 'error' })
         default:

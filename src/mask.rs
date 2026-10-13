@@ -158,15 +158,21 @@ impl Masker {
     }
 
     pub fn mask(&self, data: &[u8]) -> Vec<u8> {
+        self.mask_found(data).0
+    }
+
+    /// The masked data, and whether anything in it was masked.
+    pub fn mask_found(&self, data: &[u8]) -> (Vec<u8>, bool) {
+        let spans = self.spans(data);
         let mut out = Vec::with_capacity(data.len());
         let mut at = 0;
-        for (start, end) in self.spans(data) {
+        for &(start, end) in &spans {
             out.extend_from_slice(data.get(at..start).unwrap_or_default());
             out.extend_from_slice(MASK);
             at = end;
         }
         out.extend_from_slice(data.get(at..).unwrap_or_default());
-        out
+        (out, !spans.is_empty())
     }
 
     /// How many trailing bytes could still grow into a form.
@@ -187,6 +193,9 @@ impl Masker {
     /// How much of `data` can be masked and written now; the rest may still grow into a token holding a form.
     /// Idle, only a tail that could become a form is kept back.
     pub fn cut(&self, data: &[u8], idle: bool) -> usize {
+        if self.patterns.is_empty() {
+            return data.len();
+        }
         let mut cut = data.len() - self.partial(data);
         if !idle {
             let token_start = data.iter().rposition(|b| is_space(*b)).map_or(0, |at| at + 1);
@@ -251,5 +260,10 @@ mod tests {
         masker.add("hunter2");
         assert_eq!(masker.cut(b"first second", false), 6);
         assert_eq!(masker.cut(b"first second", true), 12);
+    }
+
+    #[test]
+    fn with_nothing_to_mask_everything_goes_out_at_once() {
+        assert_eq!(Masker::new(6).cut(b"first sec", false), 9);
     }
 }

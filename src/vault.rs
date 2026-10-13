@@ -50,7 +50,7 @@ pub enum Kind {
     Password,
     Token,
     SshKey,
-    /// A value typed into a request: kept only so masking and the tripwire know it, never handed out.
+    /// Written by earlier versions for every typed answer; the relay drops these entries when the vault opens.
     Typed,
 }
 

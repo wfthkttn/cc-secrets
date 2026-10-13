@@ -1,38 +1,15 @@
 import { expect, test } from 'claude-code/testing'
 
-import { carried, forms, holdsMask, Masker, mask, masksValues, remember } from '../hooks/mask'
-import cases from './mask-cases'
+import { holdsMask, stringsIn, withStrings } from '../hooks/mask'
 
-test('the shared cases: forms found, tokens widened, overlaps merged', async () => {
-  for (const c of cases) {
-    const masker = new Masker()
-    for (const value of c.values) if ([...value].length >= c.min) masker.add(value)
-    expect([c.input, masker.mask(c.input)]).toEqual([c.input, c.output])
-  }
+test("a tool result's strings go out and come back in place, the shape kept", async () => {
+  const result = { stdout: 'a', meta: [1, 'b', { c: 'c', d: null }], ok: true }
+  expect(stringsIn(result)).toEqual(['a', 'b', 'c'])
+  expect(withStrings(result, ['A', 'B', 'C'])).toEqual({ stdout: 'A', meta: [1, 'B', { c: 'C', d: null }], ok: true })
+  expect(withStrings('x', ['[secret]'])).toBe('[secret]')
 })
 
-test('every form of a value is as many characters as base64 makes of it or more', async () => {
-  for (const form of forms('hunter22')) expect(form.length >= 8).toBe(true)
-})
-
-test('a value at least the minimum long is masked; a shorter one is left as it is and arms nothing', async () => {
-  remember('pin1', 6, 'pin')
-  expect(masksValues()).toBe(false)
-  remember('swordfish', 6, 'fish')
-  expect(masksValues()).toBe(true)
-  expect(mask('swordfish and pin1')).toBe('[secret] and pin1')
-  expect(holdsMask(mask('swordfish'))).toBe(true)
-})
-
-test('the minimum counts characters, not bytes', async () => {
-  remember('ключик', 6, 'key')
-  expect(mask('a ключик')).toBe('a [secret]')
-})
-
-test('a text carrying a remembered value in any form names it; a short one is not watched', async () => {
-  remember('tok-554433', 6, 'Deploy (deploy)')
-  expect(carried('curl -H "Authorization: Bearer tok-554433" x')).toBe('Deploy (deploy)')
-  expect(carried(`echo ${btoa('user:tok-554433')}`)).toBe('Deploy (deploy)')
-  expect(carried('echo tok-5544')).toBe(null)
-  expect(carried('pin1 in a command')).toBe(null)
+test('masked text is recognised by its mark', async () => {
+  expect(holdsMask('pw=[secret] ok')).toBe(true)
+  expect(holdsMask('pw=secret')).toBe(false)
 })

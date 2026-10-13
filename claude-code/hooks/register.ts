@@ -1,14 +1,16 @@
-import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
+import type { EngineInterface, On, Timer } from 'claude-code'
 import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from 'sidebar'
 
-import { carried, holdsMask, masksValues, maskStrings, remember, stringsIn } from './mask'
+import { appliedText, SUGGESTED, withText } from './auto-mode'
+import type { ConfigMessage, ConfigProps } from './config-view-props'
+import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
-import type { RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
+import type { Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { fillSlot, hasSlot } from './slot'
-import { callOf, sourceOf, vaultDecision } from './source'
+import { askDecision, listDecision, requestSource, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
-import type { VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
+import type { SecretField, Suggestion, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
 const SIDEBAR_ID = 'pass'
 const DRAWER_SLOT: SidebarDrawerSlot = `sidebar-drawer:${SIDEBAR_ID}`
@@ -16,12 +18,14 @@ const POPOUT_SLOT: SidebarPopoutSlot = `sidebar-popout:${SIDEBAR_ID}`
 const LIST_KEY = 'requests'
 const POPOUT_KEY = 'popout'
 const VAULT_KEY = 'vault'
-/** Rows the vault view leaves at the room's bottom, which may be off screen or under the engine's pill. */
+const CONFIG_KEY = 'config'
+/** Rows the vault and config views leave at the room's bottom, which may be off screen or under the engine's pill. */
 const VAULT_SPARE_ROWS = 3
 const DRAWER_COLUMNS = 64
 const POPOUT_MS = 15000
 const NOTICE_MS = 10000
 const RELAY_START_MS = 5000
+const DEFAULT_MASK_MIN = 6
 const UNSEEN_PASTE = 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
 const WRITE_BACK = 'secrets: this would write [secret], a masked value, over the real one; edit around the masked span instead.'
 const ROW_COMPONENTS = [
@@ -35,20 +39,22 @@ const ROW_COMPONENTS = [
   'InfoNotice',
 ] as const satisfies readonly SidebarRowComponent[]
 
-type Ask = { id: string; prompt: string; pid: number; cmdline: string; kind: 'secret' | 'unlock' }
+type Granted = { id: string; name: string; tag: string; kind: string; use: 'session' | 'each'; allowed: boolean }
+type Asked = { id: string; prompt: string; tag: string | null; entry: Granted | null; pid: number; cmdline: string; inside: boolean }
+type Sign = Omit<Granted, 'id'> & { id: string; pid: number; cmdline: string; inside: boolean }
+type VaultList = { id: string; pid: number; cmdline: string; inside: boolean }
 type VaultState = 'absent' | 'locked' | 'open'
-type VaultGet = { id: string; tag: string; name: string; use: 'session' | 'each'; allowed: boolean; pid: number; cmdline: string }
-type VaultList = { id: string; pid: number; cmdline: string }
 type VaultEntry = ViewEntry & { created: number }
 type Decision = 'give' | 'session' | 'refuse'
 
 type RelayEvent =
   | { ready: string; vault: VaultState }
-  | { ask: Ask }
+  | { ask: Asked }
   | { gone: string }
-  | { get: VaultGet }
+  | { sign: Sign }
   | { list: VaultList }
-  | { vault: 'open' }
+  | { vault: VaultState }
+  | { masked: true }
   | { trouble: string }
 
 type Request = Omit<RequestEntry, 'length'>
@@ -57,21 +63,38 @@ type Request = Omit<RequestEntry, 'length'>
 let requests: readonly Request[] = []
 /** Bash calls in flight, for a request's source command and the loop that made it. */
 const running: { id: string; command: string; agentId: string | undefined }[] = []
-/** What the relay last said of the vault; entries carry no values. */
-let vault: { state: VaultState; entries: readonly VaultEntry[]; forward: boolean | null } = { state: 'absent', entries: [], forward: null }
+/** What the relay last said of the vault; entries and suggestions carry no values. */
+let vault: { state: VaultState; entries: readonly VaultEntry[]; suggestions: readonly Suggestion[]; forward: boolean | null } = {
+  state: 'absent',
+  entries: [],
+  suggestions: [],
+  forward: null,
+}
 let drawerTab: Tab = 'requests'
-/** The vault form's value, typed or pasted; the view only learns its length. */
-let formValue = ''
-/** The last value edit applied per vault view instance; replaced, never changed in place. */
+/** The Vault tab's held fields, typed or pasted: an entry's value, the passphrase and its repeat; the view only learns their lengths. */
+let fields: Record<SecretField, string> = { value: '', passphrase: '', again: '' }
+/** The last field edit applied per vault view instance; replaced, never changed in place. */
 let vaultApplied: Record<string, number> = {}
 /** Bumped when a save or delete went through, which closes the form. */
 let formEpoch = 0
 let vaultError: string | null = null
-let vaultValueFocused = false
+let vaultFocused: SecretField | null = null
 let vaultFormOpen = false
 let relaySocket: string | null = null
-/** The `maskMinLength` option, read once the module registers. */
-let maskMinLength = 0
+/** Masking replaced something this session, so `[secret]` in content may be a masked read. */
+let hasMasked = false
+/** The Config tab's options, in the plugin's store: changing them doesn't reload the module and its relay. */
+let maskMinLength = DEFAULT_MASK_MIN
+let unlockAtStart = true
+/** The user's settings file, where the auto-mode line lives. */
+let settingsPath: string | null = null
+/** The auto-mode text being edited, typed or pasted; the line in the settings now, null when there is none. */
+let configDraft = ''
+let configApplied: string | null = null
+/** The last text edit applied per config view instance; replaced, never changed in place. */
+let configConfirmed: Record<string, number> = {}
+let configError: string | null = null
+let configTextFocused = false
 let focusEpoch = 0
 /** The value typed or pasted for each request; the lists only learn its length. */
 const held = new Map<string, string>()
@@ -119,12 +142,15 @@ function unsay($: EngineInterface, evenSticky: boolean) {
   syncPopout($)
 }
 
-export function register(on: On, options: PluginOptions) {
-  if (typeof options.maskMinLength !== 'number') {
-    throw new Error('secrets: the maskMinLength option is not a number')
-  }
-  maskMinLength = options.maskMinLength
+/** An option from the plugin's store, its default when never set; a stored value of the wrong type is an error. */
+async function option<T extends number | boolean>($: EngineInterface, key: string, fallback: T): Promise<T> {
+  const stored = await $.store.get(key)
+  if (stored === undefined) return fallback
+  if (typeof stored !== typeof fallback) throw new Error(`secrets: the stored ${key} is not a ${typeof fallback}`)
+  return stored as T
+}
 
+export function register(on: On) {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
@@ -133,6 +159,8 @@ export function register(on: On, options: PluginOptions) {
     // A reload starts with no requests and a new relay; the host still shows what the old module set.
     await $.sidebar.badge({ id: SIDEBAR_ID, count: 0, level: 'urgent' })
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
+    maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
+    unlockAtStart = await option($, 'unlockAtStart', true)
 
     const runtimeDir = await $.env.get('XDG_RUNTIME_DIR')
     if (!runtimeDir) {
@@ -145,61 +173,77 @@ export function register(on: On, options: PluginOptions) {
     if (agent && !agent.startsWith(`${runtimeDir}/claude-secrets-`)) await $.env.set('SECRETS_ORIG_SSH_AUTH_SOCK', agent)
     const upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
     // Commands see the relay only once it listens: before, secrets-mask-run would let their output through unmasked.
-    vault = { state: await startRelay($, socket, upstream), entries: [], forward: upstream === '' ? null : false }
+    vault = { state: await startRelay($, socket, upstream), entries: [], suggestions: [], forward: upstream === '' ? null : false }
+    await sendSettings($)
     await $.env.set('SSH_AUTH_SOCK', socket + '.agent')
-    const helper = $.plugin.root + '/bin/secrets-ask'
+    const askpass = $.plugin.root + '/bin/secrets-askpass'
     await $.env.set('SECRETS_RELAY', socket)
-    await $.env.set('ASK_SECRET', helper)
-    await $.env.set('SECRETS_VAULT', $.plugin.root + '/bin/secrets-vault')
-    await $.env.set('SUDO_ASKPASS', helper)
-    await $.env.set('SSH_ASKPASS', helper)
+    await $.env.set('SUDO_ASKPASS', askpass)
+    await $.env.set('SSH_ASKPASS', askpass)
     await $.env.set('SSH_ASKPASS_REQUIRE', 'force')
-    await $.env.set('GIT_ASKPASS', helper)
-    const maskRun = $.plugin.root + '/bin/secrets-mask-run'
+    await $.env.set('GIT_ASKPASS', askpass)
+    const bin = $.plugin.root + '/bin'
+    const path = (await $.env.get('PATH')) ?? ''
+    // On a reload the plugin's bin leads PATH already.
+    if (!path.startsWith(bin + ':')) await $.env.set('PATH', `${bin}:${path}`)
+    const maskRun = bin + '/secrets-mask-run'
     const prefix = await $.env.get('CLAUDE_CODE_SHELL_PREFIX')
     // On a reload the prefix is already ours; the one found first is the user's.
     if (prefix && prefix !== maskRun) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
-    await $.env.set('SECRETS_MASK_MIN', String(maskMinLength))
     await $.env.set('CLAUDE_CODE_SHELL_PREFIX', maskRun)
-    // Unlocked from the start, the vault's values are masked and watched in every call of the session.
-    if (vault.state === 'locked') await callRelay($, 'POST', '/unlock', {})
+    if (unlockAtStart && vault.state === 'locked') {
+      drawerTab = 'vault'
+      await $.sidebar.select({ id: SIDEBAR_ID })
+    }
+    const home = await $.env.get('HOME')
+    if (!home) throw new Error('secrets: HOME is not set, so the settings file for the auto-mode line is unknown')
+    settingsPath = `${home}/.claude/settings.json`
+    await readAutoMode($)
+    configDraft = configApplied ?? SUGGESTED
     return started
   })
 
   on('tool.call', async ($, e, next) => {
     const { tool: _tool, tool_use_id: _id, agentId: _agent, ...input } = e
-    const label = stringsIn(input).map(carried).find(l => l !== null)
-    if (label !== undefined) {
-      say($, `Stopped a ${e.tool} call carrying ${label}. If the agent got it outside the vault, rotate it.`, true)
-      return { deny: `secrets: this call carries the value of ${label}, so it did not run. Use secrets through $SECRETS_VAULT or $ASK_SECRET; never write a value.` }
+    if (vault.state === 'open') {
+      const { label } = (await relayJson($, '/check', { texts: stringsIn(input) })) as { label: string | null }
+      if (label !== null) {
+        say($, `Stopped a ${e.tool} call carrying ${label}. If the agent got it outside the vault, rotate it.`, true)
+        return { deny: `secrets: this call carries the value of ${label}, so it did not run. Use secrets through \`secrets ask\`; never write a value.` }
+      }
     }
     const written =
       e.tool === 'Write' ? e.content : e.tool === 'Edit' ? e.new_string : e.tool === 'NotebookEdit' ? e.new_source : e.tool === 'Bash' ? e.command : null
-    if (written !== null && masksValues() && holdsMask(written)) return { deny: WRITE_BACK }
-    if (e.tool !== 'Bash') return maskStrings(await next(e))
+    if (written !== null && hasMasked && holdsMask(written)) return { deny: WRITE_BACK }
+    if (e.tool !== 'Bash') return maskResult($, await next(e))
     running.push({ id: e.tool_use_id, command: e.command, agentId: e.agentId })
     try {
-      return maskStrings(await next(e))
+      return maskResult($, await next(e))
     } finally {
       running.splice(running.findIndex(r => r.id === e.tool_use_id), 1)
     }
   }).catch(() => ({ deny: 'secrets: masking this tool call failed, so its result is withheld' }))
 
   on('ui.message', async ($, e, next) => {
-    if (e.element === VAULT_KEY) {
+    if (e.element === VAULT_KEY || e.element === CONFIG_KEY) {
       if (!listFocused) draftAtFocus = (await $.prompt.read()).text
       listFocused = true
-      await onVaultMessage($, e.data as VaultMessage)
+      if (e.element === VAULT_KEY) await onVaultMessage($, e.data as VaultMessage)
+      else await onConfigMessage($, e.data as ConfigMessage)
+      // The settings may have changed since the tab last showed them.
+      if (drawerTab === 'config' && e.element !== CONFIG_KEY) await readAutoMode($)
       $.ui.invalidate('ui.render')
       return next(e)
     }
     if (e.element !== LIST_KEY && e.element !== POPOUT_KEY) return next(e)
     const message = e.data as RequestsMessage
-    if (message.tab === 'vault') drawerTab = 'vault'
+    if (message.tab !== undefined) drawerTab = message.tab
+    if (message.tab === 'config') await readAutoMode($)
     unsay($, message.dismiss === true)
     if (!listFocused) draftAtFocus = (await $.prompt.read()).text
     listFocused = true
-    vaultValueFocused = false
+    vaultFocused = null
+    configTextFocused = false
     listSelected = message.selected
     livePopouts().focus(message.selected)
     const last = applied[message.instance] ?? 0
@@ -208,7 +252,7 @@ export function register(on: On, options: PluginOptions) {
       applied = { ...applied, [message.instance]: edit.seq }
       const request = requests.find(r => r.id === edit.id)
       if (request === undefined) continue
-      if (request.kind === 'grant') {
+      if (request.kind === 'sign') {
         const decisions: Partial<Record<typeof edit.kind, Decision>> = { session: 'session', once: 'give', cancel: 'refuse' }
         const decision = decisions[edit.kind]
         if (decision !== undefined) await decideRequest($, edit.id, decision)
@@ -220,6 +264,9 @@ export function register(on: On, options: PluginOptions) {
       else if (edit.kind === 'clear') held.set(edit.id, '')
       else if (edit.kind === 'submit') await answerRequest($, request, { secret: value })
       else if (edit.kind === 'cancel') await answerRequest($, request, { cancel: true })
+      else if ((edit.kind === 'session' || edit.kind === 'once') && edit.entry !== null) {
+        await answerRequest($, request, { entry: edit.entry, session: edit.kind === 'session' })
+      }
     }
     $.ui.invalidate('ui.render')
     return next(e)
@@ -238,8 +285,10 @@ export function register(on: On, options: PluginOptions) {
       return next(e)
     }
     // While the list holds the keyboard, keys go to it; a key-less edit reaching the prompt is a paste.
-    if (listFocused && vaultValueFocused && e.inputText !== '') {
-      formValue += e.inputText.replace(/\r?\n$/, '')
+    if (listFocused && (vaultFocused !== null || configTextFocused) && e.inputText !== '') {
+      const pasted = e.inputText.replace(/\r?\n$/, '')
+      if (vaultFocused !== null) fields = { ...fields, [vaultFocused]: fields[vaultFocused] + pasted }
+      else configDraft += pasted.replace(/\r?\n/g, ' ')
       $.ui.invalidate('ui.render')
       return { text: e.text, cursor: e.cursor }
     }
@@ -273,10 +322,10 @@ export function register(on: On, options: PluginOptions) {
       { prompt: "Password for 'https://alex@git.example.org'", source: 'git push origin main' },
       {
         prompt: 'deploy token',
-        source: 'TOKEN=$($ASK_SECRET "deploy token") && curl -fsS -H "Authorization: Bearer $TOKEN" https://deploy.example.org/api/v1/releases --data @release.json',
+        source: 'TOKEN=$(secrets ask "deploy token") && curl -fsS -H "Authorization: Bearer $TOKEN" https://deploy.example.org/api/v1/releases --data @release.json',
       },
     ]
-    for (const sample of samples) await addRequest($, { id: 'demo-' + randomId(), kind: 'secret', ...sample, since: clockTime() })
+    for (const sample of samples) await addRequest($, { id: 'demo-' + randomId(), kind: 'secret', ...sample, since: clockTime(), offer: null })
     await syncBadge($)
     return {}
   })
@@ -309,22 +358,43 @@ export function register(on: On, options: PluginOptions) {
       const props: VaultProps = {
         state: vault.state,
         entries: vault.entries.map(({ created: _created, ...entry }) => entry),
-        forward: vault.forward,
+        suggestions: [...vault.suggestions],
         tabs,
         columns,
         rows: height,
         applied: vaultApplied,
-        valueLength: [...formValue].length,
+        lengths: { value: [...fields.value].length, passphrase: [...fields.passphrase].length, again: [...fields.again].length },
         formEpoch,
         error: vaultError,
       }
       return Client({ key: VAULT_KEY, module: './vault-view.ts', props, width: columns, height })
     }
+    const configView = (columns: number, rows: number, tabs: Tabs) => {
+      const height = rows - VAULT_SPARE_ROWS
+      const props: ConfigProps = {
+        tabs,
+        columns,
+        rows: height,
+        draft: configDraft,
+        applied: configApplied,
+        confirmed: configConfirmed,
+        unlockAtStart,
+        maskMinLength,
+        forward: vault.forward,
+        error: configError,
+      }
+      return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })
+    }
     let filled = tree
     if (inDrawer) {
       const columns = DRAWER_COLUMNS - room.drawerFrameColumns
-      const tabs: Tabs = { active: drawerTab, requests: requests.length, vaultMark: vault.entries.some(e => e.kind === 'typed') }
-      const drawn = () => (drawerTab === 'vault' ? vaultView(columns, room.drawer, tabs) : list(LIST_KEY, requests, columns, room.drawer, tabs))
+      const tabs: Tabs = { active: drawerTab, requests: requests.length, vaultMark: vault.suggestions.length > 0 }
+      const drawn = () =>
+        drawerTab === 'vault'
+          ? vaultView(columns, room.drawer, tabs)
+          : drawerTab === 'config'
+            ? configView(columns, room.drawer, tabs)
+            : list(LIST_KEY, requests, columns, room.drawer, tabs)
       filled = fillSlot(filled, DRAWER_SLOT, drawn) as typeof tree
     }
     if (inPopout) {
@@ -369,9 +439,10 @@ async function readRelay($: EngineInterface, socket: string, upstream: string, r
       if ('ready' in event) ready(event.vault)
       else if ('ask' in event) await onAsk($, event.ask)
       else if ('gone' in event) dropRequest(event.gone)
-      else if ('get' in event) await onVaultGet($, event.get)
-      else if ('list' in event) await decideRequest($, event.list.id, callOf(event.list.cmdline, running)?.agentId === undefined ? 'give' : 'refuse')
+      else if ('sign' in event) await onSign($, event.sign)
+      else if ('list' in event) await decideRequest($, event.list.id, listDecision(event.list, running))
       else if ('vault' in event) await refreshVault($)
+      else if ('masked' in event) hasMasked = true
       else say($, event.trouble, true)
       await syncBadge($)
     }
@@ -379,34 +450,55 @@ async function readRelay($: EngineInterface, socket: string, upstream: string, r
   throw new Error('the relay exited')
 }
 
-async function onAsk($: EngineInterface, ask: Ask) {
-  const source = ask.kind === 'unlock' ? '' : sourceOf(ask.cmdline || `pid ${ask.pid}`, running.map(r => r.command))
-  await addRequest($, { id: ask.id, kind: ask.kind, prompt: ask.prompt, source, since: clockTime() })
-  await $.ui.notify(ask.kind === 'unlock' ? ask.prompt : `Password needed: ${ask.prompt}`, { title: 'secrets' })
+/** The open vault's entries a request may be answered with, `first` leading; ssh keys answer signatures, not asks. */
+function offerOf(first: string | null): Offered[] {
+  const entries = vault.entries.filter(e => e.kind !== 'ssh-key')
+  const ordered = [...entries.filter(e => e.id === first), ...entries.filter(e => e.id !== first)]
+  return ordered.map(e => ({ id: e.id, label: `${e.name} · ${e.tag}` }))
 }
 
-async function onVaultGet($: EngineInterface, get: VaultGet) {
-  const decision = vaultDecision(get, running)
-  if (decision !== 'ask') return decideRequest($, get.id, decision)
-  const source = sourceOf(get.cmdline || `pid ${get.pid}`, running.map(r => r.command))
-  await addRequest($, { id: get.id, kind: 'grant', prompt: `${get.name} · ${get.tag}`, source, since: clockTime() })
-  await $.ui.notify(`Vault entry wanted: ${get.name}`, { title: 'secrets' })
+async function onAsk($: EngineInterface, ask: Asked) {
+  const decision = askDecision(ask, running)
+  const request: Request = {
+    id: ask.id,
+    kind: 'secret',
+    prompt: ask.prompt,
+    source: requestSource(ask, running.map(r => r.command)),
+    since: clockTime(),
+    offer: decision === 'card' && vault.state === 'open' ? offerOf(ask.entry?.id ?? null) : null,
+  }
+  if (decision === 'give' && ask.entry !== null) return answerRequest($, request, { entry: ask.entry.id, session: false })
+  await addRequest($, request)
+  await $.ui.notify(`Password needed: ${ask.prompt}`, { title: 'secrets' })
 }
 
-/** Takes in the vault's entries and remembers every value for masking and the tripwire. */
+async function onSign($: EngineInterface, sign: Sign) {
+  const decision = signDecision(sign, running)
+  if (decision !== 'ask') return decideRequest($, sign.id, decision)
+  const source = requestSource(sign, running.map(r => r.command))
+  await addRequest($, { id: sign.id, kind: 'sign', prompt: `${sign.name} · ${sign.tag}`, source, since: clockTime(), offer: null })
+  await $.ui.notify(`Vault key wanted: ${sign.name}`, { title: 'secrets' })
+}
+
+/** Takes in what the vault shows: entries and suggestions, never a value. */
 async function refreshVault($: EngineInterface) {
-  const reply = await callRelay($, 'GET', '/vault', null)
-  if (reply === null) return
-  const shown = JSON.parse(reply.text) as { state: VaultState; entries: VaultEntry[]; values: string[]; forward: boolean; upstream: boolean }
-  shown.entries.forEach((entry, i) => remember(shown.values[i]!, maskMinLength, `${entry.name} (${entry.tag})`))
-  vault = { state: shown.state, entries: shown.entries, forward: shown.upstream ? shown.forward : null }
+  const shown = (await relayJson($, '/vault', null)) as {
+    state: VaultState
+    entries: VaultEntry[]
+    suggestions: Suggestion[]
+    forward: boolean
+    upstream: boolean
+  }
+  vault = { state: shown.state, entries: shown.entries, suggestions: shown.suggestions, forward: shown.upstream ? shown.forward : null }
 }
 
-/** Lists the request; it pops out unless the drawer is open, which turns to it unless a vault form is open there. */
+/** Lists the request; it pops out unless the drawer is open, which turns to it unless the user is typing into another tab. */
 async function addRequest($: EngineInterface, request: Request) {
   requests = [...requests, request]
   if ((await $.sidebar.selected({})) !== SIDEBAR_ID) livePopouts().add(request.id)
-  else if (drawerTab === 'vault' && !vaultFormOpen) drawerTab = 'requests'
+  else if ((drawerTab === 'vault' && !vaultFormOpen && !(listFocused && vaultFocused !== null)) || (drawerTab === 'config' && !(listFocused && configTextFocused))) {
+    drawerTab = 'requests'
+  }
 }
 
 /** The relay's reply, or null after saying why there is none. */
@@ -423,74 +515,172 @@ async function callRelay($: EngineInterface, method: 'GET' | 'POST', path: strin
   }
 }
 
-async function answerRequest($: EngineInterface, request: Request, answer: { secret: string } | { cancel: true }) {
+/** A JSON reply the hooks can't go on without: GET with no body, else POST; throws naming the path when there is none. */
+async function relayJson($: EngineInterface, path: string, body: object | null): Promise<unknown> {
+  const reply = await callRelay($, body === null ? 'GET' : 'POST', path, body)
+  if (reply === null || reply.status !== 200) throw new Error(`secrets: the relay's ${path} answered ${reply?.status ?? 'nothing'}`)
+  return JSON.parse(reply.text)
+}
+
+/** The tool's result with the open vault's values masked; as it is while the vault is closed. */
+async function maskResult<T>($: EngineInterface, result: T): Promise<T> {
+  if (vault.state !== 'open') return result
+  const texts = stringsIn(result)
+  if (texts.length === 0) return result
+  const masked = (await relayJson($, '/mask', { texts })) as { texts: string[] }
+  return withStrings(result, masked.texts)
+}
+
+async function sendSettings($: EngineInterface) {
+  const reply = await callRelay($, 'POST', '/settings', { maskMinLength })
+  if (reply !== null && reply.status !== 204) throw new Error(`secrets: the relay refused the mask minimum ${maskMinLength} (${reply.status})`)
+}
+
+type Answer = { secret: string } | { cancel: true } | { entry: string; session: boolean }
+
+async function answerRequest($: EngineInterface, request: Request, answer: Answer) {
   const reply = await callRelay($, 'POST', '/answer', { id: request.id, ...answer })
   if (reply === null) return
   // 410: the asking program went away first.
   if (reply.status !== 204 && reply.status !== 410) {
-    say($, `Not answered: the relay answered ${reply.status}.`, true)
+    say($, `Not answered: ${reply.status === 409 ? reply.text : `the relay answered ${reply.status}`}.`, true)
     return
-  }
-  if (reply.status === 204 && 'secret' in answer) {
-    remember(answer.secret, maskMinLength, request.prompt)
-    if (request.kind === 'secret' && vault.state === 'open') say($, `Kept for masking: ${request.prompt}. Vault ▸ Typed makes it an entry.`, false)
   }
   dropRequest(request.id)
   await syncBadge($)
 }
 
 async function onVaultMessage($: EngineInterface, message: VaultMessage) {
-  vaultValueFocused = message.valueFocused && message.tab === undefined
+  vaultFocused = message.tab === undefined ? message.focused : null
   vaultFormOpen = message.formOpen && message.tab === undefined
-  if (message.tab === 'requests') drawerTab = 'requests'
+  configTextFocused = false
+  if (message.tab !== undefined) drawerTab = message.tab
   const last = vaultApplied[message.instance] ?? 0
   for (const edit of message.edits) {
     if (edit.seq <= last) continue
     vaultApplied = { ...vaultApplied, [message.instance]: edit.seq }
-    if (edit.kind === 'append') formValue += edit.text
-    else if (edit.kind === 'back') formValue = [...formValue].slice(0, -1).join('')
-    else {
-      formValue = ''
-      vaultError = null
-    }
+    const text = fields[edit.field]
+    const next = edit.kind === 'append' ? text + edit.text : edit.kind === 'back' ? [...text].slice(0, -1).join('') : ''
+    fields = { ...fields, [edit.field]: next }
+    if (edit.kind === 'clear') vaultError = null
   }
   const action = message.action
   if (action === undefined) return
-  if (action.kind === 'unlock') {
-    // The passphrase card waits in the requests.
-    drawerTab = 'requests'
-    await callRelay($, 'POST', '/unlock', {})
-  } else if (action.kind === 'allow') await changeVault($, { op: 'allow', id: action.id, allowed: action.allowed })
-  else if (action.kind === 'forward') await changeVault($, { op: 'forward', on: action.on })
+  if (action.kind === 'open') await openVault($)
+  else if (action.kind === 'allow') await changeVault($, { op: 'allow', id: action.id, allowed: action.allowed })
   else if (action.kind === 'delete') {
     if (await changeVault($, { op: 'delete', id: action.id })) closeForm()
+  } else if (action.kind === 'dismiss') {
+    if (await changeVault($, { op: 'dismiss', id: action.id })) closeForm()
   } else {
-    const { id, name, tag, kind, use } = action.form
+    const { id, suggestion, name, tag, kind, use } = action.form
     if (name.trim() === '') vaultError = 'Name it.'
-    else if (id === null && formValue === '') vaultError = 'A new entry needs a value.'
+    else if (suggestion !== null) {
+      if (await changeVault($, { op: 'save', id: suggestion, name, tag, kind, use })) closeForm()
+    } else if (id === null && fields.value === '') vaultError = 'A new entry needs a value.'
     else {
+      const value = fields.value
       const change =
         id === null
-          ? { op: 'add', name, tag, kind, use, value: formValue }
-          : { op: 'edit', id, name, kind, use, ...(tag === '' ? {} : { tag }), ...(formValue === '' ? {} : { value: formValue }) }
+          ? { op: 'add', name, tag, kind, use, value }
+          : { op: 'edit', id, name, kind, use, ...(tag === '' ? {} : { tag }), ...(value === '' ? {} : { value }) }
       if (await changeVault($, change)) closeForm()
     }
   }
 }
 
+/** Unlocks the vault with the typed passphrase, or creates it when there is none; the passphrase fields empty either way. */
+async function openVault($: EngineInterface) {
+  const create = vault.state === 'absent'
+  if (fields.passphrase === '') {
+    vaultError = 'Type the passphrase.'
+    return
+  }
+  if (create && fields.passphrase !== fields.again) {
+    vaultError = 'The two differ.'
+    fields = { ...fields, again: '' }
+    return
+  }
+  const reply = await callRelay($, 'POST', create ? '/create' : '/unlock', { passphrase: fields.passphrase })
+  fields = { ...fields, passphrase: '', again: '' }
+  if (reply === null) return
+  vaultError = reply.status === 204 ? null : reply.status === 403 ? 'Wrong passphrase.' : reply.text || `The relay answered ${reply.status}.`
+}
+
 /** True once the relay saved it; otherwise its reason shows in the form. */
 async function changeVault($: EngineInterface, change: object): Promise<boolean> {
+  vaultError = await relayChange($, change)
+  return vaultError === null
+}
+
+/** Null once the relay took the change, else why not; an unreachable relay says so itself. */
+async function relayChange($: EngineInterface, change: object): Promise<string | null> {
   const reply = await callRelay($, 'POST', '/vault', change)
-  if (reply === null) return false
-  vaultError = reply.status === 200 ? null : reply.text || `The relay answered ${reply.status}.`
-  return reply.status === 200
+  if (reply === null) return 'Not sent.'
+  return reply.status === 200 ? null : reply.text || `The relay answered ${reply.status}.`
+}
+
+async function onConfigMessage($: EngineInterface, message: ConfigMessage) {
+  configTextFocused = message.textFocused && message.tab === undefined
+  vaultFocused = null
+  if (message.tab !== undefined) drawerTab = message.tab
+  const last = configConfirmed[message.instance] ?? 0
+  for (const edit of message.edits) {
+    if (edit.seq <= last) continue
+    configConfirmed = { ...configConfirmed, [message.instance]: edit.seq }
+    if (edit.kind === 'append') configDraft += edit.text
+    else if (edit.kind === 'back') configDraft = [...configDraft].slice(0, -1).join('')
+    else configDraft = ''
+  }
+  const action = message.action
+  if (action === undefined) return
+  configError = null
+  if (action.kind === 'apply') await applyAutoMode($)
+  else if (action.kind === 'suggest') configDraft = SUGGESTED
+  else if (action.kind === 'forward') configError = await relayChange($, { op: 'forward', on: action.on })
+  else if (action.kind === 'unlockAtStart') {
+    await $.store.set('unlockAtStart', action.on)
+    unlockAtStart = action.on
+  } else {
+    await $.store.set('maskMinLength', action.value)
+    maskMinLength = action.value
+    await sendSettings($)
+  }
+}
+
+function liveSettingsPath(): string {
+  if (settingsPath === null) throw new Error('secrets: the settings file is used before session start')
+  return settingsPath
+}
+
+/** Takes in the line the settings hold now; a file that can't be read shows its reason. */
+async function readAutoMode($: EngineInterface) {
+  const path = liveSettingsPath()
+  try {
+    configApplied = (await $.fs.exists(path)) ? appliedText(await $.fs.read(path)) : null
+  } catch (error) {
+    configError = (error as Error).message
+  }
+}
+
+/** Writes the draft as the line into the user's settings, the rest of the file kept. */
+async function applyAutoMode($: EngineInterface) {
+  const path = liveSettingsPath()
+  try {
+    const before = (await $.fs.exists(path)) ? await $.fs.read(path) : '{}'
+    await $.fs.write(path, withText(before, configDraft))
+  } catch (error) {
+    configError = `Not applied: ${(error as Error).message}`
+    return
+  }
+  await readAutoMode($)
 }
 
 function closeForm() {
-  formValue = ''
+  fields = { ...fields, value: '' }
   formEpoch += 1
   vaultError = null
-  vaultValueFocused = false
+  vaultFocused = null
   vaultFormOpen = false
 }
 

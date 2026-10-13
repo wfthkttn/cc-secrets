@@ -1,9 +1,12 @@
-import type { Tabs } from './tabs'
+import type { Tab, Tabs } from './tabs'
+
+/** A vault entry a request can be answered with: no value. */
+export type Offered = { id: string; label: string }
 
 export type RequestEntry = {
   id: string
-  /** `secret` and `unlock` take a typed value; `grant` asks whether a command gets a vault entry. */
-  kind: 'secret' | 'unlock' | 'grant'
+  /** `secret` takes a typed value or, with `offer`, a vault entry; `sign` asks whether a command signs with a vault key. */
+  kind: 'secret' | 'sign'
   prompt: string
   /** The command the request came from, as far as the hooks could tell. */
   source: string
@@ -11,12 +14,15 @@ export type RequestEntry = {
   since: string
   /** The length of the value the hooks hold for it so far. */
   length: number
+  /** The open vault's entries to pick from, the tagged one first; null when the vault is closed or the asker may not have them. */
+  offer: Offered[] | null
 }
 
-/** One change to a request's value, numbered per list instance. */
+/** One change to a request's value, numbered per list instance; `session` and `once` answer with an entry. */
 export type Edit =
   | { seq: number; id: string; kind: 'append'; text: string }
-  | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' | 'session' | 'once' }
+  | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' }
+  | { seq: number; id: string; kind: 'session' | 'once'; entry: string | null }
 
 export type RequestsProps = {
   entries: RequestEntry[]
@@ -45,6 +51,6 @@ export type RequestsMessage = {
   edits: Edit[]
   /** The message's ✕ was clicked. */
   dismiss?: true
-  /** The Vault tab was clicked. */
-  tab?: 'vault'
+  /** Another tab was clicked. */
+  tab?: Tab
 }

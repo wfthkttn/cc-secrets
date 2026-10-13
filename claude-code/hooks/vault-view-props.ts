@@ -1,49 +1,55 @@
-import type { Tabs } from './tabs'
+import type { Tab, Tabs } from './tabs'
 
-export type EntryKind = 'password' | 'token' | 'ssh-key' | 'typed'
+export type EntryKind = 'password' | 'token' | 'ssh-key'
 export type EntryUse = 'session' | 'each'
 
 /** A vault entry as the view shows it: no value. */
 export type ViewEntry = { id: string; name: string; tag: string; kind: EntryKind; use: EntryUse; allowed: boolean }
 
-/** The add or edit form; `id` null adds. A typed entry edited here becomes a full entry. */
-export type Form = { id: string | null; name: string; tag: string; kind: Exclude<EntryKind, 'typed'>; use: EntryUse }
+/** A value typed this session that the open vault offers to keep: no value. */
+export type Suggestion = { id: string; prompt: string }
 
-/** One change to the form's value, numbered per view instance; the hooks hold the value. */
-export type ValueEdit = { seq: number; kind: 'append'; text: string } | { seq: number; kind: 'back' | 'clear' }
+/** The add or edit form; `id` null adds. With `suggestion`, it saves that suggestion's value as the new entry. */
+export type Form = { id: string | null; suggestion: string | null; name: string; tag: string; kind: EntryKind; use: EntryUse }
+
+/** The fields whose text the hooks hold: an entry's value, the passphrase and its repeat. */
+export type SecretField = 'value' | 'passphrase' | 'again'
+
+/** One change to a held field, numbered per view instance. */
+export type ValueEdit = { seq: number; field: SecretField; kind: 'append'; text: string } | { seq: number; field: SecretField; kind: 'back' | 'clear' }
 
 export type VaultAction =
   | { kind: 'save'; form: Form }
   | { kind: 'delete'; id: string }
+  | { kind: 'dismiss'; id: string }
   | { kind: 'allow'; id: string; allowed: boolean }
-  | { kind: 'unlock' }
-  | { kind: 'forward'; on: boolean }
+  /** Unlocks the vault, or creates it when there is none. */
+  | { kind: 'open' }
 
 export type VaultProps = {
   state: 'absent' | 'locked' | 'open'
   entries: ViewEntry[]
-  /** Whether the user's own ssh-agent keys are offered too; null when there is no agent of theirs. */
-  forward: boolean | null
+  suggestions: Suggestion[]
   tabs: Tabs
   columns: number
   rows: number
   /** The last value edit the hooks applied, per view instance. */
   applied: Record<string, number>
-  /** The length of the value the hooks hold for the form. */
-  valueLength: number
+  /** The length of each held field. */
+  lengths: Record<SecretField, number>
   /** A change closes the form: the hooks saved or deleted what it showed. */
   formEpoch: number
-  /** Why the last save or delete failed, shown in the form. */
+  /** Why the last save, delete or unlock failed. */
   error: string | null
 }
 
 export type VaultMessage = {
   instance: string
   edits: ValueEdit[]
-  /** The form's value field has the keyboard, so a paste belongs in it. */
-  valueFocused: boolean
+  /** The held field with the keyboard, where a paste belongs; null for none. */
+  focused: SecretField | null
   /** A form is open, which a turn to the Requests tab would drop. */
   formOpen: boolean
   action?: VaultAction
-  tab?: 'requests'
+  tab?: Tab
 }

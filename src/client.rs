@@ -8,6 +8,16 @@ pub struct Reply {
     pub body: Vec<u8>,
 }
 
+/// Asks the user for a secret, `tag` naming the vault entry they may pick; the value, or the reason there is none.
+pub fn ask(prompt: &str, tag: Option<&str>) -> Result<Vec<u8>, String> {
+    let reply = post("/ask", &serde_json::json!({ "prompt": prompt, "tag": tag }))?;
+    match reply.status.as_str() {
+        "200" => Ok(reply.body),
+        "403" => Err(format!("the user cancelled: {prompt}")),
+        status => Err(format!("the relay answered {status}")),
+    }
+}
+
 /// Posts `body` (JSON) to `path` and waits for the whole reply; the error names the relay and what failed.
 pub fn post(path: &str, body: &serde_json::Value) -> Result<Reply, String> {
     let Some(relay) = std::env::var_os("SECRETS_RELAY").filter(|v| !v.is_empty()) else {

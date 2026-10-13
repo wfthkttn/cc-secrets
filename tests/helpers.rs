@@ -1,4 +1,4 @@
-//! Runs secrets-relay, secrets-mask-run and secrets-ask together, without Claude Code.
+//! Runs secrets-relay, secrets-mask-run, secrets and secrets-askpass together, without Claude Code.
 // clippy.toml's test allowances reach #[test] functions, not this file's helpers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use secrets::vault::{Costs, Entry, Kind, Use, Vault};
+
 const RELAY: &str = env!("CARGO_BIN_EXE_secrets-relay");
 const MASK_RUN: &str = env!("CARGO_BIN_EXE_secrets-mask-run");
-const ASK: &str = env!("CARGO_BIN_EXE_secrets-ask");
-const VAULT: &str = env!("CARGO_BIN_EXE_secrets-vault");
+const SECRETS: &str = env!("CARGO_BIN_EXE_secrets");
+const ASKPASS: &str = env!("CARGO_BIN_EXE_secrets-askpass");
 
 struct Relay {
     child: Child,
@@ -56,19 +58,33 @@ impl Relay {
         Self { child, events, socket, vault }
     }
 
-    fn next_event(&mut self) -> serde_json::Value {
+    fn raw_event(&mut self) -> serde_json::Value {
         let mut line = String::new();
         self.events.read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
     }
 
-    /// Answers the next event, an ask of `kind`, with `secret`; the ask's prompt.
-    fn answer_ask(&mut self, kind: &str, secret: &str) -> String {
+    /// The next event but `{"masked": true}`, which comes whenever masking first finds something.
+    fn next_event(&mut self) -> serde_json::Value {
+        loop {
+            let event = self.raw_event();
+            if event != serde_json::json!({ "masked": true }) {
+                return event;
+            }
+        }
+    }
+
+    /// The next event, which must be an ask.
+    fn next_ask(&mut self) -> serde_json::Value {
         let event = self.next_event();
-        assert_eq!(event["ask"]["kind"], kind, "{event}");
-        let id = event["ask"]["id"].as_str().unwrap().to_owned();
-        assert_eq!(post(&self.socket, "/answer", &serde_json::json!({ "id": id, "secret": secret })), "204");
-        event["ask"]["prompt"].as_str().unwrap().to_owned()
+        assert!(event["ask"]["id"].is_string(), "{event}");
+        event["ask"].clone()
+    }
+
+    /// Waits for the relay's next ask and answers it with `secret`; the relay's status.
+    fn answer_next(&mut self, secret: &str) -> String {
+        let ask = self.next_ask();
+        post(&self.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": secret }))
     }
 
     /// Waits for the next decision event, `name`, and decides it; the event.
@@ -84,6 +100,15 @@ impl Relay {
         PathBuf::from(format!("{}.agent", self.socket.display()))
     }
 
+    /// Adds an entry; its id.
+    fn add(&mut self, name: &str, tag: &str, kind: &str, use_: &str, value: &str) -> String {
+        let added = serde_json::json!({ "op": "add", "name": name, "tag": tag, "kind": kind, "use": use_, "value": value });
+        let (status, body) = post_reply(&self.socket, "/vault", &added);
+        assert_eq!(status, "200", "{body}");
+        assert_eq!(self.next_event(), serde_json::json!({ "vault": "open" }));
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_owned()
+    }
+
     /// Adds an ssh key entry from a key file; the relay's status and reason.
     fn add_key(&mut self, tag: &str, file: &Path) -> (String, String) {
         let added = serde_json::json!({ "op": "add", "name": format!("{tag} key"), "tag": tag, "kind": "ssh-key", "use": "session", "value": file });
@@ -94,8 +119,9 @@ impl Relay {
         reply
     }
 
-    fn vault_cmd(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(VAULT);
+    /// `secrets` with `args`, run straight from the relay's parent: outside any call.
+    fn secrets(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(SECRETS);
         command.args(args).env("SECRETS_RELAY", &self.socket).stdout(Stdio::piped()).stderr(Stdio::piped());
         command
     }
@@ -109,29 +135,23 @@ impl Relay {
         (head.split(' ').nth(1).unwrap().to_owned(), serde_json::from_str(body).unwrap_or(serde_json::Value::Null))
     }
 
-    fn mask_run(&self, command: &str, env: &[(&str, &str)]) -> Command {
+    /// A call as Claude Code runs it: `$SECRETS` is the `secrets` command.
+    fn mask_run(&self, command: &str) -> Command {
         let mut run = Command::new(MASK_RUN);
         run.arg(command)
             .env("SECRETS_RELAY", &self.socket)
-            .env("ASK_SECRET", ASK)
-            .env("SECRETS_MASK_MIN", "6")
+            .env("SECRETS", SECRETS)
             .env_remove("SECRETS_ORIG_PREFIX")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (key, value) in env {
-            run.env(key, value);
-        }
         run
     }
 
-    /// Waits for the relay's next ask and answers it with `secret`; the relay's status.
-    fn answer_next(&mut self, secret: &str) -> String {
-        let mut line = String::new();
-        self.events.read_line(&mut line).unwrap();
-        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let id = event["ask"]["id"].as_str().unwrap().to_owned();
-        post(&self.socket, "/answer", &serde_json::json!({ "id": id, "secret": secret }))
+    fn create_vault(&mut self, passphrase: &str) {
+        assert_eq!(self.vault, "absent");
+        assert_eq!(post(&self.socket, "/create", &serde_json::json!({ "passphrase": passphrase })), "204");
+        assert_eq!(self.next_event(), serde_json::json!({ "vault": "open" }));
     }
 }
 
@@ -161,65 +181,81 @@ fn run(mut command: Command) -> Output {
     command.output().unwrap()
 }
 
-#[test]
-fn a_value_typed_mid_command_is_masked_on_both_streams_and_the_status_passes_through() {
-    let mut relay = Relay::start("typed");
-    let child = relay.mask_run(r#"x=$($ASK_SECRET "t1"); printf "got %s\n" "$x"; printf "%s" "$x" >&2; exit 3"#, &[]).spawn().unwrap();
-    assert_eq!(relay.answer_next("hunter2"), "204");
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "got [secret]\n");
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "[secret]");
-    assert_eq!(out.status.code(), Some(3));
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
-fn a_value_under_the_minimum_stays_and_without_a_minimum_every_value_is_masked() {
+fn a_value_typed_mid_command_is_masked_on_both_streams_and_the_status_passes_through() {
+    let mut relay = Relay::start("typed");
+    let child = relay.mask_run(r#"x=$("$SECRETS" ask t1); printf "got %s\n" "$x"; printf "%s" "$x" >&2; exit 3"#).spawn().unwrap();
+    let ask = relay.next_ask();
+    assert_eq!((ask["prompt"].as_str(), ask["inside"].as_bool(), ask["entry"].is_null()), (Some("t1"), Some(true), true));
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "hunter2" })), "204");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(stdout(&out), "got [secret]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "[secret]");
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(relay.raw_event(), serde_json::json!({ "masked": true }));
+}
+
+#[test]
+fn a_typed_value_is_forgotten_when_its_call_ends_and_other_calls_never_get_it() {
+    let mut relay = Relay::start("scoped");
+    let asking = relay.mask_run(r#"x=$("$SECRETS" ask t2); sleep 0.5; echo "$x""#).spawn().unwrap();
+    let ask = relay.next_ask();
+    let other = relay.mask_run("sleep 0.2; echo hunter2").spawn().unwrap();
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "hunter2" })), "204");
+    assert_eq!(stdout(&other.wait_with_output().unwrap()), "hunter2\n");
+    assert_eq!(stdout(&asking.wait_with_output().unwrap()), "[secret]\n");
+    assert_eq!(stdout(&run(relay.mask_run("echo hunter2"))), "hunter2\n");
+}
+
+#[test]
+fn a_value_under_the_minimum_stays_until_the_minimum_changes() {
     let mut relay = Relay::start("short");
-    let child = relay.mask_run(r#"x=$($ASK_SECRET "t2"); printf "%s and hunter2\n" "$x""#, &[]).spawn().unwrap();
+    let command = r#"x=$("$SECRETS" ask t3); printf "%s and hunter2\n" "$x""#;
+    let child = relay.mask_run(command).spawn().unwrap();
     assert_eq!(relay.answer_next("abc"), "204");
-    let child_out = child.wait_with_output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&child_out.stdout), "abc and hunter2\n");
-    let first = relay.mask_run(r#"x=$($ASK_SECRET "t3"); echo "$x""#, &[]).spawn().unwrap();
-    assert_eq!(relay.answer_next("hunter2"), "204");
-    first.wait_with_output().unwrap();
-    let out = run(relay.mask_run(r#"printf "abc""#, &[("SECRETS_MASK_MIN", "")]));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "[secret]");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("SECRETS_MASK_MIN"));
+    assert_eq!(stdout(&child.wait_with_output().unwrap()), "abc and hunter2\n");
+    assert_eq!(post(&relay.socket, "/settings", &serde_json::json!({ "maskMinLength": 1 })), "204");
+    let child = relay.mask_run(command).spawn().unwrap();
+    assert_eq!(relay.answer_next("abc"), "204");
+    assert_eq!(stdout(&child.wait_with_output().unwrap()), "[secret] and hunter2\n");
+    assert_eq!(post(&relay.socket, "/settings", &serde_json::json!({ "maskMinLength": 0 })), "400");
 }
 
 #[test]
 fn split_values_encoded_forms_and_glued_tokens_are_masked() {
     let mut relay = Relay::start("forms");
-    let child = relay.mask_run(r#"x=$($ASK_SECRET "t4"); echo "$x" > /dev/null"#, &[]).spawn().unwrap();
-    assert_eq!(relay.answer_next("hunter2"), "204");
-    child.wait_with_output().unwrap();
     let cases = [
         (r#"printf "hun"; sleep 0.3; printf "ter2 and hunt"; sleep 0.3; printf "er2\n""#, "[secret] and [secret]\n"),
         (r#"printf "hunt""#, "hunt"),
-        (r#"printf "auth: %s\n" "$(printf "alex:%s" hunter2 | base64)""#, "auth: [secret]\n"),
-        (r#"printf "pw=hunter2;rest more\n""#, "[secret] more\n"),
+        (r#"printf "auth: %s\n" "$(printf "alex:%s" "$x" | base64)""#, "auth: [secret]\n"),
+        (r#"printf "pw=%s;rest more\n" "$x""#, "[secret] more\n"),
     ];
     for (command, want) in cases {
-        let out = run(relay.mask_run(command, &[]));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{command}");
+        let child = relay.mask_run(&format!(r#"x=$("$SECRETS" ask t4); {command}"#)).spawn().unwrap();
+        assert_eq!(relay.answer_next("hunter2"), "204");
+        assert_eq!(stdout(&child.wait_with_output().unwrap()), want, "{command}");
     }
-    let out = run(relay.mask_run(r#"printf "\000\377binary""#, &[]));
+    let out = run(relay.mask_run(r#"printf "\000\377binary""#));
     assert_eq!(out.stdout, b"\x00\xffbinary");
 }
 
 #[test]
 fn output_flows_while_the_command_runs() {
     let relay = Relay::start("flow");
-    let mut child = relay.mask_run("printf 'Enter: '; sleep 2; echo done", &[]).spawn().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
+    let mut child = relay.mask_run("printf 'Enter: '; sleep 2; echo done").spawn().unwrap();
+    let mut out = child.stdout.take().unwrap();
     let started = Instant::now();
     let mut first = [0u8; 7];
-    stdout.read_exact(&mut first).unwrap();
+    out.read_exact(&mut first).unwrap();
     assert_eq!(&first, b"Enter: ");
     assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
     child.wait().unwrap();
 
-    let mut echo = relay.mask_run(r#"while read -r line; do printf "%s\n" "$line"; done"#, &[]).stdin(Stdio::piped()).spawn().unwrap();
+    let mut echo = relay.mask_run(r#"while read -r line; do printf "%s\n" "$line"; done"#).stdin(Stdio::piped()).spawn().unwrap();
     let mut stdin = echo.stdin.take().unwrap();
     stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n").unwrap();
     let mut line = String::new();
@@ -232,121 +268,142 @@ fn output_flows_while_the_command_runs() {
 #[test]
 fn a_signal_ends_it_as_128_plus_the_signal() {
     let relay = Relay::start("signal");
-    let out = run(relay.mask_run("kill -TERM $$", &[]));
+    let out = run(relay.mask_run("kill -TERM $$"));
     assert_eq!(out.status.code(), Some(128 + 15));
 }
 
 #[test]
 fn without_a_relay_the_command_still_runs_and_says_so() {
     let out = Command::new(MASK_RUN).arg("echo hunter2").env("SECRETS_RELAY", "/nonexistent/relay.sock").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "hunter2\n");
+    assert_eq!(stdout(&out), "hunter2\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("not masked"));
 }
 
 #[test]
-fn only_mask_run_started_by_the_relays_parent_gets_the_values() {
+fn only_mask_run_started_by_the_relays_parent_gets_a_filter() {
     let mut relay = Relay::start("peer");
-    let child = relay.mask_run(r#"x=$($ASK_SECRET "t5"); echo "$x" > /dev/null"#, &[]).spawn().unwrap();
+    let nested = format!(r#"x=$("$SECRETS" ask t5); '{MASK_RUN}' "echo $x""#);
+    let child = relay.mask_run(&nested).spawn().unwrap();
     assert_eq!(relay.answer_next("hunter2"), "204");
-    child.wait_with_output().unwrap();
-    let nested = format!("'{MASK_RUN}' 'echo hunter2'");
-    let out = run(relay.mask_run(&nested, &[]));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "[secret]\n");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(stdout(&out), "[secret]\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("refused"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
 fn a_cancelled_ask_exits_1_with_a_line() {
     let mut relay = Relay::start("cancel");
-    let child = Command::new(ASK).arg("deploy token").env("SECRETS_RELAY", &relay.socket).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    let mut line = String::new();
-    relay.events.read_line(&mut line).unwrap();
-    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(event["ask"]["prompt"], "deploy token");
-    let id = event["ask"]["id"].as_str().unwrap();
-    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": id, "cancel": true })), "204");
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "secrets-ask: the user cancelled: deploy token\n");
-    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": id, "secret": "late" })), "410");
-}
-
-/// Creates a vault through the passphrase asks, as the hooks would.
-fn create_vault(relay: &mut Relay, passphrase: &str) {
-    assert_eq!(relay.vault, "absent");
-    assert_eq!(post(&relay.socket, "/unlock", &serde_json::json!({})), "204");
-    assert_eq!(relay.answer_ask("unlock", passphrase), "New vault passphrase");
-    assert_eq!(relay.answer_ask("unlock", "typo"), "New vault passphrase, again");
-    assert_eq!(relay.answer_ask("unlock", passphrase), "Passphrases differed; new vault passphrase");
-    relay.answer_ask("unlock", passphrase);
-    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }));
+    for (program, args, line) in [
+        (SECRETS, &["ask", "deploy", "token"][..], "secrets: the user cancelled: deploy token\n"),
+        (ASKPASS, &["deploy token"][..], "secrets-askpass: the user cancelled: deploy token\n"),
+    ] {
+        let child = Command::new(program).args(args).env("SECRETS_RELAY", &relay.socket).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let ask = relay.next_ask();
+        assert_eq!(ask["prompt"], "deploy token");
+        assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "cancel": true })), "204");
+        let out = child.wait_with_output().unwrap();
+        assert_eq!((out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned()), (Some(1), line.to_owned()));
+        assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "late" })), "410");
+    }
 }
 
 #[test]
-fn a_new_vault_hands_an_entry_out_as_decided_and_masks_it() {
+fn an_open_vault_hands_a_tagged_entry_out_as_decided_and_masks_it_everywhere() {
     let data = data_dir("vault");
     let mut relay = Relay::start_in("vault", &data);
-    create_vault(&mut relay, "correct horse");
+    relay.create_vault("correct horse");
     let file = data.join("secrets/vault");
     assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-    let added = serde_json::json!({ "op": "add", "name": "Prod DB", "tag": "db", "kind": "password", "use": "session", "value": "hunter22x" });
-    assert_eq!(post_reply(&relay.socket, "/vault", &added).0, "200");
-    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }));
-    assert_eq!(post_reply(&relay.socket, "/vault", &added), ("400".to_owned(), "tag db is taken or not made of letters, digits, - _ .".to_owned()));
+    let id = relay.add("Prod DB", "db", "password", "session", "hunter22x");
+    let again = serde_json::json!({ "op": "add", "name": "Prod DB", "tag": "db", "kind": "password", "use": "session", "value": "x" });
+    assert_eq!(post_reply(&relay.socket, "/vault", &again), ("400".to_owned(), "tag db is taken or not made of letters, digits, - _ .".to_owned()));
     assert!(memchr::memmem::find(&std::fs::read(&file).unwrap(), b"hunter22x").is_none());
 
-    let first = relay.vault_cmd(&["get", "db"]).spawn().unwrap();
-    let event = relay.decide_next("get", "session");
-    assert_eq!((event["tag"].as_str(), event["allowed"].as_bool()), (Some("db"), Some(false)));
-    assert_eq!(String::from_utf8_lossy(&first.wait_with_output().unwrap().stdout), "hunter22x\n");
-    let second = relay.vault_cmd(&["get", "db"]).spawn().unwrap();
-    assert_eq!(relay.decide_next("get", "give")["allowed"], true);
-    assert_eq!(String::from_utf8_lossy(&second.wait_with_output().unwrap().stdout), "hunter22x\n");
+    let first = relay.secrets(&["ask", "--tag", "db", "Prod DB password"]).spawn().unwrap();
+    let ask = relay.next_ask();
+    assert_eq!((ask["entry"]["id"].as_str(), ask["entry"]["allowed"].as_bool(), ask["inside"].as_bool()), (Some(id.as_str()), Some(false), Some(false)));
+    assert!(ask["cmdline"].as_str().unwrap().ends_with("secrets ask --tag db Prod DB password"), "{ask}");
+    let picked = serde_json::json!({ "id": ask["id"], "entry": id, "session": true });
+    assert_eq!(post(&relay.socket, "/answer", &picked), "204");
+    assert_eq!(stdout(&first.wait_with_output().unwrap()), "hunter22x\n");
+    let second = relay.secrets(&["ask", "--tag", "db", "Prod DB password"]).spawn().unwrap();
+    assert_eq!(relay.next_ask()["entry"]["allowed"], true);
+    drop(second);
 
-    let list = relay.vault_cmd(&["list"]).spawn().unwrap();
+    let unknown = relay.secrets(&["ask", "--tag", "nope", "x"]).spawn().unwrap();
+    assert!(relay.next_ask()["entry"].is_null());
+    drop(unknown);
+
+    let list = relay.secrets(&["list"]).spawn().unwrap();
     relay.decide_next("list", "give");
-    assert_eq!(String::from_utf8_lossy(&list.wait_with_output().unwrap().stdout), "db\tpassword\tsession\tallowed\tProd DB\n");
-    let missing = run(relay.vault_cmd(&["get", "nope"]));
-    assert_eq!(String::from_utf8_lossy(&missing.stderr), "secrets-vault: no entry tagged nope\n");
-    let out = run(relay.mask_run("echo the db password is hunter22x", &[]));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "the db password is [secret]\n");
+    assert_eq!(stdout(&list.wait_with_output().unwrap()), "db\tpassword\tsession\tallowed\tProd DB\n");
+    assert_eq!(stdout(&run(relay.mask_run("echo the db password is hunter22x"))), "the db password is [secret]\n");
+    let masked = post_reply(&relay.socket, "/mask", &serde_json::json!({ "texts": ["pw hunter22x here", "plain"] })).1;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&masked).unwrap(), serde_json::json!({ "texts": ["pw [secret] here", "plain"] }));
+    let carried = post_reply(&relay.socket, "/check", &serde_json::json!({ "texts": ["curl -u alex:hunter22x https://db"] })).1;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&carried).unwrap(), serde_json::json!({ "label": "Prod DB (db)" }));
     drop(relay);
     std::fs::remove_dir_all(&data).unwrap();
 }
 
 #[test]
-fn a_saved_vault_unlocks_after_a_wrong_passphrase_and_keeps_typed_values_for_masking_only() {
-    let data = data_dir("reopen");
-    let mut relay = Relay::start_in("reopen", &data);
-    create_vault(&mut relay, "pass phrase");
-    let added = serde_json::json!({ "op": "add", "name": "API", "tag": "api", "kind": "token", "use": "each", "value": "tok-998877" });
-    assert_eq!(post_reply(&relay.socket, "/vault", &added).0, "200");
-    relay.next_event();
-    let typed = relay.mask_run(r#"x=$($ASK_SECRET "sudo pw"); echo "$x" > /dev/null"#, &[]).spawn().unwrap();
-    assert_eq!(relay.answer_ask("secret", "typed-secret-1"), "sudo pw");
-    typed.wait_with_output().unwrap();
-    drop(relay);
-
-    let mut relay = Relay::start_in("reopen", &data);
-    assert_eq!(relay.vault, "locked");
-    let refused = relay.vault_cmd(&["get", "api"]).spawn().unwrap();
-    assert_eq!(relay.answer_ask("unlock", "wrong"), "Vault passphrase");
-    assert_eq!(relay.answer_ask("unlock", "pass phrase"), "Vault passphrase: wrong, again");
+fn a_value_typed_while_the_vault_is_open_is_only_suggested_and_kept_when_saved() {
+    let data = data_dir("suggest");
+    let mut relay = Relay::start_in("suggest", &data);
+    relay.create_vault("pass phrase");
+    let child = relay.mask_run(r#"x=$("$SECRETS" ask "sudo pw"); echo "$x" > /dev/null"#).spawn().unwrap();
+    assert_eq!(relay.answer_next("typed-secret-1"), "204");
     assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }));
-    assert_eq!(relay.decide_next("get", "refuse")["use"], "each");
-    let out = refused.wait_with_output().unwrap();
-    assert_eq!((out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned()), (Some(1), "secrets-vault: refused: api\n".to_owned()));
+    child.wait_with_output().unwrap();
+    let (_, shown) = relay.get("/vault");
+    assert_eq!(shown["entries"], serde_json::json!([]));
+    assert_eq!(shown["suggestions"][0]["prompt"], "sudo pw");
+    assert!(!shown.to_string().contains("typed-secret-1"));
+    assert_eq!(stdout(&run(relay.mask_run("echo typed-secret-1"))), "[secret]\n");
 
-    let (status, shown) = relay.get("/vault");
-    assert_eq!((status.as_str(), shown["state"].as_str()), ("200", Some("open")));
-    let kinds: Vec<_> = shown["entries"].as_array().unwrap().iter().map(|e| (e["kind"].as_str().unwrap(), e["name"].as_str().unwrap())).collect();
-    assert_eq!(kinds, [("token", "API"), ("typed", "sudo pw")]);
-    assert!(shown.to_string().contains("typed-secret-1"));
-    let typed_tag = shown["entries"][1]["tag"].as_str().unwrap().to_owned();
-    assert_eq!(String::from_utf8_lossy(&run(relay.vault_cmd(&["get", &typed_tag])).stderr), format!("secrets-vault: no entry tagged {typed_tag}\n"));
-    let out = run(relay.mask_run("echo typed-secret-1 tok-998877", &[]));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "[secret] [secret]\n");
+    let save = serde_json::json!({ "op": "save", "id": shown["suggestions"][0]["id"], "name": "sudo", "tag": "sudo", "kind": "password", "use": "each" });
+    assert_eq!(post(&relay.socket, "/vault", &save), "200");
+    relay.next_event();
+    let (_, shown) = relay.get("/vault");
+    assert_eq!((shown["entries"][0]["tag"].as_str(), shown["suggestions"].as_array().map(Vec::len)), (Some("sudo"), Some(0)));
     drop(relay);
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn a_closed_vault_offers_nothing_and_opens_only_with_its_passphrase() {
+    let data = data_dir("closed");
+    std::fs::create_dir_all(data.join("secrets")).unwrap();
+    let costs = Costs { memory_kib: 64, time: 1, lanes: 1 };
+    let mut vault = Vault::create(b"pass phrase", costs).unwrap();
+    for (tag, kind, value) in [("api", Kind::Token, "tok-998877"), ("typed-1", Kind::Typed, "old-typed-value")] {
+        vault.entries.push(Entry { id: tag.to_owned(), name: tag.to_owned(), tag: tag.to_owned(), kind, use_: Use::Each, value: value.to_owned(), created: 0 });
+    }
+    let file = data.join("secrets/vault");
+    vault.save(&file).unwrap();
+
+    let mut relay = Relay::start_in("closed", &data);
+    assert_eq!(relay.vault, "locked");
+    let refused = run(relay.secrets(&["list"]));
+    assert_eq!(String::from_utf8_lossy(&refused.stderr), "secrets: the vault is closed\n");
+    let asking = relay.secrets(&["ask", "--tag", "api", "API token"]).spawn().unwrap();
+    let ask = relay.next_ask();
+    assert!(ask["entry"].is_null(), "{ask}");
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "entry": "api" })), "409");
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "typed-now" })), "204");
+    assert_eq!(stdout(&asking.wait_with_output().unwrap()), "typed-now\n");
+    assert_eq!(stdout(&run(relay.mask_run("echo tok-998877"))), "tok-998877\n");
+
+    assert_eq!(post_reply(&relay.socket, "/unlock", &serde_json::json!({ "passphrase": "wrong" })), ("403".to_owned(), "wrong passphrase".to_owned()));
+    assert_eq!(post(&relay.socket, "/create", &serde_json::json!({ "passphrase": "other" })), "409");
+    assert_eq!(post(&relay.socket, "/unlock", &serde_json::json!({ "passphrase": "pass phrase" })), "204");
+    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }));
+    let (_, shown) = relay.get("/vault");
+    assert_eq!((shown["entries"].as_array().map(Vec::len), shown["suggestions"].as_array().map(Vec::len)), (Some(1), Some(0)));
+    assert_eq!(stdout(&run(relay.mask_run("echo tok-998877 typed-now"))), "[secret] typed-now\n");
+    drop(relay);
+    let reopened = Vault::open(&file, b"pass phrase").unwrap();
+    assert_eq!(reopened.entries.iter().map(|e| e.tag.as_str()).collect::<Vec<_>>(), ["api"]);
     std::fs::remove_dir_all(&data).unwrap();
 }
 
@@ -395,7 +452,7 @@ fn verified(key: &Path, message: &Path) -> bool {
 fn the_agent_lists_vault_keys_and_signs_only_once_given() {
     let data = data_dir("agent");
     let mut relay = Relay::start_in("agent", &data);
-    create_vault(&mut relay, "pass phrase");
+    relay.create_vault("pass phrase");
     let keys = data.join("keys");
     std::fs::create_dir_all(&keys).unwrap();
     let (ed25519, rsa, locked) = (keys.join("id_ed25519"), keys.join("id_rsa"), keys.join("id_locked"));
@@ -414,13 +471,13 @@ fn the_agent_lists_vault_keys_and_signs_only_once_given() {
     std::fs::write(&message, "sign me").unwrap();
     for (tag, key) in [("ed", &ed25519), ("rsa", &rsa)] {
         let sign = agent_sign(&relay.agent(), key, &message).spawn().unwrap();
-        assert_eq!(relay.decide_next("get", "give")["tag"], tag);
+        assert_eq!(relay.decide_next("sign", "give")["tag"], tag);
         let out = sign.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(verified(key, &message), "{tag}");
     }
     let refused = agent_sign(&relay.agent(), &ed25519, &message).spawn().unwrap();
-    relay.decide_next("get", "refuse");
+    relay.decide_next("sign", "refuse");
     assert!(!refused.wait_with_output().unwrap().status.success());
     drop(relay);
     std::fs::remove_dir_all(&data).unwrap();
@@ -443,7 +500,7 @@ fn forwarding_offers_and_signs_with_the_users_own_agent_only_when_switched_on() 
     std::fs::remove_file(&theirs).unwrap();
 
     let mut relay = Relay::start_with("forward", &data, &[("SECRETS_UPSTREAM_AGENT", &upstream_socket)]);
-    create_vault(&mut relay, "pass phrase");
+    relay.create_vault("pass phrase");
     let mine = data.join("id_mine");
     keygen(&mine, "ed25519", "");
     assert_eq!(relay.add_key("mine", &mine).0, "200");
@@ -469,21 +526,4 @@ impl Drop for Killed {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-#[test]
-fn a_cancelled_unlock_refuses_what_waited_on_it() {
-    let data = data_dir("cancel-unlock");
-    let mut relay = Relay::start_in("cancel-unlock", &data);
-    create_vault(&mut relay, "pass phrase");
-    drop(relay);
-    let mut relay = Relay::start_in("cancel-unlock", &data);
-    let waiting = relay.vault_cmd(&["list"]).spawn().unwrap();
-    let event = relay.next_event();
-    let id = event["ask"]["id"].as_str().unwrap();
-    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": id, "cancel": true })), "204");
-    let out = waiting.wait_with_output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "secrets-vault: the vault was not unlocked\n");
-    drop(relay);
-    std::fs::remove_dir_all(&data).unwrap();
 }

@@ -1,6 +1,6 @@
 import type { ClientElements, RenderElement } from 'claude-code'
 
-export type Tab = 'requests' | 'vault'
+export type Tab = 'requests' | 'vault' | 'config'
 
 /** What the drawer's tab row shows besides the names. */
 export type Tabs = { active: Tab; requests: number; vaultMark: boolean }
@@ -11,12 +11,13 @@ export const TAB_ROWS = 2
 const LABELS: Record<Tab, (tabs: Tabs) => string> = {
   requests: tabs => ` Requests${tabs.requests > 0 ? ' ' + tabs.requests : ''} `,
   vault: tabs => ` Vault${tabs.vaultMark ? ' •' : ''} `,
+  config: () => ' Config ',
 }
 
 /** Each tab's label and the columns it takes, left to right, a `│` between them. */
 export function tabSpans(tabs: Tabs) {
   let start = 0
-  return (['requests', 'vault'] as const).map(tab => {
+  return (['requests', 'vault', 'config'] as const).map(tab => {
     const label = LABELS[tab](tabs)
     const span = { tab, label, start, width: [...label].length }
     start += span.width + 1

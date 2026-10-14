@@ -25,6 +25,40 @@
         '';
       };
 
+      # The plugin lands at /run/current-system/sw/share/secrets/claude-code, a path that stays put across rebuilds.
+      nixosModules.default = { config, lib, ... }:
+        let cfg = config.services.claude-secrets;
+        in {
+          options.services.claude-secrets = {
+            enable = lib.mkEnableOption "the secrets vault daemon for Claude Code";
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${system}.default;
+              description = "The secrets package; the plugin's bin/ and the daemon must come from the same one.";
+            };
+          };
+          config = lib.mkIf cfg.enable {
+            environment.systemPackages = [ cfg.package ];
+            environment.pathsToLink = [ "/share/secrets" ];
+            # one vault for every session: the first session's attach starts the daemon; systemd holds the socket
+            # across restarts, so attaches made meanwhile queue instead of failing
+            systemd.user.sockets.secrets = {
+              description = "secrets vault daemon socket";
+              wantedBy = [ "sockets.target" ];
+              listenStreams = [ "%t/secrets.sock" ];
+              socketConfig.SocketMode = "0600";
+            };
+            systemd.user.services.secrets = {
+              description = "secrets vault daemon";
+              serviceConfig = {
+                ExecStart = "${cfg.package}/bin/secrets-relay daemon";
+                Restart = "on-failure";
+                RestartSec = 5;
+              };
+            };
+          };
+        };
+
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
       };

@@ -1,34 +1,14 @@
+import type { ClientKeyEvent } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
+import { hitAt } from '../hooks/controls'
 import { TAB_ROWS, tabSpans } from '../hooks/tabs'
-import VaultView, {
-  accessLabel,
-  closedRows,
-  collisionButtons,
-  collisionRows,
-  contentRows,
-  doorButtons,
-  formButtons,
-  formRows,
-  initialState,
-  listRows,
-  nextAccess,
-  onClick,
-  onKey,
-  rekeyButtons,
-  rekeyRows,
-  shownText,
-  tagOptions,
-  type ViewState,
-} from '../hooks/vault-view'
-import type { ValueEdit, VaultProps, ViewEntry } from '../hooks/vault-view-props'
-
-const isAction = (e: ValueEdit): e is Extract<ValueEdit, { kind: 'action' }> => e.kind === 'action'
-const isTab = (e: ValueEdit): e is Extract<ValueEdit, { kind: 'tab' }> => e.kind === 'tab'
+import VaultView, { accessLabel, contentRows, drawPage, initialState, onClick, onKey, pageOf, shownPage, shownText, tagOptions, type ViewState } from '../hooks/vault-view'
+import type { ValueEdit, VaultAction, VaultProps, ViewEntry } from '../hooks/vault-view-props'
 
 const ENTRIES: ViewEntry[] = [
-  { id: 'e1', name: 'Prod DB', tag: 'db', kind: 'password', use: 'session', access: 'allowed' },
-  { id: 'e2', name: 'Deploy', tag: 'deploy', kind: 'token', use: 'each', access: 'ask' },
+  { id: 'e1', name: 'Prod DB', tag: 'db', kind: 'password', access: 'allowed' },
+  { id: 'e2', name: 'Deploy', tag: 'deploy', kind: 'token', access: 'ask' },
 ]
 const PROPS: VaultProps = {
   state: 'open',
@@ -39,21 +19,39 @@ const PROPS: VaultProps = {
     { tag: 'sudo', what: 'sudo -A asks for your password' },
     { tag: 'db', what: 'an agent asked for it this session' },
   ],
+  forward: false,
   tabs: { active: 'vault', requests: 1, vaultMark: true },
   columns: 60,
-  rows: 20,
+  rows: 40,
   applied: {},
   lengths: { value: 0, passphrase: 0, again: 0 },
   peeked: {},
   formEpoch: 0,
   error: null,
 }
+const LOCKED: VaultProps = { ...PROPS, state: 'locked', entries: [], suggestions: [] }
 const START = initialState(0, 'v1')
 const CLOSED = initialState(0, 'v1', true)
-/** A click on the row `at` under the tabs. */
-const click = (state: ViewState, at: number, x: number, props = PROPS) => onClick(state, props, at + TAB_ROWS, x)
 
-function draw(props: VaultProps, state?: ViewState) {
+const actionOf = (r: { post?: { edits: ValueEdit[] } }): VaultAction | undefined =>
+  r.post?.edits.findLast((e): e is Extract<ValueEdit, { kind: 'action' }> => e.kind === 'action')?.action
+const key = (state: ViewState, k: string | ClientKeyEvent, props = PROPS) => onKey(state, props, typeof k === 'string' ? { key: k } : k)
+const keys = (state: ViewState, list: string[], props = PROPS) => list.reduce((s, k) => key(s, k, props).state, state)
+
+/** The first cell the control `hit` takes on screen, under the tabs. */
+function cellOf(props: VaultProps, state: ViewState, hit: string): { y: number; x: number } {
+  const lines = shownPage(props, state).lines
+  for (let y = 0; y < lines.length; y++) {
+    for (let x = 0; x < props.columns; x++) if (hitAt(lines[y], x) === hit) return { y, x }
+  }
+  throw new Error(`no ${hit} drawn on the ${pageOf(props, state)} page`)
+}
+const click = (state: ViewState, hit: string, props = PROPS) => {
+  const { y, x } = cellOf(props, state, hit)
+  return onClick(state, props, y + TAB_ROWS, x)
+}
+
+function draw(props: VaultProps, state?: ViewState): string[] {
   let current: unknown = state
   const surface = {
     elements: { Box: (p: object) => ({ type: 'Box', ...p }), Text: (p: object) => ({ type: 'Text', ...p }) },
@@ -70,232 +68,287 @@ function draw(props: VaultProps, state?: ViewState) {
     onKey: () => () => {},
     post: () => {},
   }
-  const text = (node: unknown): string =>
-    typeof node === 'string' ? node : ((node as { children?: unknown[] }).children ?? []).map(text).join('')
+  const text = (node: unknown): string => (typeof node === 'string' ? node : ((node as { children?: unknown[] }).children ?? []).map(text).join(''))
   const view = VaultView as unknown as (p: VaultProps, s: typeof surface) => { children: unknown[] }
   return view(props, surface).children.map(text)
 }
+const expectWidths = (rows: string[]) => {
+  for (const row of rows) expect([...row].length).toBe(PROPS.columns)
+}
 
-test('a closed vault shows its passphrase field, twice for a new one, and one button', async () => {
-  expect(closedRows({ state: 'locked', error: null }).map(r => r.kind)).toEqual(['closed', 'door', 'gap', 'buttonsTop', 'buttons', 'buttonsBottom'])
-  expect(closedRows({ state: 'absent', error: 'The two differ.' }).filter(r => r.kind === 'door').length).toBe(2)
-  expect(doorButtons('absent')[0]!.label).toBe(' Create ')
-  expect(doorButtons('locked')[0]!.label).toBe(' Unlock ')
-})
-
-test('keys on a closed vault go to its passphrase; Enter or the button opens it', async () => {
-  const locked = { ...PROPS, state: 'locked' as const, entries: [], suggestions: [] }
-  const typed = onKey(CLOSED, locked, { key: 'p4ss' })
+test('a locked vault: one passphrase field with Show, and Unlock; typing fills it, Enter or Unlock opens', async () => {
+  const rows = draw(LOCKED, CLOSED)
+  expectWidths(rows)
+  expect(rows[TAB_ROWS]).toMatch(/^ Vault locked/)
+  expect(rows.some(r => r.startsWith(' Passphrase  [ ▏') && r.includes('Show ]'))).toBe(true)
+  expect(rows.some(r => r.includes('│ Unlock │'))).toBe(true)
+  expect(rows.some(r => r.includes('Again'))).toBe(false)
+  const typed = key(CLOSED, 'p4ss', LOCKED)
   expect(typed.post).toEqual({ instance: 'v1', edits: [{ seq: 1, field: 'passphrase', kind: 'append', text: 'p4ss' }], focused: 'passphrase', formOpen: false })
-  expect(onKey(typed.state, locked, { key: 'return' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'open' })
-  expect(click(CLOSED, 3, doorButtons('locked')[0]!.start + 1, locked).post?.edits.find(isAction)?.action).toEqual({ kind: 'open' })
-  const absent = { ...locked, state: 'absent' as const }
-  const again = onKey(CLOSED, absent, { key: 'down' })
+  expect(actionOf(key(typed.state, 'return', LOCKED))).toEqual({ kind: 'open' })
+  expect(actionOf(click(CLOSED, 'open', LOCKED))).toEqual({ kind: 'open' })
+})
+
+test('a new vault takes its passphrase twice; ↓ goes to the second, Tab passes Show on the way', async () => {
+  const absent = { ...LOCKED, state: 'absent' as const }
+  const rows = draw(absent, CLOSED)
+  expect(rows[TAB_ROWS]).toMatch(/^ No vault yet/)
+  expect(rows.some(r => r.includes('│ Create │'))).toBe(true)
+  const again = key(CLOSED, 'down', absent)
   expect(again.post?.focused).toBe('again')
-  expect(onKey(again.state, absent, { key: 'x' }).post?.edits).toEqual([{ seq: 1, field: 'again', kind: 'append', text: 'x' }])
-  expect(click(CLOSED, 1, 20, absent).post?.focused).toBe('passphrase')
+  expect(key(again.state, 'x', absent).post?.edits).toEqual([{ seq: 1, field: 'again', kind: 'append', text: 'x' }])
+  expect(key(CLOSED, 'tab', absent).state.focus).toBe('show:passphrase')
+  expect(key(CLOSED, 'tab', absent).post?.focused).toBe('passphrase')
+  expect(click(again.state, 'passphrase', absent).post?.focused).toBe('passphrase')
 })
 
-test('an open vault lists its entries, then what was typed this session to keep', async () => {
-  expect(listRows(PROPS).map(r => r.kind)).toEqual(['add', 'rekey', 'lock', 'entryHead', 'entry', 'entry', 'suggestHead', 'suggestion'])
-  expect(listRows({ entries: [], suggestions: [] }).map(r => r.kind)).toEqual(['add', 'rekey', 'lock', 'none'])
+test('Show turns a held field to plain text and back; Ctrl+R does it from the field; only peeked text reaches the view', async () => {
+  const props = { ...LOCKED, lengths: { value: 0, passphrase: 4, again: 0 } }
+  expect(click(CLOSED, 'show:passphrase', props).post?.edits).toEqual([{ seq: 1, field: 'passphrase', kind: 'peek' }])
+  expect(key(CLOSED, { key: 'r', ctrl: true }, props).post?.edits).toEqual([{ seq: 1, field: 'passphrase', kind: 'peek' }])
+  const hidden = draw(props, CLOSED)
+  expect(hidden.some(r => r.includes('[ ••••▏') && r.includes('Show ]'))).toBe(true)
+  const shown = draw({ ...props, peeked: { passphrase: 'abcd' } }, CLOSED)
+  expect(shown.some(r => r.includes('[ abcd▏') && r.includes('Hide ]'))).toBe(true)
+  expectWidths(shown)
+  const typing = key(CLOSED, 'e', props).state
+  expect(draw({ ...props, peeked: { passphrase: 'abcd' } }, typing).some(r => r.includes('abcde'))).toBe(true)
+  expect(shownText('abcd', 'passphrase', [{ seq: 1, field: 'passphrase', kind: 'back' }, { seq: 2, field: 'again', kind: 'clear' }])).toBe('abc')
 })
 
-test('Lock closes the vault for every session, by click or Enter', async () => {
-  expect(click(START, 2, 4).post?.edits.find(isAction)?.action).toEqual({ kind: 'lock' })
-  const onLock = ['down', 'down'].reduce((state, key) => onKey(state, PROPS, { key }).state, START)
-  expect(onKey(onLock, PROPS, { key: 'return' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'lock' })
-  expect(draw(PROPS).some(r => r.includes('⊘ Lock the vault (every session)'))).toBe(true)
-})
-
-test("each entry row shows this session's access under a header naming the columns", async () => {
+test('the open vault: buttons, then the entries under a header, with each access a dropdown at the row end', async () => {
   const rows = draw(PROPS)
-  for (const row of rows) expect([...row].length).toBe(60)
-  const at = (kind: string) => TAB_ROWS + listRows(PROPS).findIndex(r => r.kind === kind)
-  expect(rows[at('entryHead')]).toMatch(/^ Agent +Name +Tag +Kind *$/)
-  expect(rows[at('entry')]).toMatch(/^ allowed +Prod DB +db +password *$/)
-  expect(rows[at('entry') + 1]).toMatch(/^ ask each +Deploy +deploy +token *$/)
-  expect(accessLabel({ access: 'refused', use: 'each' })).toBe('refused')
+  expectWidths(rows)
+  expect(rows[TAB_ROWS + 1]).toMatch(/^ │ \+ Add entry │ │ Change passphrase │ │ Lock vault │ +$/)
+  expect(rows).toContain(' Entries' + ' '.repeat(52))
+  expect(rows.find(r => r.startsWith(' Name'))).toMatch(/^ Name +Tag +Kind +This session *$/)
+  expect(rows.find(r => r.startsWith(' Prod DB'))).toMatch(/^ Prod DB +db +Password +\[ Allowed ▾ \] $/)
+  expect(rows.find(r => r.startsWith(' Deploy'))).toMatch(/^ Deploy +deploy +Token +\[ Ask     ▾ \] $/)
+  expect(rows).toContain(' Typed this session, not kept' + ' '.repeat(31))
+  expect(accessLabel('refused')).toBe('Refused')
 })
 
-test('the view is as tall as its tallest open page, so a form opens without waiting for it to grow', async () => {
-  expect(contentRows(PROPS)).toBe(Math.max(listRows(PROPS).length, formRows(null).length))
-  expect(contentRows({ ...PROPS, entries: [], suggestions: [] })).toBe(formRows(null).length)
-  expect(contentRows({ ...PROPS, state: 'locked' })).toBe(closedRows({ state: 'locked', error: null }).length)
-  const collisions = [{ name: 'tracer', carriers: ['http.fetch'], refused: false }]
-  expect(contentRows({ ...PROPS, collisions })).toBe(collisionRows(collisions).length)
+test("a row opens its entry; only the row's dropdown changes access, through a list that says what each means", async () => {
+  expect(click(START, 'row:e1').state.form).toEqual({ id: 'e1', suggestion: null, name: 'Prod DB', tag: 'db', kind: 'password' })
+  const opened = click(START, 'access:e2')
+  expect(opened.state.open).toBe('access:e2')
+  expect(opened.post).toBeDefined()
+  expect(actionOf(opened)).toBe(undefined)
+  const rows = draw(PROPS, opened.state)
+  expectWidths(rows)
+  expect(rows.some(r => r.includes('▸ Ask') && r.includes('a card each time it is asked for'))).toBe(true)
+  expect(rows.some(r => r.includes('Allowed') && r.includes('given with no card'))).toBe(true)
+  expect(rows.some(r => r.includes('Refused') && r.includes('never given'))).toBe(true)
+  expect(actionOf(click(opened.state, 'pick:2'))).toEqual({ kind: 'access', id: 'e2', access: 'refused' })
+  expect(click(opened.state, 'pick:2').state.open).toBe(null)
+  const outside = click(opened.state, 'add')
+  expect(outside.state.open).toBe(null)
+  expect(outside.state.form?.id).toBe(null)
+  expect(click(opened.state, 'access:e2').state.open).toBe(null)
 })
 
-test('the tag field offers what the agent asks for, then the tag typed; tags other entries hold are left out', async () => {
-  let state = onKey(click(START, 0, 4).state, PROPS, { key: 'down' }).state
-  expect(state.field).toBe('tag')
-  expect(tagOptions(PROPS, state.form!).map(o => o.tag)).toEqual(['sudo'])
-  state = onKey(state, PROPS, { key: 'right' }).state
-  expect(state.form?.tag).toBe('sudo')
-  const drawn = draw(PROPS, state)
-  for (const row of drawn) expect([...row].length).toBe(60)
-  expect(drawn.some(r => r.includes('‹ sudo ›') && r.includes('sudo -A asks for your password'))).toBe(true)
-  state = onKey(state, PROPS, { key: 'x' }).state
-  expect(state.form?.tag).toBe('x')
-  state = onKey(onKey(state, PROPS, { key: 'space' }).state, PROPS, { key: 'y' }).state
-  expect(state.form?.tag).toBe('y')
-  state = onKey(onKey(state, PROPS, { key: 'right' }).state, PROPS, { key: 'left' }).state
-  expect(state.form?.tag).toBe('y')
-  expect(draw(PROPS, state).some(r => r.includes('‹ y▏ ›') && r.includes('your own'))).toBe(true)
-  const editing = click(START, 4, 20).state
+test('the access list works from the keyboard: Enter opens it on the current access, ↓ and Enter pick', async () => {
+  const onAccess = keys(START, ['down', 'right'])
+  expect(onAccess.focus).toBe('access:e1')
+  const opened = key(onAccess, 'return').state
+  expect([opened.open, opened.cursor]).toEqual(['access:e1', 1])
+  expect(actionOf(key(key(opened, 'down').state, 'return'))).toEqual({ kind: 'access', id: 'e1', access: 'refused' })
+  expect(key(opened, 'tab').state.open).toBe(null)
+})
+
+test('Lock asks first, for every session; Cancel goes back, Lock locks', async () => {
+  const asked = click(START, 'lock')
+  expect(pageOf(PROPS, asked.state)).toBe('confirm')
+  expect(actionOf(asked)).toBe(undefined)
+  const rows = draw(PROPS, asked.state)
+  expectWidths(rows)
+  expect(rows[TAB_ROWS]).toMatch(/^ Lock the vault for every session\?/)
+  expect(asked.state.focus).toBe('cancel')
+  expect(pageOf(PROPS, key(asked.state, 'return').state)).toBe('list')
+  expect(actionOf(click(asked.state, 'confirm'))).toEqual({ kind: 'lock' })
+})
+
+test('Add opens an empty form: Name, Tag, Kind and Value, then Save and Cancel', async () => {
+  const opened = click(START, 'add')
+  expect(opened.state.form).toEqual({ id: null, suggestion: null, name: '', tag: '', kind: 'password' })
+  expect(opened.post).toEqual({ instance: 'v1', edits: [{ seq: 1, field: 'value', kind: 'clear' }], focused: null, formOpen: true })
+  const rows = draw(PROPS, opened.state)
+  expectWidths(rows)
+  expect(rows[TAB_ROWS]).toMatch(/^ New entry/)
+  expect(rows.some(r => r.startsWith(' Name    [ ▏'))).toBe(true)
+  expect(rows.some(r => r.startsWith(' Tag     [ none: one is made up') && r.endsWith('▾ ] '))).toBe(true)
+  expect(rows.some(r => r.startsWith(' Kind    (•) Password   ( ) Token   ( ) SSH key'))).toBe(true)
+  expect(rows.some(r => r.startsWith(' Value   [ ') && r.endsWith('Show ] '))).toBe(true)
+  expect(rows.some(r => r.includes('│ Save │ │ Cancel │'))).toBe(true)
+})
+
+test('the form fills from the keyboard: typing, Tab between fields, ←/→ on Kind, held typing on Value, Enter saves', async () => {
+  let state = click(START, 'add').state
+  state = keys(state, ['G', 'H', 'backspace', 'i'])
+  expect(state.form?.name).toBe('Gi')
+  state = key(state, 'tab').state
+  expect(state.focus).toBe('tag')
+  state = keys(state, ['m', 'y'])
+  expect([state.form?.tag, state.ownTag]).toEqual(['my', 'my'])
+  state = keys(state, ['down', 'right'])
+  expect(state.form?.kind).toBe('token')
+  const toValue = key(state, 'down')
+  expect(toValue.post?.focused).toBe('value')
+  const typed = key(toValue.state, 's3cret')
+  expect(typed.post?.edits.at(-1)).toEqual({ seq: 2, field: 'value', kind: 'append', text: 's3cret' })
+  expect(actionOf(key(typed.state, 'return'))).toEqual({ kind: 'save', form: { id: null, suggestion: null, name: 'Gi', tag: 'my', kind: 'token' } })
+})
+
+test("the tag dropdown lists what agents ask for, each with what asks, then the person's own", async () => {
+  const form = click(START, 'add').state
+  expect(tagOptions(PROPS, form.form!).map(o => o.tag)).toEqual(['sudo'])
+  const opened = click(form, 'tag')
+  expect([opened.state.open, opened.state.cursor]).toEqual(['tag', 1])
+  const rows = draw(PROPS, opened.state)
+  expectWidths(rows)
+  expect(rows.some(r => r.includes('sudo') && r.includes('sudo -A asks for your password'))).toBe(true)
+  expect(rows.some(r => r.includes('▸ Your own tag…'))).toBe(true)
+  const picked = click(opened.state, 'pick:0').state
+  expect(picked.form?.tag).toBe('sudo')
+  expect(draw(PROPS, picked).some(r => r.startsWith(' Tag     [ sudo · sudo -A asks for your password'))).toBe(true)
+  const typedOver = keys(picked, ['x'])
+  expect(typedOver.form?.tag).toBe('x')
+  const back = click(click(typedOver, 'tag').state, 'pick:0').state
+  expect(click(click(back, 'tag').state, 'pick:1').state.form?.tag).toBe('x')
+  const editing = click(START, 'row:e1').state
   expect(tagOptions(PROPS, editing.form!).map(o => o.tag)).toEqual(['sudo', 'db'])
-  expect(tagOptions(PROPS, { ...editing.form!, kind: 'ssh-key' })).toEqual([])
+  const sshKey = click(editing, 'kind=ssh-key').state
+  expect(tagOptions(PROPS, sshKey.form!)).toEqual([])
+  expect(draw(PROPS, sshKey).some(r => r.startsWith(' Tag     [ db') && !r.includes('▾'))).toBe(true)
+  expect(draw(PROPS, sshKey).some(r => r.startsWith(' File    [ unchanged'))).toBe(true)
 })
 
-test('Change passphrase takes the new one twice with both fields emptied first; Enter or Change sends it, ✕ leaves', async () => {
-  const opened = click(START, 1, 4)
+test('Kind is a radio group: a click picks; to or from an SSH key the typed value is dropped', async () => {
+  const form = click(START, 'add').state
+  const token = click(form, 'kind=token')
+  expect(token.state.form?.kind).toBe('token')
+  expect(token.post?.edits).toEqual(form.pending)
+  const sshKey = click(form, 'kind=ssh-key')
+  expect(sshKey.post?.edits.at(-1)).toEqual({ seq: 2, field: 'value', kind: 'clear' })
+})
+
+test('an entry: Save, Delete after confirming, Cancel back to its row', async () => {
+  const edit = click(START, 'row:e1').state
+  expect(draw(PROPS, edit)[TAB_ROWS]).toMatch(/^ Entry/)
+  expect(draw(PROPS, edit).some(r => r.includes('│ Save │ │ Delete │ │ Cancel │'))).toBe(true)
+  expect(actionOf(click(edit, 'save'))).toEqual({ kind: 'save', form: edit.form })
+  const asked = click(edit, 'delete')
+  expect(actionOf(asked)).toBe(undefined)
+  expect(draw(PROPS, asked.state)[TAB_ROWS]).toMatch(/^ Delete Prod DB\?/)
+  expect(actionOf(click(asked.state, 'confirm'))).toEqual({ kind: 'delete', id: 'e1' })
+  expect(pageOf(PROPS, click(asked.state, 'cancel').state)).toBe('form')
+  const closed = click(edit, 'cancel')
+  expect(closed.state.form).toBe(null)
+  expect(closed.state.focus).toBe('row:e1')
+  expect(closed.post?.edits.at(-1)).toEqual({ seq: 2, field: 'value', kind: 'clear' })
+  expect(closed.post?.formOpen).toBe(false)
+})
+
+test('a typed value opens as an entry to keep, named by its prompt; no SSH key, no value to type, Dismiss drops it', async () => {
+  const opened = click(START, 'sugg:s1')
+  expect(opened.state.form).toEqual({ id: null, suggestion: 's1', name: '[sudo] password for alex', tag: '', kind: 'password' })
+  const rows = draw(PROPS, opened.state)
+  expect(rows[TAB_ROWS]).toMatch(/^ Keep a typed value/)
+  expect(rows.some(r => r.includes('SSH key'))).toBe(false)
+  expect(rows.some(r => r.startsWith(' Value   typed this session'))).toBe(true)
+  expect(rows.some(r => r.includes('│ Save │ │ Dismiss │ │ Cancel │'))).toBe(true)
+  expect(keys(opened.state, ['down', 'down', 'right', 'right']).form?.kind).toBe('password')
+  expect(actionOf(click(opened.state, 'dismiss'))).toEqual({ kind: 'dismiss', id: 's1' })
+})
+
+test('Change passphrase empties both fields first; Enter or Change sends it, Cancel leaves', async () => {
+  const opened = click(START, 'rekey')
   expect(opened.state.rekeying).toBe(true)
   expect(opened.post?.edits).toEqual([
     { seq: 1, field: 'passphrase', kind: 'clear' },
     { seq: 2, field: 'again', kind: 'clear' },
   ])
   expect(opened.post?.focused).toBe('passphrase')
-  const typed = onKey(opened.state, PROPS, { key: 'n3w' })
-  expect(typed.post?.edits.at(-1)).toEqual({ seq: 3, field: 'passphrase', kind: 'append', text: 'n3w' })
-  const again = onKey(typed.state, PROPS, { key: 'down' })
+  const again = key(key(opened.state, 'n3w').state, 'down')
   expect(again.post?.focused).toBe('again')
-  expect(onKey(again.state, PROPS, { key: 'return' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'rekey' })
-  const [change, cancel] = rekeyButtons()
-  const buttonsRow = rekeyRows(null).findIndex(r => r.kind === 'buttons')
-  expect(click(again.state, buttonsRow, change!.start + 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'rekey' })
-  const left = click(again.state, buttonsRow, cancel!.start + 1)
+  expect(actionOf(key(again.state, 'return'))).toEqual({ kind: 'rekey' })
+  expect(actionOf(click(again.state, 'change'))).toEqual({ kind: 'rekey' })
+  const left = click(again.state, 'cancel')
   expect(left.state.rekeying).toBe(false)
   expect(left.post?.edits.slice(-2).map(e => ('field' in e ? e.field + ' ' + e.kind : e.kind))).toEqual(['passphrase clear', 'again clear'])
-  const drawn = draw(PROPS, again.state)
-  for (const row of drawn) expect([...row].length).toBe(60)
-  expect(drawn.some(r => r.includes('│ Change │'))).toBe(true)
-  expect(draw({ ...PROPS, formEpoch: 1 }, again.state).some(r => r.includes('+ Add'))).toBe(true)
+  const rows = draw(PROPS, again.state)
+  expectWidths(rows)
+  expect(rows[TAB_ROWS]).toMatch(/^ New passphrase/)
+  expect(draw({ ...PROPS, formEpoch: 1 }, again.state).some(r => r.includes('+ Add entry'))).toBe(true)
 })
 
-test('a held field shows its text only while peeked: the mark or Ctrl+R asks, the hooks send the text', async () => {
-  const locked = { ...PROPS, state: 'locked' as const, entries: [], suggestions: [], lengths: { value: 0, passphrase: 4, again: 0 } }
-  expect(onKey(CLOSED, locked, { key: 'r', ctrl: true }).post?.edits).toEqual([{ seq: 1, field: 'passphrase', kind: 'peek' }])
-  expect(click(CLOSED, 1, 60 - 4, locked).post?.edits).toEqual([{ seq: 1, field: 'passphrase', kind: 'peek' }])
-  expect(click(CLOSED, 1, 20, locked).post?.edits).toEqual([])
-  const hidden = draw(locked, CLOSED)
-  expect(hidden.some(r => r.includes('••••▏') && r.includes('○'))).toBe(true)
-  const shown = draw({ ...locked, peeked: { passphrase: 'abcd' } }, CLOSED)
-  expect(shown.some(r => r.includes('abcd') && r.includes('◉'))).toBe(true)
-  for (const row of shown) expect([...row].length).toBe(60)
-  const typing = onKey(CLOSED, locked, { key: 'e' }).state
-  expect(draw({ ...locked, peeked: { passphrase: 'abcd' } }, typing).some(r => r.includes('abcde'))).toBe(true)
-  expect(shownText('abcd', 'passphrase', [{ seq: 1, field: 'passphrase', kind: 'back' }, { seq: 2, field: 'again', kind: 'clear' }])).toBe('abc')
+test("the session's own ssh-agent: a checkbox under its heading, only when there is one", async () => {
+  const rows = draw(PROPS)
+  expect(rows).toContain(' SSH agent' + ' '.repeat(50))
+  expect(rows.some(r => r.startsWith(" [ ] Use my own ssh-agent's keys in this session (no card)"))).toBe(true)
+  expect(actionOf(click(START, 'forward'))).toEqual({ kind: 'forward', on: true })
+  expect(actionOf(click(START, 'forward', { ...PROPS, forward: true }))).toEqual({ kind: 'forward', on: false })
+  expect(draw({ ...PROPS, forward: true }).some(r => r.startsWith(' [x] Use my own'))).toBe(true)
+  expect(draw({ ...PROPS, forward: null }).some(r => r.includes('ssh-agent'))).toBe(false)
+  const failed = draw({ ...PROPS, error: 'there is no ssh-agent of yours to forward to' })
+  expect(failed.some(r => r.startsWith(' there is no ssh-agent of yours to forward to'))).toBe(true)
+  const onForward = key(START, { key: 'tab', shift: true })
+  expect(onForward.state.focus).toBe('forward')
+  expect(actionOf(key(onForward.state, 'space'))).toEqual({ kind: 'forward', on: true })
 })
 
-test('Add opens an empty form and drops any value left; typed text fills the field with the keyboard', async () => {
-  const opened = click(START, 0, 4)
-  expect(opened.state.form).toEqual({ id: null, suggestion: null, name: '', tag: '', kind: 'password', use: 'session' })
-  expect(opened.post).toEqual({ instance: 'v1', edits: [{ seq: 1, field: 'value', kind: 'clear' }], focused: null, formOpen: true })
-  let state = opened.state
-  for (const key of ['G', 'H', 'backspace', 'i']) state = onKey(state, PROPS, { key }).state
-  expect(state.form?.name).toBe('Gi')
-  state = onKey(state, PROPS, { key: 'down' }).state
-  state = onKey(state, PROPS, { key: 'g' }).state
-  state = onKey(state, PROPS, { key: 'down' }).state
-  state = onKey(state, PROPS, { key: 'right' }).state
-  expect(state.form).toEqual({ id: null, suggestion: null, name: 'Gi', tag: 'g', kind: 'token', use: 'session' })
-  state = onKey(state, PROPS, { key: 'down' }).state
-  state = onKey(state, PROPS, { key: 'space' }).state
-  expect(state.form?.use).toBe('each')
-  const toValue = onKey(state, PROPS, { key: 'down' })
-  expect(toValue.post?.focused).toBe('value')
-  const typed = onKey(toValue.state, PROPS, { key: 's3cret' })
-  expect(typed.post?.edits.at(-1)).toEqual({ seq: 2, field: 'value', kind: 'append', text: 's3cret' })
-  expect(onKey(typed.state, PROPS, { key: 'return' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'save', form: typed.state.form })
-})
-
-test('an entry opens for editing; a click on its access or Space turns it over: ask, allowed, refused', async () => {
-  expect(click(START, 4, 20).state.form).toEqual({ id: 'e1', suggestion: null, name: 'Prod DB', tag: 'db', kind: 'password', use: 'session' })
-  expect(click(START, 4, 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'access', id: 'e1', access: 'refused' })
-  expect(click(START, 4, 9).post?.edits.find(isAction)?.action).toEqual({ kind: 'access', id: 'e1', access: 'refused' })
-  expect(click(START, 5, 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'access', id: 'e2', access: 'refused' })
-  const onDeploy = ['down', 'down', 'down', 'down'].reduce((state, key) => onKey(state, PROPS, { key }).state, START)
-  expect(onKey(onDeploy, PROPS, { key: 'space' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'access', id: 'e2', access: 'refused' })
-  const session = { use: 'session' as const }
-  expect([nextAccess({ ...session, access: 'ask' }), nextAccess({ ...session, access: 'allowed' }), nextAccess({ ...session, access: 'refused' })]).toEqual([
-    'allowed',
-    'refused',
-    'ask',
-  ])
-  expect([nextAccess({ use: 'each', access: 'ask' }), nextAccess({ use: 'each', access: 'refused' })]).toEqual(['refused', 'ask'])
-})
-
-test("the selection stays on its entry when another session's change moves the rows; once it went, keys act on nothing", async () => {
-  const onDeploy = ['down', 'down', 'down', 'down'].reduce((state, key) => onKey(state, PROPS, { key }).state, START)
+test("the focus stays on its entry when another session's change moves the rows; once it went, keys act on nothing", async () => {
+  const onDeploy = keys(START, ['down', 'down'])
+  expect(onDeploy.focus).toBe('row:e2')
   const shifted = { ...PROPS, entries: [ENTRIES[1]!] }
-  expect(onKey(onDeploy, shifted, { key: 'space' }).post?.edits.find(isAction)?.action).toEqual({ kind: 'access', id: 'e2', access: 'refused' })
+  expect(key(onDeploy, 'return', shifted).state.form?.id).toBe('e2')
   const gone = { ...PROPS, entries: [ENTRIES[0]!] }
-  expect(onKey(onDeploy, gone, { key: 'space' }).post).toBe(undefined)
-  expect(onKey(onDeploy, gone, { key: 'return' }).post).toBe(undefined)
-  expect(onKey(onDeploy, gone, { key: 'down' }).state.selected).toBe('add')
-})
-
-test('a suggestion opens as a new entry named by its prompt; its value is not typed again, nor an ssh key', async () => {
-  const opened = click(START, 7, 6)
-  expect(opened.state.form).toEqual({ id: null, suggestion: 's1', name: '[sudo] password for alex', tag: '', kind: 'password', use: 'session' })
-  expect(formButtons(opened.state.form!).map(b => b.kind)).toEqual(['save', 'dismiss', 'cancel'])
-  let state = opened.state
-  for (const key of ['down', 'down', 'right', 'right']) state = onKey(state, PROPS, { key }).state
-  expect(state.form?.kind).toBe('password')
-  for (const key of ['down', 'down']) state = onKey(state, PROPS, { key }).state
-  const atValue = onKey(state, PROPS, { key: 'x' })
-  expect(atValue.post).toBe(undefined)
-  const buttonsRow = 5 + 1 + 1
-  const dismiss = formButtons(opened.state.form!)[1]!
-  expect(click(opened.state, buttonsRow, dismiss.start + 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'dismiss', id: 's1' })
-})
-
-test('the form saves, deletes an existing entry, or closes on ✕', async () => {
-  const add = click(START, 0, 4).state
-  expect(formButtons(add.form!).map(b => b.kind)).toEqual(['save', 'cancel'])
-  const edit = click(START, 4, 20).state
-  const buttons = formButtons(edit.form!)
-  expect(buttons.map(b => b.kind)).toEqual(['save', 'delete', 'cancel'])
-  const buttonsRow = 5 + 1 + 1
-  expect(click(edit, buttonsRow, buttons[1]!.start + 1).post?.edits.find(isAction)?.action).toEqual({ kind: 'delete', id: 'e1' })
-  expect(click(edit, buttonsRow, buttons[0]!.start).post?.edits.find(isAction)?.action).toEqual({ kind: 'save', form: edit.form })
-  const closed = click(edit, buttonsRow - 1, buttons[2]!.start + 2)
-  expect(closed.state.form).toBe(null)
-  expect(closed.post?.edits.at(-1)).toEqual({ seq: 2, field: 'value', kind: 'clear' })
-  expect(closed.post?.formOpen).toBe(false)
+  expect(key(onDeploy, 'space', gone).post).toBe(undefined)
+  expect(key(onDeploy, 'return', gone).post).toBe(undefined)
+  expect(key(onDeploy, 'down', gone).state.focus).toBe('add')
 })
 
 test('the Requests tab switches back; a saved form closes when the hooks bump the epoch', async () => {
   const requests = tabSpans(PROPS.tabs)[0]!
-  expect(onClick(START, PROPS, 0, requests.start + 1).post?.edits.find(isTab)?.tab).toBe('requests')
-  const edit = click(START, 4, 20).state
-  const rows = draw({ ...PROPS, formEpoch: 1 }, edit)
-  expect(rows.some(r => r.includes('+ Add'))).toBe(true)
+  expect(onClick(START, PROPS, 0, requests.start + 1).post?.edits.find(e => e.kind === 'tab')).toEqual({ seq: 1, kind: 'tab', tab: 'requests' })
+  const edit = click(START, 'row:e1').state
+  expect(draw({ ...PROPS, formEpoch: 1 }, edit).some(r => r.includes('+ Add entry'))).toBe(true)
 })
 
-test('every drawn row is exactly as wide as the view: the list, the form, the closed vault', async () => {
-  for (const row of draw(PROPS)) expect([...row].length).toBe(60)
-  const form = click(START, 4, 20).state
-  const rows = draw({ ...PROPS, error: 'tag db is taken or not made of letters, digits, - _ .' }, form)
-  for (const row of rows) expect([...row].length).toBe(60)
-  expect(rows.some(r => r.includes('│ Delete │'))).toBe(true)
-  const closed = draw({ ...PROPS, state: 'absent', entries: [], suggestions: [], lengths: { value: 0, passphrase: 4, again: 0 }, error: 'Wrong passphrase.' })
-  for (const row of closed) expect([...row].length).toBe(60)
-  expect(closed.some(r => r.includes('••••'))).toBe(true)
-  expect(closed.some(r => r.includes('│ Create │'))).toBe(true)
+test('the view is as tall as its tallest page with its longest list open, so nothing waits for it to grow', async () => {
+  const rows = contentRows(PROPS)
+  const pages = [
+    START,
+    click(START, 'access:e1').state,
+    click(click(START, 'add').state, 'tag').state,
+    click(START, 'rekey').state,
+    click(START, 'lock').state,
+    click(click(START, 'row:e1').state, 'delete').state,
+  ]
+  for (const state of pages) expect(drawPage(PROPS, state).lines.length).toBeLessThanOrEqual(rows)
+  expect(contentRows(LOCKED)).toBe(drawPage(LOCKED, CLOSED).lines.length)
+  for (const state of pages) expect(draw({ ...PROPS, error: 'tag db is taken or not made of letters, digits, - _ .' }, state).length).toBe(TAB_ROWS + contentRows({ ...PROPS, error: 'x' }))
+})
+
+test('a page taller than the view scrolls to keep the focus in view', async () => {
+  const many = Array.from({ length: 20 }, (_, i) => ({ id: `m${i}`, name: `Entry ${i}`, tag: `t${i}`, kind: 'password' as const, access: 'ask' as const }))
+  const props = { ...PROPS, entries: many, rows: 14 }
+  const atLast = keys(START, Array(20).fill('down'), props)
+  expect(atLast.focus).toBe('row:m19')
+  const shown = shownPage(props, atLast).lines
+  expect(shown.length).toBe(12)
+  expect(click(atLast, 'row:m19', props).state.form?.id).toBe('m19')
 })
 
 test('a colliding plugin replaces the vault with what it hooks and Allow / Refuse; keys do nothing there', async () => {
   const props = { ...PROPS, collisions: [{ name: 'tracer', carriers: ['http.fetch'], refused: false }] }
   const rows = draw(props)
-  for (const row of rows) expect([...row].length).toBe(60)
+  expectWidths(rows)
   expect(rows[TAB_ROWS]).toContain('⚠ tracer hooks http.fetch')
-  expect(rows.some(r => r.includes('+ Add'))).toBe(false)
-  const [allow, refuse] = collisionButtons()
-  const at = collisionRows(props.collisions).findIndex(r => r.kind === 'collisionButtons')
-  expect(click(START, at, allow!.start + 1, props).post?.edits.find(isAction)?.action).toEqual({ kind: 'collision', name: 'tracer', decision: 'allow' })
-  expect(click(START, at, refuse!.start + 1, props).post?.edits.find(isAction)?.action).toEqual({ kind: 'collision', name: 'tracer', decision: 'refuse' })
-  expect(onKey(START, props, { key: 'return' }).post).toBe(undefined)
+  expect(rows.some(r => r.includes('+ Add entry'))).toBe(false)
+  expect(actionOf(click(START, 'allow:tracer', props))).toEqual({ kind: 'collision', name: 'tracer', decision: 'allow' })
+  expect(actionOf(click(START, 'refuse:tracer', props))).toEqual({ kind: 'collision', name: 'tracer', decision: 'refuse' })
+  expect(key(START, 'return', props).post).toBe(undefined)
   const refused = draw({ ...props, collisions: [{ ...props.collisions[0]!, refused: true }] })
   expect(refused.some(r => r.includes('│ Allow │'))).toBe(false)
   expect(refused.some(r => r.includes('Refused from the next start'))).toBe(true)

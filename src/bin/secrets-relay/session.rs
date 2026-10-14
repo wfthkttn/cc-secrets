@@ -40,8 +40,6 @@ pub struct Session {
     /// The Claude Code session id its grants are kept under, once the hooks named it.
     pub named: Option<String>,
     pub access: Access,
-    /// The upstream agent's keys are offered too.
-    pub forward: bool,
     /// The user's own ssh-agent, as the hooks found it.
     pub upstream: Option<PathBuf>,
     serving: Vec<JoinHandle<()>>,
@@ -120,7 +118,6 @@ fn open(ctx: &Shared, state: &mut State, claude_code: i32, started: u64) -> Resu
         deciding: HashMap::new(),
         named: None,
         access: Access::default(),
-        forward: false,
         upstream: None,
         serving,
     };

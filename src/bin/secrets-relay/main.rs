@@ -27,7 +27,7 @@
 //! - `POST /unlock {passphrase}`, `POST /create {passphrase}`: 204 open, 403 wrong passphrase.
 //! - `POST /lock`: the vault closes for every session.
 //! - `POST /passphrase {passphrase}`: the open vault sealed under a new passphrase (`locker::rekey`).
-//! - `POST /session {id, projects?}`: whose grants these are (`session_named`).
+//! - `POST /session {id, projects?}`: whose grants and forwarding these are (`session_named`).
 //! - `POST /decide {id, decision: "give" | "session" | "refuse"}`: 204, 410 no such request.
 //! - `GET /vault`: `{state, entries, suggestions, forward, upstream}`; never a value. Each entry, like those in `ask`
 //!   and `sign` events and `/list`, carries the session's `access`: `"ask" | "allowed" | "refused"`.

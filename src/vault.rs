@@ -54,23 +54,13 @@ pub enum Kind {
     Typed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Use {
-    /// Once allowed in a session, handed out there without asking again.
-    Session,
-    /// Asked for on every use.
-    Each,
-}
-
+/// An entry. A `use` field in the file is ignored on read and dropped on save.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
     pub name: String,
     pub tag: String,
     pub kind: Kind,
-    #[serde(rename = "use")]
-    pub use_: Use,
     pub value: String,
     /// Seconds since the Unix epoch.
     pub created: u64,
@@ -225,7 +215,7 @@ mod tests {
     const CHEAP: Costs = Costs { memory_kib: 64, time: 1, lanes: 1 };
 
     fn entry(tag: &str, value: &str) -> Entry {
-        Entry { id: tag.to_owned(), name: format!("name of {tag}"), tag: tag.to_owned(), kind: Kind::Password, use_: Use::Session, value: value.to_owned(), created: 1 }
+        Entry { id: tag.to_owned(), name: format!("name of {tag}"), tag: tag.to_owned(), kind: Kind::Password, value: value.to_owned(), created: 1 }
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -245,6 +235,13 @@ mod tests {
         assert_eq!(opened.entries, vault.entries);
         assert!(matches!(Vault::open(&path, b"wrong horse"), Err(Error::Refused)));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_entry_saved_with_a_use_field_still_reads() {
+        let text = r#"{"id":"db","name":"name of db","tag":"db","kind":"password","use":"each","value":"hunter22","created":1}"#;
+        assert_eq!(serde_json::from_str::<Entry>(text).unwrap(), entry("db", "hunter22"));
+        assert!(!serde_json::to_string(&entry("db", "hunter22")).unwrap().contains("\"use\""));
     }
 
     #[test]

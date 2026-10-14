@@ -68,9 +68,8 @@ const GRANT_BUTTONS = [
   { kind: 'cancel', label: CANCEL_LABEL },
 ] as const
 const FIELD_BACKGROUND = '#1f2a3a'
-/** The show/hide mark after a typed value: shown, hidden. */
-const PEEK_MARKS = [' ◉', ' ○'] as const
-const PEEK_COLUMNS = 2
+/** The Show or Hide button after a typed value. */
+const SHOW_COLUMNS = 5
 /** Where a field's text starts: the card's edge, then the field's own. */
 const FIELD_TEXT_START = CARD_EDGE + 2
 /** Names a `Client` gets for special keys; any other `key` is typed text, a burst arriving whole. */
@@ -147,9 +146,9 @@ export function shownText(text: string, entry: RequestEntry, pending: Edit[]): s
   return text
 }
 
-/** The columns of a card's field text: short of its menu mark and its show/hide mark. */
+/** The columns of a card's field text: short of its Show button and its menu mark. */
 export function fieldRoom(columns: number, hasMenu: boolean): number {
-  return geometry(columns).fieldColumns - 4 - (hasMenu ? 2 : 0) - PEEK_COLUMNS
+  return geometry(columns).fieldColumns - 4 - (hasMenu ? 2 : 0) - SHOW_COLUMNS
 }
 
 /** Whether a card's field takes typing now: no vault entry in it, typing not off. */
@@ -404,8 +403,8 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   const entry = entries.find(e => e.id === row.id)!
   const isField = row.kind === 'fieldTop' || row.kind === 'field' || row.kind === 'fieldBottom'
   if (isField && onButton) return withEdit(state, current, { id: row.id, kind: 'cancel' })
-  const peekStart = FIELD_TEXT_START + fieldRoom(frame.columns, offerOf(entry).length > 0)
-  if (row.kind === 'field' && x >= peekStart && x < peekStart + PEEK_COLUMNS && takesTyping(entry, state.pending, frame)) {
+  const showStart = FIELD_TEXT_START + fieldRoom(frame.columns, offerOf(entry).length > 0)
+  if (row.kind === 'field' && x >= showStart && x < showStart + SHOW_COLUMNS && takesTyping(entry, state.pending, frame)) {
     return withEdit(state, row.id, { id: row.id, kind: 'peek' })
   }
   // A click on the field, whatever it holds, opens its menu.
@@ -524,11 +523,12 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
                   ? fitted
                   : 'password'
         const isDim = chosen === null && !typing && (count === 0 || isOff)
-        const mark = takesTyping(entry, state.pending, frame) ? PEEK_MARKS[entry.text === null ? 1 : 0] : ' '.repeat(PEEK_COLUMNS)
+        const show = takesTyping(entry, state.pending, frame) ? (entry.text === null ? ' Show' : ' Hide') : ' '.repeat(SHOW_COLUMNS)
         return line(row.id, [
           Text({ ...look(row.id), children: ['│ '] }),
           Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: isDim, children: [pad(shown, room)] }),
-          Text({ backgroundColor: FIELD_BACKGROUND, dimColor: entry.text === null, children: [mark + (hasMenu ? ' ▾' : '')] }),
+          Text({ backgroundColor: FIELD_BACKGROUND, color: 'claude', underline: true, children: [show] }),
+          Text({ backgroundColor: FIELD_BACKGROUND, color: 'claude', children: [hasMenu ? ' ▾' : ''] }),
           Text({ ...look(row.id), children: [' │ '] }),
           Text({ color: 'error', children: [BUTTON_ROW_TEXT[1]] }),
         ])

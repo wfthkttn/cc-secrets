@@ -37,11 +37,10 @@ test('no running call matches: the asking process\'s parent command line', async
 
 test("a subagent's signature is refused; a main-loop one gets a session key; anything else asks the person", async () => {
   const command = 'git push'
-  const allowed = { cmdline: WRAPPER(command), inside: true, access: 'allowed' as const, use: 'session' as const }
+  const allowed = { cmdline: WRAPPER(command), inside: true, access: 'allowed' as const }
   expect(signDecision(allowed, [{ command, agentId: 'a-1' }])).toBe('refuse')
   expect(signDecision({ ...allowed, access: 'ask' }, [{ command, agentId: 'a-1' }])).toBe('refuse')
   expect(signDecision(allowed, [{ command, agentId: undefined }])).toBe('give')
-  expect(signDecision({ ...allowed, use: 'each' }, [{ command, agentId: undefined }])).toBe('ask')
   expect(signDecision({ ...allowed, access: 'ask' }, [{ command, agentId: undefined }])).toBe('ask')
   expect(signDecision(allowed, [])).toBe('ask')
   expect(signDecision({ ...allowed, cmdline: '' }, [{ command, agentId: undefined }])).toBe('ask')
@@ -49,20 +48,19 @@ test("a subagent's signature is refused; a main-loop one gets a session key; any
 
 test('a key or an entry the session refused is refused to anyone, with no card', async () => {
   const command = 'git push'
-  const refused = { cmdline: WRAPPER(command), inside: true, access: 'refused' as const, use: 'session' as const }
+  const refused = { cmdline: WRAPPER(command), inside: true, access: 'refused' as const }
   for (const calls of [[{ command, agentId: undefined }], [{ command, agentId: 'a-1' }], []]) {
     expect(signDecision(refused, calls)).toBe('refuse')
     expect(askDecision({ cmdline: refused.cmdline, inside: true, entry: refused }, calls)).toBe('refuse')
   }
-  expect(askDecision({ cmdline: 'fake', inside: false, entry: { ...refused, use: 'each' } }, [])).toBe('refuse')
+  expect(askDecision({ cmdline: 'fake', inside: false, entry: refused }, [])).toBe('refuse')
 })
 
 test("an ask: a main-loop call's allowed session entry comes without a card; a subagent's card offers no entries", async () => {
   const command = 'psql "$(secrets ask --tag db "DB")"'
-  const ask = { cmdline: WRAPPER(command), inside: true, entry: { access: 'allowed' as const, use: 'session' as const } }
+  const ask = { cmdline: WRAPPER(command), inside: true, entry: { access: 'allowed' as const } }
   expect(askDecision(ask, [{ command, agentId: undefined }])).toBe('give')
-  expect(askDecision({ ...ask, entry: { access: 'allowed', use: 'each' } }, [{ command, agentId: undefined }])).toBe('card')
-  expect(askDecision({ ...ask, entry: { access: 'ask', use: 'session' } }, [{ command, agentId: undefined }])).toBe('card')
+  expect(askDecision({ ...ask, entry: { access: 'ask' } }, [{ command, agentId: undefined }])).toBe('card')
   expect(askDecision({ ...ask, entry: null }, [{ command, agentId: undefined }])).toBe('card')
   expect(askDecision(ask, [{ command, agentId: 'a-1' }])).toBe('typed card')
   expect(askDecision(ask, [])).toBe('card')
@@ -70,9 +68,9 @@ test("an ask: a main-loop call's allowed session entry comes without a card; a s
 
 test('a requester outside the session is never matched to a call: its own argv could name any command', async () => {
   const command = 'psql "$(secrets ask --tag db "DB")"'
-  const outside = { cmdline: `fake ${command}`, inside: false, access: 'allowed' as const, use: 'session' as const }
+  const outside = { cmdline: `fake ${command}`, inside: false, access: 'allowed' as const }
   expect(signDecision(outside, [{ command, agentId: undefined }])).toBe('ask')
-  expect(askDecision({ ...outside, entry: { access: 'allowed', use: 'session' } }, [{ command, agentId: undefined }])).toBe('card')
+  expect(askDecision({ ...outside, entry: { access: 'allowed' } }, [{ command, agentId: undefined }])).toBe('card')
   expect(listDecision(outside, [{ command, agentId: undefined }])).toBe('refuse')
   expect(listDecision({ ...outside, inside: true, cmdline: WRAPPER(command) }, [{ command, agentId: undefined }])).toBe('give')
   expect(listDecision({ ...outside, inside: true, cmdline: WRAPPER(command) }, [{ command, agentId: 'a-1' }])).toBe('refuse')
@@ -86,10 +84,10 @@ test('the same command running in the main loop and a subagent gets no vault: a 
     { command, agentId: undefined },
     { command, agentId: 'a-1' },
   ]
-  const sign = { cmdline: WRAPPER(command), inside: true, access: 'allowed' as const, use: 'session' as const }
+  const sign = { cmdline: WRAPPER(command), inside: true, access: 'allowed' as const }
   expect(signDecision(sign, both)).toBe('refuse')
   expect(signDecision(sign, [...both].reverse())).toBe('refuse')
-  expect(askDecision({ ...sign, entry: { access: 'allowed', use: 'session' } }, both)).toBe('typed card')
+  expect(askDecision({ ...sign, entry: { access: 'allowed' } }, both)).toBe('typed card')
   expect(listDecision(sign, both)).toBe('refuse')
   expect(signDecision(sign, [both[0]!, both[0]!])).toBe('give')
 })
@@ -100,9 +98,9 @@ test('the same command in two subagents only is a subagent\'s: refused, no entri
     { command, agentId: 'a-1' },
     { command, agentId: 'a-2' },
   ]
-  const sign = { cmdline: WRAPPER(command), inside: true, access: 'allowed' as const, use: 'session' as const }
+  const sign = { cmdline: WRAPPER(command), inside: true, access: 'allowed' as const }
   expect(signDecision(sign, subagents)).toBe('refuse')
-  expect(askDecision({ ...sign, entry: { access: 'allowed', use: 'session' } }, subagents)).toBe('typed card')
+  expect(askDecision({ ...sign, entry: { access: 'allowed' } }, subagents)).toBe('typed card')
   expect(listDecision(sign, subagents)).toBe('refuse')
 })
 

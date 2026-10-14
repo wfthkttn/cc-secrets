@@ -23,7 +23,7 @@ export function callOf<C extends { command: string }>(cmdline: string, calls: re
 type Requester = { cmdline: string; inside: boolean }
 type Call = { command: string; agentId: string | undefined }
 type Calls = readonly Call[]
-type Granted = { access: 'ask' | 'allowed' | 'refused'; use: 'session' | 'each' }
+type Granted = { access: 'ask' | 'allowed' | 'refused' }
 
 /**
  * The Bash call a requester runs in. Only one `inside` the session is matched: its command line is the one Claude
@@ -51,7 +51,7 @@ export function signDecision(sign: Requester & Granted, calls: Calls): 'refuse' 
   if (sign.access === 'refused') return 'refuse'
   const call = callFor(sign, calls)
   if (call === 'unknown' || call?.agentId !== undefined) return 'refuse'
-  return call !== undefined && sign.access === 'allowed' && sign.use === 'session' ? 'give' : 'ask'
+  return call !== undefined && sign.access === 'allowed' ? 'give' : 'ask'
 }
 
 /**
@@ -63,7 +63,7 @@ export function askDecision(ask: Requester & { entry: Granted | null }, calls: C
   if (ask.entry?.access === 'refused') return 'refuse'
   const call = callFor(ask, calls)
   if (call === 'unknown' || call?.agentId !== undefined) return 'typed card'
-  return call !== undefined && ask.entry !== null && ask.entry.access === 'allowed' && ask.entry.use === 'session' ? 'give' : 'card'
+  return call !== undefined && ask.entry !== null && ask.entry.access === 'allowed' ? 'give' : 'card'
 }
 
 /** The vault's tags and names: only to a main-loop command; refused to any other and to one that can't be matched. */

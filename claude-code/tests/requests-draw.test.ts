@@ -39,7 +39,7 @@ function nodes(props: RequestsProps, initial?: ListState): Node[] {
   return (draw(props, surface).children ?? []) as Node[]
 }
 
-test('a typed value shows as dots with ○, or as text with ◉ while the hooks send it', async () => {
+test('a typed value shows as dots with Show, or as text with Hide while the hooks send it', async () => {
   const props = (text: string | null): RequestsProps => ({
     focusEpoch: 0,
     tabs: null,
@@ -51,9 +51,9 @@ test('a typed value shows as dots with ○, or as text with ◉ while the hooks 
     entries: [{ id: 'a', kind: 'secret', prompt: 'token', source: '', since: '04:00:00', length: 4, text, offer: null, chosen: null }],
   })
   const hidden = draw(props(null))
-  expect(hidden.some(r => r.includes('••••') && r.includes('○'))).toBe(true)
+  expect(hidden.some(r => r.includes('••••') && r.includes(' Show │'))).toBe(true)
   const shown = draw(props('s3cr'))
-  expect(shown.some(r => r.includes('s3cr') && r.includes('◉'))).toBe(true)
+  expect(shown.some(r => r.includes('s3cr') && r.includes(' Hide │'))).toBe(true)
   for (const row of shown) expect([...row].length).toBe(60)
 })
 

@@ -2,12 +2,13 @@ import type { ClientKeyEvent } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
 import { SUGGESTED } from '../hooks/auto-mode'
-import ConfigView, { buttons, type ConfigState, confirm, initialState, layout, maskArrows, onClick, onKey, shownText, status, wrap } from '../hooks/config-view'
+import ConfigView, { type ConfigState, confirm, drawPage, initialState, onClick, onKey, shownText, status, wrap } from '../hooks/config-view'
 import type { ConfigProps, TextEdit } from '../hooks/config-view-props'
+import { hitAt } from '../hooks/controls'
 import { TAB_ROWS, tabSpans } from '../hooks/tabs'
 
-const isAction = (e: TextEdit): e is Extract<TextEdit, { kind: 'action' }> => e.kind === 'action'
 const isTab = (e: TextEdit): e is Extract<TextEdit, { kind: 'tab' }> => e.kind === 'tab'
+const actionOf = (r: { post?: { edits: TextEdit[] } }) => r.post?.edits.findLast((e): e is Extract<TextEdit, { kind: 'action' }> => e.kind === 'action')?.action
 
 const PROPS: ConfigProps = {
   tabs: { active: 'config', requests: 0, vaultMark: false },
@@ -18,16 +19,19 @@ const PROPS: ConfigProps = {
   confirmed: {},
   unlockAtStart: true,
   maskMinLength: 6,
-  forward: false,
-  forwardAtStart: true,
   error: null,
 }
 const START = initialState('c1')
-const key = (k: string, mods: { ctrl?: true } = {}): ClientKeyEvent => ({ key: k, ...mods })
-/** A click on the row `at` under the tabs. */
-const click = (state: ConfigState, at: number, x: number, props = PROPS) => onClick(state, props, at + TAB_ROWS, x)
-/** Rows under the tabs for a one-row text: head 0, text 1, buttons 2–4, gap 5, unlock 6, mask 7, forward at start 8, forward 9. */
-const ROW = { text: 1, buttons: 3, unlock: 6, mask: 7, forwardAtStart: 8, forward: 9 }
+const key = (k: string, mods: { ctrl?: true; shift?: true } = {}): ClientKeyEvent => ({ key: k, ...mods })
+
+/** A click on the first cell the control `hit` takes. */
+function click(state: ConfigState, hit: string, props = PROPS) {
+  const lines = drawPage(props, state)
+  for (let y = 0; y < lines.length; y++) {
+    for (let x = 0; x < props.columns; x++) if (hitAt(lines[y], x) === hit) return onClick(state, props, y + TAB_ROWS, x)
+  }
+  throw new Error(`no ${hit} drawn`)
+}
 
 function draw(props: ConfigProps, state?: ConfigState) {
   let current: unknown = state
@@ -46,11 +50,25 @@ function draw(props: ConfigProps, state?: ConfigState) {
     onKey: () => () => {},
     post: () => {},
   }
-  const text = (node: unknown): string =>
-    typeof node === 'string' ? node : ((node as { children?: unknown[] }).children ?? []).map(text).join('')
+  const text = (node: unknown): string => (typeof node === 'string' ? node : ((node as { children?: unknown[] }).children ?? []).map(text).join(''))
   const view = ConfigView as unknown as (p: ConfigProps, s: typeof surface) => { children: unknown[] }
   return view(props, surface).children.map(text)
 }
+
+test('two sections: Vault with a checkbox and a stepper, then Auto mode with its status, the text box, Apply and Suggested', async () => {
+  const rows = draw(PROPS, START)
+  for (const row of rows) expect([...row].length).toBe(PROPS.columns)
+  const under = rows.slice(TAB_ROWS)
+  expect(under[0]).toMatch(/^ Vault +$/)
+  expect(under[1]).toMatch(/^ \[x\] Unlock the vault at session start +$/)
+  expect(under[2]).toMatch(/^ Mask values of at least \[ - \] {2}6 {2}\[ \+ \] characters +$/)
+  expect(under[4]).toMatch(/^ Auto mode · Secrets management +not in settings $/)
+  expect(under[5]).toMatch(/^┌─+┐$/)
+  expect(under[6]).toMatch(/^│ mine▏ +│$/)
+  expect(under[7]).toMatch(/^└─+┘$/)
+  expect(under[9]).toMatch(/^ │ Apply │ │ Suggested │ +$/)
+  expect(draw({ ...PROPS, unlockAtStart: false }, START)[TAB_ROWS + 1]).toMatch(/^ \[ \] Unlock/)
+})
 
 test('the status compares the shown text with the line in the settings', async () => {
   expect(status('mine', null)).toBe('not in settings')
@@ -70,51 +88,42 @@ test("typing shows at once as unconfirmed edits; the hooks' confirmation drops t
   expect(confirm(START, 3)).toBe(null)
 })
 
-test('Enter in the text applies; the buttons apply or reset to the suggested text', async () => {
-  expect(onKey(START, PROPS, key('return')).post?.edits.find(isAction)?.action).toEqual({ kind: 'apply' })
-  const [apply, suggest] = buttons()
-  expect(click(START, ROW.buttons, apply!.start).post?.edits.find(isAction)?.action).toEqual({ kind: 'apply' })
-  expect(click(START, ROW.buttons, suggest!.start + 2).post?.edits.find(isAction)?.action).toEqual({ kind: 'suggest' })
-  expect(click(START, ROW.buttons, 0).post).toBe(undefined)
+test('Enter in the text applies; Apply and Suggested press from any cell of their boxes', async () => {
+  expect(actionOf(onKey(START, PROPS, key('return')))).toEqual({ kind: 'apply' })
+  expect(actionOf(click(START, 'apply'))).toEqual({ kind: 'apply' })
+  expect(actionOf(click(START, 'suggest'))).toEqual({ kind: 'suggest' })
+  expect(click(START, 'text').state.focus).toBe('text')
 })
 
-test('↑/↓ walk the text and the settings; the forward row only exists with an agent of the user', async () => {
-  const down = (state: ConfigState, props = PROPS) => onKey(state, props, key('down')).state
-  expect(down(down(down(down(START)))).focus).toBe('forward')
-  const noAgent = { ...PROPS, forward: null }
-  expect(down(down(down(down(START, noAgent), noAgent), noAgent), noAgent).focus).toBe('forwardAtStart')
-  expect(layout(noAgent, 'mine', true).map(r => r.kind)).not.toContain('forward')
-  const up = onKey(START, PROPS, key('up'))
-  expect(up.state.focus).toBe('text')
-  expect(up.post?.textFocused).toBe(true)
-  expect(onKey(START, PROPS, key('down')).post?.textFocused).toBe(false)
+test('the keyboard walks the controls in reading order: ↑/↓ by line, ←/→ along the buttons, Tab through all', async () => {
+  const at = (keys: ClientKeyEvent[]) => keys.reduce((state, k) => onKey(state, PROPS, k).state, START).focus
+  expect(at([key('up')])).toBe('mask')
+  expect(at([key('up'), key('up')])).toBe('unlock')
+  expect(at([key('down')])).toBe('apply')
+  expect(at([key('down'), key('right')])).toBe('suggest')
+  expect(at([key('tab')])).toBe('apply')
+  expect(at([key('tab', { shift: true })])).toBe('mask')
+  expect(onKey(START, PROPS, key('up')).post?.textFocused).toBe(false)
+  expect(onKey({ ...START, focus: 'mask' }, PROPS, key('down')).post?.textFocused).toBe(true)
 })
 
-test('Space or Enter flips a toggle; ←/→ step the mask minimum, never below 1', async () => {
+test('Space or Enter flips the checkbox; ←/→ or -/+ step the mask minimum, never below 1', async () => {
   const at = (focus: ConfigState['focus']) => ({ ...START, focus })
-  expect(onKey(at('unlock'), PROPS, key('space')).post?.edits.find(isAction)?.action).toEqual({ kind: 'unlockAtStart', on: false })
-  expect(onKey(at('forward'), PROPS, key('return')).post?.edits.find(isAction)?.action).toEqual({ kind: 'forward', on: true })
-  expect(onKey(at('mask'), PROPS, key('right')).post?.edits.find(isAction)?.action).toEqual({ kind: 'maskMinLength', value: 7 })
-  expect(onKey(at('mask'), { ...PROPS, maskMinLength: 1 }, key('left')).post).toBe(undefined)
+  expect(actionOf(onKey(at('unlock'), PROPS, key('space')))).toEqual({ kind: 'unlockAtStart', on: false })
+  expect(actionOf(onKey(at('unlock'), PROPS, key('return')))).toEqual({ kind: 'unlockAtStart', on: false })
+  expect(actionOf(onKey(at('mask'), PROPS, key('right')))).toEqual({ kind: 'maskMinLength', value: 7 })
+  expect(actionOf(onKey(at('mask'), PROPS, key('-')))).toEqual({ kind: 'maskMinLength', value: 5 })
+  expect(onKey(at('mask'), { ...PROPS, maskMinLength: 1 }, key('left')).post?.edits).toEqual([])
   expect(onKey(at('unlock'), PROPS, key('x')).post).toBe(undefined)
+  expect(actionOf(onKey(at('apply'), PROPS, key('space')))).toEqual({ kind: 'apply' })
 })
 
-test('an action and a tab click travel as numbered edits, so a later post in the same frame keeps them', async () => {
-  const applied = onKey(START, PROPS, key('return'))
-  const typed = onKey(applied.state, PROPS, key('x'))
-  expect(typed.post?.edits.map(e => e.kind)).toEqual(['action', 'append'])
-  expect(confirm(typed.state, 1)?.pending.map(e => e.kind)).toEqual(['append'])
-})
-
-test('clicks: a toggle row flips, the mask arrows step, a tab turns the drawer', async () => {
-  expect(click(START, ROW.unlock, 5).post?.edits.find(isAction)?.action).toEqual({ kind: 'unlockAtStart', on: false })
-  expect(click(START, ROW.forward, 5).post?.edits.find(isAction)?.action).toEqual({ kind: 'forward', on: true })
-  expect(click(START, ROW.forwardAtStart, 5).post?.edits.find(isAction)?.action).toEqual({ kind: 'forwardAtStart', on: false })
-  const arrows = maskArrows(6)
-  expect(click(START, ROW.mask, arrows.less).post?.edits.find(isAction)?.action).toEqual({ kind: 'maskMinLength', value: 5 })
-  expect(click(START, ROW.mask, arrows.more).post?.edits.find(isAction)?.action).toEqual({ kind: 'maskMinLength', value: 7 })
-  expect(click(START, ROW.mask, 2).post?.edits.find(isAction)?.action).toBe(undefined)
-  expect(click(START, ROW.mask, 2).state.focus).toBe('mask')
+test('clicks: the checkbox toggles, the stepper buttons step, the text around them does nothing, a tab turns the drawer', async () => {
+  expect(actionOf(click(START, 'unlock'))).toEqual({ kind: 'unlockAtStart', on: false })
+  expect(actionOf(click(START, 'mask-'))).toEqual({ kind: 'maskMinLength', value: 5 })
+  expect(actionOf(click(START, 'mask+'))).toEqual({ kind: 'maskMinLength', value: 7 })
+  expect(onClick(START, PROPS, TAB_ROWS + 2, 3).post).toBe(undefined)
+  expect(onClick(START, PROPS, TAB_ROWS + 3, 3).post).toBe(undefined)
   const vault = tabSpans(PROPS.tabs).find(s => s.tab === 'vault')!
   expect(onClick(START, PROPS, 0, vault.start).post?.edits.find(isTab)?.tab).toBe('vault')
   const config = tabSpans(PROPS.tabs).find(s => s.tab === 'config')!
@@ -122,10 +131,10 @@ test('clicks: a toggle row flips, the mask arrows step, a tab turns the drawer',
 })
 
 test('a text longer than the room shows its end, where typing goes', async () => {
-  const rows = layout({ ...PROPS, rows: TAB_ROWS + 11 + 2 }, 'a'.repeat(58 * 5), false)
-  const text = rows.filter(r => r.kind === 'text')
+  const lines = drawPage({ ...PROPS, rows: TAB_ROWS + 11 + 2, draft: 'a'.repeat(56 * 5) }, { focus: 'apply', pending: [] })
+  const text = lines.filter(l => l.some(s => s.hit === 'text') && l.length === 3)
   expect(text.length).toBe(2)
-  expect(text.at(-1)).toEqual({ kind: 'text', text: 'a'.repeat(58), isLast: true })
+  expect(text.at(-1)![1]!.text).toBe('a'.repeat(56))
 })
 
 test('rows break after a space; a word longer than a row is cut; a full last row puts the cursor on the next', async () => {
@@ -135,20 +144,13 @@ test('rows break after a space; a word longer than a row is cut; a full last row
   expect(wrap('aaaaaa', 6, true)).toEqual(['aaaaaa', ''])
   expect(wrap('aaaaaa', 6, false)).toEqual(['aaaaaa'])
   expect(wrap('', 6, false)).toEqual([''])
-  expect(wrap(SUGGESTED, 58, true).join('')).toBe(SUGGESTED)
+  expect(wrap(SUGGESTED, 56, true).join('')).toBe(SUGGESTED)
 })
 
-test('the suggested text with the cursor draws every row at the view width, so clicks land where the layout says', async () => {
-  for (const line of draw({ ...PROPS, draft: SUGGESTED })) expect([...line].length).toBe(PROPS.columns)
-  for (const line of draw({ ...PROPS, draft: 'x'.repeat(58) })) expect([...line].length).toBe(PROPS.columns)
-})
-
-test('every drawn row is as wide as the view; the arrows sit where clicks find them', async () => {
-  const lines = draw({ ...PROPS, error: 'Not applied: EACCES', draft: 'x'.repeat(130) })
+test('every drawn row is as wide as the view, the suggested text and an error included', async () => {
+  for (const line of draw({ ...PROPS, draft: SUGGESTED }, START)) expect([...line].length).toBe(PROPS.columns)
+  for (const line of draw({ ...PROPS, draft: 'x'.repeat(56) }, START)) expect([...line].length).toBe(PROPS.columns)
+  const lines = draw({ ...PROPS, error: 'Not applied: EACCES', draft: 'x'.repeat(130) }, START)
   for (const line of lines) expect([...line].length).toBe(PROPS.columns)
-  const mask = lines.find(l => l.includes('Mask values'))!
-  const arrows = maskArrows(6)
-  expect([...mask][arrows.less]).toBe('‹')
-  expect([...mask][arrows.more]).toBe('›')
-  expect(lines[TAB_ROWS]).toContain('not in settings')
+  expect(lines.at(-1)).toMatch(/^ Not applied: EACCES/)
 })

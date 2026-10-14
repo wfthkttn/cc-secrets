@@ -1,6 +1,7 @@
 //! What this Claude session lets its agent have of each vault entry: ask (a card), allowed (no card) or refused (no
-//! card, no value). The vault holds no grants; each session's live in `sessions/<session-id>.json` beside it, so a
-//! resumed session finds them again. Kept across lock and unlock: a closed vault gives nothing anyway.
+//! card, no value), and whether its ssh-agent offers the user's own agent's keys too (off for a new session). The
+//! vault holds no grants; each session's live in `sessions/<session-id>.json` beside it, so a resumed session finds
+//! them again. Kept across lock and unlock: a closed vault gives nothing anyway.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
@@ -21,6 +22,8 @@ pub enum Grant {
 struct Stored {
     allowed: Vec<String>,
     refused: Vec<String>,
+    #[serde(default)]
+    forward: bool,
 }
 
 #[derive(Default)]
@@ -28,6 +31,7 @@ pub struct Access {
     /// The session's file; none until the hooks name the session, and then changes stay in memory.
     file: Option<PathBuf>,
     grants: HashMap<String, Grant>,
+    forward: bool,
 }
 
 /// A Claude Code session id as a file name: letters, digits, `-` and `_`.
@@ -53,7 +57,7 @@ impl Access {
         };
         let allowed = stored.allowed.into_iter().map(|id| (id, Grant::Allowed));
         let grants = allowed.chain(stored.refused.into_iter().map(|id| (id, Grant::Refused))).collect();
-        Ok(Self { file: Some(file), grants })
+        Ok(Self { file: Some(file), grants, forward: stored.forward })
     }
 
     /// Sets the entry's grant; true when it changed. Saved at once when the session is named.
@@ -70,6 +74,16 @@ impl Access {
         Ok(true)
     }
 
+    pub fn forward(&self) -> bool {
+        self.forward
+    }
+
+    /// Turns forwarding on or off. Saved at once when the session is named.
+    pub fn set_forward(&mut self, on: bool) -> Result<(), String> {
+        let before = std::mem::replace(&mut self.forward, on);
+        self.save().inspect_err(|_| self.forward = before)
+    }
+
     /// Forgets the grants of entries no longer in the vault.
     pub fn keep_only(&mut self, live: &HashSet<&str>) -> Result<(), String> {
         let before = self.grants.len();
@@ -84,7 +98,7 @@ impl Access {
             ids.sort();
             ids
         };
-        let stored = Stored { allowed: listed(Grant::Allowed), refused: listed(Grant::Refused) };
+        let stored = Stored { allowed: listed(Grant::Allowed), refused: listed(Grant::Refused), forward: self.forward };
         let text = serde_json::to_vec(&stored).map_err(|e| e.to_string())?;
         let failed = |e: std::io::Error| format!("can't save {}: {e}", file.display());
         if let Some(dir) = file.parent() {

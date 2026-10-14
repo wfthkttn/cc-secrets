@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use secrets::agent;
-use secrets::vault::{Entry, Kind, Use, Vault, random_hex};
+use secrets::vault::{Entry, Kind, Vault, random_hex};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::UnixStream;
@@ -70,10 +70,10 @@ impl Locker {
         self.entries().iter().find(|e| e.tag == tag && e.kind != Kind::SshKey)
     }
 
-    /// The value of the entry `id` for an answer, and its use.
-    pub fn hand_out(&self, id: &str) -> Option<(Zeroizing<String>, Use)> {
+    /// The value of the entry `id` for an answer.
+    pub fn hand_out(&self, id: &str) -> Option<Zeroizing<String>> {
         let entry = self.entries().iter().find(|e| e.id == id && e.kind != Kind::SshKey)?;
-        Some((Zeroizing::new(entry.value.clone()), entry.use_))
+        Some(Zeroizing::new(entry.value.clone()))
     }
 
     /// Keeps a typed value as a suggestion while the vault is open; false when closed or already held.
@@ -109,12 +109,10 @@ pub fn prune(state: &mut State) {
     }
 }
 
-/// Sets the session's grant of the entry `id`; the hooks are told of a change. Allowing needs an entry used for the
-/// session.
+/// Sets the session's grant of the entry `id`; the hooks are told of a change.
 pub fn grant(state: &mut State, session: Id, id: &str, grant: Grant) -> Result<(), String> {
-    let entry = state.vault.entries().iter().find(|e| e.id == id).ok_or_else(|| "no such entry, or the vault is closed".to_owned())?;
-    if grant == Grant::Allowed && entry.use_ == Use::Each {
-        return Err("an entry asked for on every use can't be allowed".to_owned());
+    if !state.vault.entries().iter().any(|e| e.id == id) {
+        return Err("no such entry, or the vault is closed".to_owned());
     }
     let open = state.sessions.get_mut(&session).ok_or_else(|| "the session ended".to_owned())?;
     if open.access.set(id, grant)? {
@@ -236,13 +234,13 @@ pub fn show(state: &State, session: Id) -> serde_json::Value {
                 .vault
                 .entries
                 .iter()
-                .map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "created": e.created, "access": access(&e.id) }))
+                .map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "created": e.created, "access": access(&e.id) }))
                 .collect(),
             vault.suggestions.iter().map(|s| json!({ "id": s.id, "prompt": s.prompt })).collect(),
         ),
         _ => (Vec::new(), Vec::new()),
     };
-    let forward = open.is_some_and(|s| s.forward);
+    let forward = open.is_some_and(|s| s.access.forward());
     let upstream = open.is_some_and(|s| s.upstream.is_some());
     json!({ "state": state.vault.shown(), "entries": entries, "suggestions": suggestions, "forward": forward, "upstream": upstream })
 }
@@ -250,13 +248,13 @@ pub fn show(state: &State, session: Id) -> serde_json::Value {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 enum Change {
-    Add { name: String, #[serde(default)] tag: String, kind: Kind, #[serde(rename = "use")] use_: Use, value: String },
-    Edit { id: String, name: Option<String>, tag: Option<String>, kind: Option<Kind>, #[serde(rename = "use")] use_: Option<Use>, value: Option<String> },
+    Add { name: String, #[serde(default)] tag: String, kind: Kind, value: String },
+    Edit { id: String, name: Option<String>, tag: Option<String>, kind: Option<Kind>, value: Option<String> },
     Delete { id: String },
     /// The session's grant of the entry, not the vault's.
     Access { id: String, access: Grant },
-    /// A suggestion becomes an entry under the name, tag, kind and use given.
-    Save { id: String, name: String, #[serde(default)] tag: String, kind: Kind, #[serde(rename = "use")] use_: Use },
+    /// A suggestion becomes an entry under the name, tag and kind given.
+    Save { id: String, name: String, #[serde(default)] tag: String, kind: Kind },
     Dismiss { id: String },
     /// The session's ssh-agent offers the user's own agent's keys too.
     Forward { on: bool },
@@ -297,17 +295,17 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
     let taken = |tag: &str, except: &str| vault.entries.iter().any(|e| e.tag == tag && e.id != except);
     let bad_tag = |tag: &str| format!("tag {tag} is taken or not made of letters, digits, - _ .");
     let id = match change {
-        Change::Add { name, tag, kind, use_, value } => {
+        Change::Add { name, tag, kind, value } => {
             let tag = new_tag(kind, tag)?;
             if !is_tag(&tag) || taken(&tag, "") {
                 return Err(bad_tag(&tag));
             }
             let value = if kind == Kind::SshKey { key_text(&value)? } else { value };
             let id = random_hex::<8>().map_err(|e| e.to_string())?;
-            vault.entries.push(Entry { id: id.clone(), name, tag, kind, use_, value, created: now() });
+            vault.entries.push(Entry { id: id.clone(), name, tag, kind, value, created: now() });
             id
         }
-        Change::Save { id, name, tag, kind, use_ } => {
+        Change::Save { id, name, tag, kind } => {
             if kind == Kind::SshKey || kind == Kind::Typed {
                 return Err("a typed value is kept as a password or a token".to_owned());
             }
@@ -318,7 +316,7 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
             let at = suggestions.iter().position(|s| s.id == id).ok_or("no such suggestion")?;
             let suggestion = suggestions.remove(at);
             let entry_id = random_hex::<8>().map_err(|e| e.to_string())?;
-            vault.entries.push(Entry { id: entry_id.clone(), name, tag, kind, use_, value: suggestion.value.to_string(), created: now() });
+            vault.entries.push(Entry { id: entry_id.clone(), name, tag, kind, value: suggestion.value.to_string(), created: now() });
             entry_id
         }
         Change::Dismiss { id } => {
@@ -326,7 +324,7 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
             suggestions.remove(at);
             return Ok(id);
         }
-        Change::Edit { id, name, tag, kind, use_, value } => {
+        Change::Edit { id, name, tag, kind, value } => {
             if let Some(tag) = &tag
                 && (!is_tag(tag) || taken(tag, &id))
             {
@@ -347,7 +345,6 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
                 entry.tag = tag;
             }
             entry.kind = kind.unwrap_or(entry.kind);
-            entry.use_ = use_.unwrap_or(entry.use_);
             if let Some(value) = value {
                 std::mem::replace(&mut entry.value, value).zeroize();
             }
@@ -371,7 +368,7 @@ fn apply(ctx: &Context, session: Id, parsed: Change) -> Result<String, String> {
         if on && open.upstream.is_none() {
             return Err("there is no ssh-agent of yours to forward to".to_owned());
         }
-        open.forward = on;
+        open.access.set_forward(on)?;
         emit(&json!({ "vault": state.vault.shown() }));
         return Ok("forward".to_owned());
     }
@@ -431,7 +428,7 @@ pub async fn list(stream: &mut UnixStream, ctx: &Context, session: Id) {
             .vault
             .entries()
             .iter()
-            .map(|e| json!({ "tag": e.tag, "name": e.name, "kind": e.kind, "use": e.use_, "access": open.map_or(Grant::Ask, |s| s.access.of(&e.id)) }))
+            .map(|e| json!({ "tag": e.tag, "name": e.name, "kind": e.kind, "access": open.map_or(Grant::Ask, |s| s.access.of(&e.id)) }))
             .collect()
     };
     respond(stream, "200 OK", json!(listed).to_string().as_bytes()).await;

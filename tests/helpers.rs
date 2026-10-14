@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use secrets::vault::{Costs, Entry, Kind, Use, Vault};
+use secrets::vault::{Costs, Entry, Kind, Vault};
 
 const RELAY: &str = env!("CARGO_BIN_EXE_secrets-relay");
 const MASK_RUN: &str = env!("CARGO_BIN_EXE_secrets-mask-run");
@@ -138,8 +138,8 @@ impl Relay {
     }
 
     /// Adds an entry; its id.
-    fn add(&mut self, name: &str, tag: &str, kind: &str, use_: &str, value: &str) -> String {
-        let added = serde_json::json!({ "op": "add", "name": name, "tag": tag, "kind": kind, "use": use_, "value": value });
+    fn add(&mut self, name: &str, tag: &str, kind: &str, value: &str) -> String {
+        let added = serde_json::json!({ "op": "add", "name": name, "tag": tag, "kind": kind, "value": value });
         let (status, body) = post_reply(&self.socket, "/vault", &added);
         assert_eq!(status, "200", "{body}");
         assert_eq!(self.next_event(), serde_json::json!({ "vault": "open" }));
@@ -148,7 +148,7 @@ impl Relay {
 
     /// Adds an ssh key entry from a key file; the relay's status and reason.
     fn add_key(&mut self, tag: &str, file: &Path) -> (String, String) {
-        let added = serde_json::json!({ "op": "add", "name": format!("{tag} key"), "tag": tag, "kind": "ssh-key", "use": "session", "value": file });
+        let added = serde_json::json!({ "op": "add", "name": format!("{tag} key"), "tag": tag, "kind": "ssh-key", "value": file });
         let reply = post_reply(&self.socket, "/vault", &added);
         if reply.0 == "200" {
             assert_eq!(self.next_event(), serde_json::json!({ "vault": "open" }));
@@ -381,7 +381,7 @@ fn a_session_ends_with_its_claude_code_process_and_its_waiting_requests_are_refu
 fn a_reattach_keeps_the_open_vault_and_brings_back_the_waiting_requests() {
     let mut relay = Relay::start("reattach");
     relay.create_vault("pass phrase");
-    relay.add("Kept", "kept", "password", "session", "kept-value-1");
+    relay.add("Kept", "kept", "password", "kept-value-1");
     let asking = relay.mask_run(r#"x=$("$SECRETS" ask kept); echo "got $x""#).spawn().unwrap();
     let ask = relay.next_ask();
     let ready = relay.reattach();
@@ -403,7 +403,7 @@ fn every_session_shares_the_one_vault_and_gets_its_own_requests() {
     assert_eq!(other.next_event(), serde_json::json!({ "vault": "open" }), "opened once, open for every session");
     let late = data.join("late");
     other.call(&relay.bin, "sleep 1; echo value-late-1", &late);
-    relay.add("Late", "late", "password", "session", "value-late-1");
+    relay.add("Late", "late", "password", "value-late-1");
     assert_eq!(other.next_event(), serde_json::json!({ "vault": "open" }));
     assert!(file_holds(&late, "[secret]\n"), "a running call masks what another session saved: {:?}", std::fs::read_to_string(&late));
     let asked = data.join("asked");
@@ -453,7 +453,7 @@ fn a_change_that_cannot_be_saved_changes_nothing() {
     relay.create_vault("pass phrase");
     let dir = data.join("secrets");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let added = serde_json::json!({ "op": "add", "name": "New", "tag": "new", "kind": "password", "use": "session", "value": "value-new-1" });
+    let added = serde_json::json!({ "op": "add", "name": "New", "tag": "new", "kind": "password", "value": "value-new-1" });
     let (status, reason) = post_reply(&relay.socket, "/vault", &added);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(status, "400", "{reason}");
@@ -617,7 +617,7 @@ fn each_askpass_asks_with_its_programs_tag() {
     let data = data_dir("askpass");
     let mut relay = Relay::start_in("askpass", &data);
     relay.create_vault("pass phrase");
-    let id = relay.add("Login", "sudo", "password", "session", "sudo-pw-12");
+    let id = relay.add("Login", "sudo", "password", "sudo-pw-12");
     for (helper, tag) in [("secrets-askpass-ssh", "ssh"), ("secrets-askpass-git", "git")] {
         let child = Command::new(relay.bin.join(helper)).arg("Password:").env("SECRETS_RELAY", &relay.socket).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let ask = relay.next_ask();
@@ -646,8 +646,8 @@ fn an_open_vault_hands_a_tagged_entry_out_as_decided_and_masks_it_everywhere() {
     relay.create_vault("correct horse");
     let file = data.join("secrets/vault");
     assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-    let id = relay.add("Prod DB", "db", "password", "session", "hunter22x");
-    let again = serde_json::json!({ "op": "add", "name": "Prod DB", "tag": "db", "kind": "password", "use": "session", "value": "x" });
+    let id = relay.add("Prod DB", "db", "password", "hunter22x");
+    let again = serde_json::json!({ "op": "add", "name": "Prod DB", "tag": "db", "kind": "password", "value": "x" });
     assert_eq!(post_reply(&relay.socket, "/vault", &again), ("400".to_owned(), "tag db is taken or not made of letters, digits, - _ .".to_owned()));
     assert!(memchr::memmem::find(&std::fs::read(&file).unwrap(), b"hunter22x").is_none());
 
@@ -669,7 +669,7 @@ fn an_open_vault_hands_a_tagged_entry_out_as_decided_and_masks_it_everywhere() {
 
     let list = relay.secrets(&["list"]).spawn().unwrap();
     relay.decide_next("list", "give");
-    assert_eq!(stdout(&list.wait_with_output().unwrap()), "db\tpassword\tsession\tallowed\tProd DB\n");
+    assert_eq!(stdout(&list.wait_with_output().unwrap()), "db\tpassword\tallowed\tProd DB\n");
     assert_eq!(stdout(&run(relay.mask_run("echo the db password is hunter22x"))), "the db password is [secret]\n");
     let masked = post_reply(&relay.socket, "/mask", &serde_json::json!({ "texts": ["pw hunter22x here", "plain"] })).1;
     assert_eq!(serde_json::from_str::<serde_json::Value>(&masked).unwrap(), serde_json::json!({ "texts": ["pw [secret] here", "plain"] }));
@@ -694,7 +694,7 @@ fn a_value_typed_while_the_vault_is_open_is_only_suggested_and_kept_when_saved()
     assert!(!shown.to_string().contains("typed-secret-1"));
     assert_eq!(stdout(&run(relay.mask_run("echo typed-secret-1"))), "[secret]\n");
 
-    let save = serde_json::json!({ "op": "save", "id": shown["suggestions"][0]["id"], "name": "sudo", "tag": "sudo", "kind": "password", "use": "each" });
+    let save = serde_json::json!({ "op": "save", "id": shown["suggestions"][0]["id"], "name": "sudo", "tag": "sudo", "kind": "password" });
     assert_eq!(post(&relay.socket, "/vault", &save), "200");
     relay.next_event();
     let (_, shown) = relay.get("/vault");
@@ -708,7 +708,7 @@ fn a_new_passphrase_keeps_the_entries_and_the_sessions_access() {
     let data = data_dir("rekey");
     let mut relay = Relay::start_in("rekey", &data);
     relay.create_vault("old phrase");
-    let id = relay.add("Login", "sudo", "password", "session", "sudo-pw-34");
+    let id = relay.add("Login", "sudo", "password", "sudo-pw-34");
     assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "access", "id": id, "access": "allowed" })), "200");
     assert_eq!(post_reply(&relay.socket, "/passphrase", &serde_json::json!({ "passphrase": "" })).0, "400");
     assert_eq!(post(&relay.socket, "/passphrase", &serde_json::json!({ "passphrase": "new phrase" })), "204");
@@ -731,22 +731,21 @@ fn a_sessions_access_outlives_its_relay_and_ends_with_its_transcript() {
     std::fs::write(projects.join("-home-x").join("resumable.jsonl"), "").unwrap();
     let mut relay = Relay::start_in("access", &data);
     relay.create_vault("pass phrase");
-    let login = relay.add("Login", "sudo", "password", "session", "sudo-pw-56");
-    let each = relay.add("Deploy", "deploy", "token", "each", "deploy-tok-56");
-    let gone = relay.add("Old", "old", "password", "session", "old-pw-56");
+    let login = relay.add("Login", "sudo", "password", "sudo-pw-56");
+    let deploy = relay.add("Deploy", "deploy", "token", "deploy-tok-56");
+    let gone = relay.add("Old", "old", "password", "old-pw-56");
     let set = |relay: &Relay, id: &str, access: &str| post_reply(&relay.socket, "/vault", &serde_json::json!({ "op": "access", "id": id, "access": access }));
     assert_eq!(set(&relay, &login, "allowed").0, "200", "before the session is named, kept in memory");
     assert_eq!(post(&relay.socket, "/session", &serde_json::json!({ "id": "../x" })), "400");
     assert_eq!(post(&relay.socket, "/session", &serde_json::json!({ "id": "first-session" })), "204");
     assert_eq!(relay.get("/vault").1["entries"][0]["access"], "ask", "a named session starts from its own file");
-    for (id, access) in [(&login, "allowed"), (&each, "refused"), (&gone, "refused")] {
+    for (id, access) in [(&login, "allowed"), (&deploy, "refused"), (&gone, "refused")] {
         assert_eq!(set(&relay, id, access).0, "200");
     }
-    assert_eq!(set(&relay, &each, "allowed"), ("400".to_owned(), "an entry asked for on every use can't be allowed".to_owned()));
     assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "delete", "id": gone })), "200");
     let file = data.join("secrets/sessions/first-session.json");
     let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    assert_eq!(stored, serde_json::json!({ "allowed": [login], "refused": [each] }), "a deleted entry's grant goes with it");
+    assert_eq!(stored, serde_json::json!({ "allowed": [login], "refused": [deploy], "forward": false }), "a deleted entry's grant goes with it");
     assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
     drop(relay);
 
@@ -760,7 +759,7 @@ fn a_sessions_access_outlives_its_relay_and_ends_with_its_transcript() {
     assert_eq!(access, ["allowed", "refused"], "{shown}");
     let list = resumed.secrets(&["list"]).spawn().unwrap();
     resumed.decide_next("list", "give");
-    assert_eq!(stdout(&list.wait_with_output().unwrap()), "sudo\tpassword\tsession\tallowed\tLogin\ndeploy\ttoken\teach\trefused\tDeploy\n");
+    assert_eq!(stdout(&list.wait_with_output().unwrap()), "sudo\tpassword\tallowed\tLogin\ndeploy\ttoken\trefused\tDeploy\n");
 
     std::fs::write(data.join("secrets/sessions/ended.json"), r#"{"allowed":[],"refused":[]}"#).unwrap();
     assert_eq!(post(&resumed.socket, "/session", &serde_json::json!({ "id": "resumable", "projects": projects })), "204");
@@ -781,7 +780,7 @@ fn a_closed_vault_offers_nothing_and_opens_only_with_its_passphrase() {
     let costs = Costs { memory_kib: 64, time: 1, lanes: 1 };
     let mut vault = Vault::create(b"pass phrase", costs).unwrap();
     for (tag, kind, value) in [("api", Kind::Token, "tok-998877"), ("typed-1", Kind::Typed, "old-typed-value")] {
-        vault.entries.push(Entry { id: tag.to_owned(), name: tag.to_owned(), tag: tag.to_owned(), kind, use_: Use::Each, value: value.to_owned(), created: 0 });
+        vault.entries.push(Entry { id: tag.to_owned(), name: tag.to_owned(), tag: tag.to_owned(), kind, value: value.to_owned(), created: 0 });
     }
     let file = data.join("secrets/vault");
     vault.save(&file).unwrap();
@@ -913,12 +912,21 @@ fn forwarding_offers_and_signs_with_the_users_own_agent_only_when_switched_on() 
     std::fs::write(&message, "sign me").unwrap();
     assert!(!run(agent_sign(&relay.agent(), &theirs, &message)).status.success());
 
+    assert_eq!(post(&relay.socket, "/session", &serde_json::json!({ "id": "forwarding" })), "204");
     assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "forward", "on": true })), "200");
     assert_eq!(listed(&relay.agent()), [public_of(&mine), public_of(&theirs)]);
     let out = run(agent_sign(&relay.agent(), &theirs, &message));
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(verified(&theirs, &message));
     drop(relay);
+
+    let resumed = Relay::start_with("forward-resumed", &data, &[("SECRETS_UPSTREAM_AGENT", &upstream_socket)]);
+    assert!(!listed(&resumed.agent()).contains(&public_of(&theirs)), "a session not yet named forwards nothing");
+    assert_eq!(post(&resumed.socket, "/session", &serde_json::json!({ "id": "forwarding" })), "204");
+    assert_eq!(listed(&resumed.agent()), [public_of(&theirs)], "a resumed session forwards as it did");
+    assert_eq!(post(&resumed.socket, "/session", &serde_json::json!({ "id": "new-session" })), "204");
+    assert!(!listed(&resumed.agent()).contains(&public_of(&theirs)), "a new session starts with forwarding off");
+    drop(resumed);
     std::fs::remove_dir_all(&data).unwrap();
 }
 

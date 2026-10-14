@@ -1,13 +1,12 @@
 import type { Tab, Tabs } from './tabs'
 
 export type EntryKind = 'password' | 'token' | 'ssh-key'
-export type EntryUse = 'session' | 'each'
 
 /** What this session lets its agent have of an entry: a card each time, no card, or nothing. */
 export type Access = 'ask' | 'allowed' | 'refused'
 
 /** A vault entry as the view shows it: no value; `access` is this session's, not the vault's. */
-export type ViewEntry = { id: string; name: string; tag: string; kind: EntryKind; use: EntryUse; access: Access }
+export type ViewEntry = { id: string; name: string; tag: string; kind: EntryKind; access: Access }
 
 /** A tag the agent asks for, and what asks with it. */
 export type TagChoice = { tag: string; what: string }
@@ -16,7 +15,7 @@ export type TagChoice = { tag: string; what: string }
 export type Suggestion = { id: string; prompt: string }
 
 /** The add or edit form; `id` null adds. With `suggestion`, it saves that suggestion's value as the new entry. */
-export type Form = { id: string | null; suggestion: string | null; name: string; tag: string; kind: EntryKind; use: EntryUse }
+export type Form = { id: string | null; suggestion: string | null; name: string; tag: string; kind: EntryKind }
 
 /** The fields whose text the hooks hold: an entry's value, the passphrase and its repeat. */
 export type SecretField = 'value' | 'passphrase' | 'again'
@@ -50,6 +49,8 @@ export type VaultAction =
   | { kind: 'rekey' }
   /** Closes the vault for every session. */
   | { kind: 'lock' }
+  /** The session's ssh-agent offers the user's own agent's keys too, with no card. */
+  | { kind: 'forward'; on: boolean }
 
 export type VaultProps = {
   state: 'absent' | 'locked' | 'open'
@@ -59,6 +60,8 @@ export type VaultProps = {
   suggestions: Suggestion[]
   /** What the form's tag field offers before the person's own text; tags other entries hold are left out there. */
   tagChoices: TagChoice[]
+  /** Whether this session's ssh-agent offers the user's own agent's keys too; null when there is no agent of theirs. */
+  forward: boolean | null
   tabs: Tabs
   columns: number
   rows: number

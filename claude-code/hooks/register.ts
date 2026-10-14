@@ -11,7 +11,7 @@ import type { Offered, RequestEntry, RequestsMessage, RequestsProps } from './re
 import { fillSlot, hasSlot } from './slot'
 import { askDecision, listDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
-import { layout } from './config-view'
+import { drawPage as configLines } from './config-view'
 import { contentRows } from './vault-view'
 import type { Access, Collision, SecretField, Suggestion, TagChoice, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
 
@@ -53,7 +53,7 @@ const ROW_COMPONENTS = [
   'InfoNotice',
 ] as const satisfies readonly SidebarRowComponent[]
 
-type Granted = { id: string; name: string; tag: string; kind: string; use: 'session' | 'each'; access: Access }
+type Granted = { id: string; name: string; tag: string; kind: string; access: Access }
 /** Who asks, and `live`: the command lines of the calls whose output runs through the relay then. */
 type Requester = { pid: number; cmdline: string; inside: boolean; live: string[] }
 type Asked = Requester & { id: string; prompt: string; tag: string | null; entry: Granted | null }
@@ -130,7 +130,6 @@ let hasMasked = false
 /** The Config tab's options, in the plugin's store: changing them doesn't reload the module and its relay. */
 let maskMinLength = DEFAULT_MASK_MIN
 let unlockAtStart = true
-let forwardAtStart = true
 /** The user's settings file, where the auto-mode line lives. */
 let settingsPath: string | null = null
 /** The auto-mode text being edited, typed or pasted; the line in the settings now, null when there is none. */
@@ -264,7 +263,6 @@ export function register(on: On) {
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
     maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
     unlockAtStart = await option($, 'unlockAtStart', true)
-    forwardAtStart = await option($, 'forwardAtStart', true)
     hasMasked = (await $.state.get({ plugin: 'secrets', key: 'hasMasked' })).value ?? false
 
     const runtimeDir = await $.env.get('XDG_RUNTIME_DIR')
@@ -281,7 +279,6 @@ export function register(on: On) {
     const relay = await startRelay($)
     await useRelay($, relay)
     vault = { state: relay.state, entries: [], suggestions: [], forward: upstream === '' ? null : false }
-    await forwardAsSwitched($)
     if (unlockAtStart && vault.state === 'locked') {
       drawerTab = 'vault'
       await $.sidebar.select({ id: SIDEBAR_ID })
@@ -527,6 +524,7 @@ export function register(on: On) {
         entries: vault.entries.map(({ created: _created, ...entry }) => entry),
         suggestions: [...vault.suggestions],
         tagChoices: tagChoices(),
+        forward: vault.forward,
         tabs,
         columns,
         rows: room,
@@ -550,11 +548,9 @@ export function register(on: On) {
         confirmed: configConfirmed,
         unlockAtStart,
         maskMinLength,
-        forward: vault.forward,
-        forwardAtStart,
         error: configError,
       }
-      const height = Math.min(room, TAB_ROWS + layout(props, configDraft, true).length)
+      const height = Math.min(room, TAB_ROWS + configLines(props, { focus: 'text', pending: [] }).length)
       return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })
     }
     let filled = tree
@@ -616,7 +612,6 @@ async function reattach($: EngineInterface, why: Error, wait: number) {
     const relay = await startRelay($)
     await useRelay($, relay)
     await refreshVault($)
-    await forwardAsSwitched($)
     say($, 'The secrets daemon restarted: requests waiting before it did are gone.', false)
   } catch (error) {
     await reattach($, error as Error, wait * 2)
@@ -644,15 +639,6 @@ async function useRelay($: EngineInterface, relay: Attached) {
   relayReady = true
   await nameSession($, await $.session.id())
   await sendSettings($)
-}
-
-/** The session's ssh-agent forwards to the user's own as the Config tab says: the session's switch, else the start setting. */
-async function forwardAsSwitched($: EngineInterface) {
-  const switched = (await $.state.get({ plugin: 'secrets', key: 'forward' })).value
-  if (upstream === '' || !(switched ?? forwardAtStart)) return
-  const refused = await relayChange($, { op: 'forward', on: true })
-  if (refused !== null) throw new Error(`secrets: the daemon didn't forward to your ssh-agent: ${refused}`)
-  vault = { ...vault, forward: true }
 }
 
 async function readRelay($: EngineInterface, ready: (started: Attached) => void) {
@@ -884,22 +870,23 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
     if (reply !== null) vaultError = reply.status === 204 ? null : reply.text || `The daemon answered ${reply.status}.`
   }
   else if (action.kind === 'access') await changeVault($, { op: 'access', id: action.id, access: action.access })
+  else if (action.kind === 'forward') await changeVault($, { op: 'forward', on: action.on })
   else if (action.kind === 'delete') {
     if (await changeVault($, { op: 'delete', id: action.id })) closeForm()
   } else if (action.kind === 'dismiss') {
     if (await changeVault($, { op: 'dismiss', id: action.id })) closeForm()
   } else {
-    const { id, suggestion, name, tag, kind, use } = action.form
+    const { id, suggestion, name, tag, kind } = action.form
     if (name.trim() === '') vaultError = 'Name it.'
     else if (suggestion !== null) {
-      if (await changeVault($, { op: 'save', id: suggestion, name, tag, kind, use })) closeForm()
+      if (await changeVault($, { op: 'save', id: suggestion, name, tag, kind })) closeForm()
     } else if (id === null && fields.value === '') vaultError = 'A new entry needs a value.'
     else {
       const value = fields.value
       const change =
         id === null
-          ? { op: 'add', name, tag, kind, use, value }
-          : { op: 'edit', id, name, kind, use, ...(tag === '' ? {} : { tag }), ...(value === '' ? {} : { value }) }
+          ? { op: 'add', name, tag, kind, value }
+          : { op: 'edit', id, name, kind, ...(tag === '' ? {} : { tag }), ...(value === '' ? {} : { value }) }
       if (await changeVault($, change)) closeForm()
     }
   }
@@ -995,16 +982,9 @@ async function onConfigAction($: EngineInterface, action: ConfigAction) {
   configError = null
   if (action.kind === 'apply') await applyAutoMode($)
   else if (action.kind === 'suggest') configDraft = SUGGESTED
-  else if (action.kind === 'forward') {
-    configError = await relayChange($, { op: 'forward', on: action.on })
-    if (configError === null) await $.state.set({ plugin: 'secrets', key: 'forward' }, action.on)
-  }
   else if (action.kind === 'unlockAtStart') {
     await $.store.set('unlockAtStart', action.on)
     unlockAtStart = action.on
-  } else if (action.kind === 'forwardAtStart') {
-    await $.store.set('forwardAtStart', action.on)
-    forwardAtStart = action.on
   } else {
     await $.store.set('maskMinLength', action.value)
     maskMinLength = action.value

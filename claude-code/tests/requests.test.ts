@@ -73,12 +73,13 @@ test('backspace, ctrl+u and Enter are edits too, in order', async () => {
   expect(shownLength(entry('a', 'p', 5), state.pending)).toBe(0)
 })
 
-test('Ctrl+R or a click on the mark asks to see the typed value; a card holding a vault entry has none', async () => {
+test('Ctrl+R or a click on Show asks to see the typed value; a card holding a vault entry has none', async () => {
   expect(onKey(START, ENTRIES, FRAME, { key: 'r', ctrl: true }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'peek' }])
   const fieldRow = view(ENTRIES, FRAME, START).findIndex(r => r.id === 'a' && r.kind === 'field')
-  const mark = 4 + fieldRoom(FRAME.columns, false)
-  expect(onClick(START, ENTRIES, FRAME, fieldRow, mark).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'peek' }])
-  expect(onClick(START, ENTRIES, FRAME, fieldRow, mark - 1).post?.edits).toEqual([])
+  const show = 4 + fieldRoom(FRAME.columns, false)
+  for (const x of [show, show + 4]) expect(onClick(START, ENTRIES, FRAME, fieldRow, x).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'peek' }])
+  expect(onClick(START, ENTRIES, FRAME, fieldRow, show - 1).post?.edits).toEqual([])
+  expect(onClick(START, ENTRIES, FRAME, fieldRow, show + 5).post?.edits).toEqual([])
   const offered = [{ ...entry('a', 'db'), offer: [{ id: 'e1', label: 'Prod DB · db' }], chosen: 'e1' }]
   expect(onClick(START, offered, FRAME, fieldRow, 4 + fieldRoom(FRAME.columns, true)).state.isMenuOpen).toBe(true)
   expect(shownText('abc', entry('a', 'p'), [{ seq: 1, id: 'a', kind: 'append', text: 'd' }, { seq: 2, id: 'b', kind: 'clear' }])).toBe('abcd')

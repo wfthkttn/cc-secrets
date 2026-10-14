@@ -9,10 +9,11 @@ import { Popouts } from './popouts'
 import { listHeight } from './requests'
 import type { ListResume, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { fillSlot, hasSlot } from './slot'
-import { askDecision, listDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
+import { askDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
 import { drawPage as configLines } from './config-view'
 import { contentRows } from './vault-view'
+import { VAULT_DESCRIPTION, VAULT_TOOL, VAULT_TOOL_NAME, vaultListing, vaultVerdict } from './vault-tool'
 import type { Access, Collision, SecretField, Suggestion, TagChoice, VaultAction, VaultMessage, VaultProps, VaultResume, ViewEntry } from './vault-view-props'
 
 const SIDEBAR_ID = 'pass'
@@ -58,7 +59,6 @@ type Granted = { id: string; name: string; tag: string; kind: string; access: Ac
 type Requester = { pid: number; cmdline: string; inside: boolean; live: string[] }
 type Asked = Requester & { id: string; prompt: string; tag: string | null; entry: Granted | null }
 type Sign = Omit<Granted, 'id'> & Requester & { id: string }
-type VaultList = Requester & { id: string }
 type VaultState = 'absent' | 'locked' | 'open'
 type VaultEntry = ViewEntry & { created: number }
 type Decision = 'give' | 'session' | 'refuse'
@@ -68,7 +68,6 @@ type RelayEvent =
   | { ask: Asked }
   | { gone: string }
   | { sign: Sign }
-  | { list: VaultList }
   | { vault: VaultState }
   | { masked: true }
   | { masking: boolean }
@@ -264,6 +263,8 @@ export function register(on: On) {
     await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
     popouts = new Popouts(POPOUT_MS, (ms, fn) => $.clock.after(ms, fn), () => syncPopout($))
     await $.command.register({ name: 'pass-demo', description: 'Show one sample request of each kind; no program waits on them' })
+    const { tool } = await $.tool.register({ name: VAULT_TOOL_NAME, description: VAULT_DESCRIPTION, inputSchema: { type: 'object', properties: {} }, isDeferred: false })
+    if (tool !== VAULT_TOOL) throw new Error(`secrets: the vault tool registered as ${tool}, not ${VAULT_TOOL}`)
     // A reload starts with no requests until the daemon sends the waiting ones again; the host still shows what the
     // old module set.
     await $.sidebar.badge({ id: SIDEBAR_ID, count: 0, level: 'urgent' })
@@ -306,7 +307,16 @@ export function register(on: On) {
     return next(e)
   })
 
+  // The vault tool lists names, never values: the main loop may call it with no dialog; subagents get nothing.
+  on('tool.check', { tool: VAULT_TOOL }, async ($, e) => vaultVerdict(e.agentId))
+
   on('tool.call', async ($, e, next) => {
+    // The plugin's own tool is not among the tool names the types know.
+    const name: string = e.tool
+    if (name === VAULT_TOOL) {
+      const verdict = vaultVerdict(e.agentId)
+      return verdict.decision === 'allow' ? { result: vaultListing(vault.state, vault.entries) } : { deny: verdict.reason }
+    }
     const { tool: _tool, tool_use_id: _id, agentId: _agent, ...input } = e
     if (vault.state === 'open') {
       const { label } = (await relayJson($, '/check', { texts: stringsIn(input) })) as { label: string | null }
@@ -678,7 +688,6 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
       } else if ('ask' in event) await onAsk($, event.ask)
       else if ('gone' in event) dropRequest(event.gone)
       else if ('sign' in event) await onSign($, event.sign)
-      else if ('list' in event) await decideRequest($, event.list.id, listDecision(event.list, callsBy(event.list)))
       else if ('vault' in event) await refreshVault($)
       else if ('masking' in event) masking = event.masking
       else if ('masked' in event) {

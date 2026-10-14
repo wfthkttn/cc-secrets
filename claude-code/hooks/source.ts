@@ -66,12 +66,6 @@ export function askDecision(ask: Requester & { entry: Granted | null }, calls: C
   return call !== undefined && ask.entry !== null && ask.entry.access === 'allowed' ? 'give' : 'card'
 }
 
-/** The vault's tags and names: only to a main-loop command; refused to any other and to one that can't be matched. */
-export function listDecision(list: Requester, calls: Calls): 'give' | 'refuse' {
-  const call = callFor(list, calls)
-  return call !== undefined && call !== 'unknown' && call.agentId === undefined ? 'give' : 'refuse'
-}
-
 /**
  * Where a paste into the list goes: the selected card's typed value, else the prompt, when no card is selected or the
  * card takes no typing (a sign card, a vault entry in its field, typing off).

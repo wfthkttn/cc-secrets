@@ -667,9 +667,9 @@ fn an_open_vault_hands_a_tagged_entry_out_as_decided_and_masks_it_everywhere() {
     assert!(relay.next_ask()["entry"].is_null());
     drop(unknown);
 
-    let list = relay.secrets(&["list"]).spawn().unwrap();
-    relay.decide_next("list", "give");
-    assert_eq!(stdout(&list.wait_with_output().unwrap()), "db\tpassword\tallowed\tProd DB\n");
+    let shown = relay.get("/vault").1;
+    assert_eq!((shown["entries"][0]["tag"].as_str(), shown["entries"][0]["access"].as_str()), (Some("db"), Some("allowed")));
+    assert!(!shown.to_string().contains("hunter22x"));
     assert_eq!(stdout(&run(relay.mask_run("echo the db password is hunter22x"))), "the db password is [secret]\n");
     let masked = post_reply(&relay.socket, "/mask", &serde_json::json!({ "texts": ["pw hunter22x here", "plain"] })).1;
     assert_eq!(serde_json::from_str::<serde_json::Value>(&masked).unwrap(), serde_json::json!({ "texts": ["pw [secret] here", "plain"] }));
@@ -757,9 +757,6 @@ fn a_sessions_access_outlives_its_relay_and_ends_with_its_transcript() {
     let shown = resumed.get("/vault").1;
     let access: Vec<_> = shown["entries"].as_array().unwrap().iter().map(|e| e["access"].as_str().unwrap().to_owned()).collect();
     assert_eq!(access, ["allowed", "refused"], "{shown}");
-    let list = resumed.secrets(&["list"]).spawn().unwrap();
-    resumed.decide_next("list", "give");
-    assert_eq!(stdout(&list.wait_with_output().unwrap()), "sudo\tpassword\tallowed\tLogin\ndeploy\ttoken\trefused\tDeploy\n");
 
     std::fs::write(data.join("secrets/sessions/ended.json"), r#"{"allowed":[],"refused":[]}"#).unwrap();
     assert_eq!(post(&resumed.socket, "/session", &serde_json::json!({ "id": "resumable", "projects": projects })), "204");
@@ -787,8 +784,8 @@ fn a_closed_vault_offers_nothing_and_opens_only_with_its_passphrase() {
 
     let mut relay = Relay::start_in("closed", &data);
     assert_eq!(relay.vault, "locked");
-    let refused = run(relay.secrets(&["list"]));
-    assert_eq!(String::from_utf8_lossy(&refused.stderr), "secrets: the vault is closed\n");
+    let shown = relay.get("/vault").1;
+    assert_eq!((shown["state"].as_str(), shown["entries"].as_array().map(Vec::len)), (Some("locked"), Some(0)));
     let asking = relay.secrets(&["ask", "--tag", "api", "API token"]).spawn().unwrap();
     let ask = relay.next_ask();
     assert!(ask["entry"].is_null(), "{ask}");

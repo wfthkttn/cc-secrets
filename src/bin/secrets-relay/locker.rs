@@ -16,7 +16,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::access::Grant;
 use crate::session::Id;
-use crate::{COSTS, Context, Decision, Shared, State, decide, emit, lock, now, peer, respond};
+use crate::{COSTS, Context, Shared, State, emit, lock, now, respond};
 
 pub enum Locker {
     Absent,
@@ -402,34 +402,4 @@ pub async fn change_vault(stream: &mut UnixStream, ctx: &Context, session: Id, b
         Ok(id) => respond(stream, "200 OK", json!({ "id": id }).to_string().as_bytes()).await,
         Err(reason) => respond(stream, "400 Bad Request", reason.as_bytes()).await,
     }
-}
-
-/// `POST /list`: the vault's entries once the hooks decide; never a value.
-pub async fn list(stream: &mut UnixStream, ctx: &Context, session: Id) {
-    let asked = {
-        let state = lock(ctx);
-        let open = state.sessions.get(&session);
-        let is_open = matches!(state.vault, Locker::Open(_));
-        open.filter(|_| is_open).map(|s| {
-            let by = peer::requester(peer::peer_pid(stream), &ctx.mask_run, s.claude_code);
-            json!({ "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": state.filter.live(s.claude_code) })
-        })
-    };
-    let Some(event) = asked else { return respond(stream, "403 Forbidden", b"the vault is closed").await };
-    match decide(stream, ctx, session, "list", event).await {
-        None => return,
-        Some(Decision::Refuse) => return respond(stream, "403 Forbidden", b"").await,
-        Some(_) => {}
-    }
-    let listed: Vec<_> = {
-        let state = lock(ctx);
-        let open = state.sessions.get(&session);
-        state
-            .vault
-            .entries()
-            .iter()
-            .map(|e| json!({ "tag": e.tag, "name": e.name, "kind": e.kind, "access": open.map_or(Grant::Ask, |s| s.access.of(&e.id)) }))
-            .collect()
-    };
-    respond(stream, "200 OK", json!(listed).to_string().as_bytes()).await;
 }

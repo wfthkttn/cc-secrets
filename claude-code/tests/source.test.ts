@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { askDecision, listDecision, pasteTarget, requestSource, runsIn, signDecision, sourceOf } from '../hooks/source'
+import { askDecision, pasteTarget, requestSource, runsIn, signDecision, sourceOf } from '../hooks/source'
 
 const WRAPPER = (command: string, quote = `'"'"'`) =>
   `/run/current-system/sw/bin/zsh -c source /home/alex/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval '${command.split("'").join(quote)}' < /dev/null && pwd -P >| /tmp/claude-cwd`
@@ -71,10 +71,7 @@ test('a requester outside the session is never matched to a call: its own argv c
   const outside = { cmdline: `fake ${command}`, inside: false, access: 'allowed' as const }
   expect(signDecision(outside, [{ command, agentId: undefined }])).toBe('ask')
   expect(askDecision({ ...outside, entry: { access: 'allowed' } }, [{ command, agentId: undefined }])).toBe('card')
-  expect(listDecision(outside, [{ command, agentId: undefined }])).toBe('refuse')
-  expect(listDecision({ ...outside, inside: true, cmdline: WRAPPER(command) }, [{ command, agentId: undefined }])).toBe('give')
-  expect(listDecision({ ...outside, inside: true, cmdline: WRAPPER(command) }, [{ command, agentId: 'a-1' }])).toBe('refuse')
-  expect(requestSource({ cmdline: 'secrets list', pid: 7, inside: false }, [])).toBe('outside this session: secrets list')
+  expect(requestSource({ cmdline: 'secrets ask x', pid: 7, inside: false }, [])).toBe('outside this session: secrets ask x')
   expect(requestSource({ cmdline: WRAPPER(command), pid: 7, inside: true }, [])).toBe(command)
 })
 
@@ -88,7 +85,6 @@ test('the same command running in the main loop and a subagent gets no vault: a 
   expect(signDecision(sign, both)).toBe('refuse')
   expect(signDecision(sign, [...both].reverse())).toBe('refuse')
   expect(askDecision({ ...sign, entry: { access: 'allowed' } }, both)).toBe('typed card')
-  expect(listDecision(sign, both)).toBe('refuse')
   expect(signDecision(sign, [both[0]!, both[0]!])).toBe('give')
 })
 
@@ -101,7 +97,6 @@ test('the same command in two subagents only is a subagent\'s: refused, no entri
   const sign = { cmdline: WRAPPER(command), inside: true, access: 'allowed' as const }
   expect(signDecision(sign, subagents)).toBe('refuse')
   expect(askDecision({ ...sign, entry: { access: 'allowed' } }, subagents)).toBe('typed card')
-  expect(listDecision(sign, subagents)).toBe('refuse')
 })
 
 test("a mask-run's command line runs the command its wrapper holds, either way of quoting", async () => {
@@ -109,10 +104,6 @@ test("a mask-run's command line runs the command its wrapper holds, either way o
   expect(runsIn(WRAPPER(command), command)).toBe(true)
   expect(runsIn(WRAPPER(command, `'\\''`), command)).toBe(true)
   expect(runsIn(WRAPPER('ls'), command)).toBe(false)
-})
-
-test('a secrets list that matches no running call is refused, as from a background call', async () => {
-  expect(listDecision({ cmdline: WRAPPER('secrets list'), inside: true }, [])).toBe('refuse')
 })
 
 test('a paste goes into a card only while its field takes typing', async () => {

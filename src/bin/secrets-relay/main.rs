@@ -17,8 +17,6 @@
 //! - `POST /ask {prompt, tag?}`: prints `{"ask": {id, prompt, tag, entry, pid, cmdline, inside, live}}`, `entry`
 //!   being the open vault's entry tagged `tag` (no value) or null, then holds the request until answered: 200 with
 //!   the value, 403 when cancelled. A client that hangs up first prints `{"gone": id}`.
-//! - `POST /list`: 403 while the vault is closed; else prints `{"list": {id, pid, cmdline, inside, live}}` and waits
-//!   for a decision: 200 with the entries as JSON (no values), 403 refused.
 //! - `POST /filter`: for `secrets-mask-run` as the session's Claude Code starts it, 403 to anyone else; a call's
 //!   output stream (`secrets::filter`), masked with what that call was handed and the open vault's values.
 //!
@@ -30,7 +28,7 @@
 //! - `POST /session {id, projects?}`: whose grants and forwarding these are (`session_named`).
 //! - `POST /decide {id, decision: "give" | "session" | "refuse"}`: 204, 410 no such request.
 //! - `GET /vault`: `{state, entries, suggestions, forward, upstream}`; never a value. Each entry, like those in `ask`
-//!   and `sign` events and `/list`, carries the session's `access`: `"ask" | "allowed" | "refused"`.
+//!   and `sign` events, carries the session's `access`: `"ask" | "allowed" | "refused"`.
 //! - `POST /vault {op: "add" | "edit" | "delete" | "access" | "save" | "dismiss" | "forward", …}`: 200 `{id}`; 400
 //!   with a reason.
 //! - `POST /settings {maskMinLength}`: 204.
@@ -296,7 +294,7 @@ async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
     let Some(claude_code) = lock(&ctx).sessions.get(&session).map(|s| s.claude_code) else {
         return respond(&mut stream, "410 Gone", b"the session ended").await;
     };
-    let for_claude_code = !matches!(route, ("POST", "/ask" | "/list" | "/filter"));
+    let for_claude_code = !matches!(route, ("POST", "/ask" | "/filter"));
     if for_claude_code && !peer::is_claude_code(&stream, claude_code) {
         return respond(&mut stream, "403 Forbidden", b"").await;
     }
@@ -307,7 +305,6 @@ async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
     let body = body.as_slice();
     match route {
         ("POST", "/ask") => pass::ask(&mut stream, &ctx, session, body).await,
-        ("POST", "/list") => locker::list(&mut stream, &ctx, session).await,
         ("POST", "/filter") => filter::serve(&mut stream, &ctx, session).await,
         ("POST", "/answer") => pass::answer(&mut stream, &ctx, session, body).await,
         ("POST", "/unlock") => locker::open(&mut stream, &ctx, body, false).await,

@@ -58,7 +58,8 @@ type Granted = { id: string; name: string; tag: string; kind: string; access: Ac
 /** Who asks, and `live`: the command lines of the calls whose output runs through the relay then. */
 type Requester = { pid: number; cmdline: string; inside: boolean; live: string[] }
 type Asked = Requester & { id: string; prompt: string; tag: string | null; entry: Granted | null }
-type Sign = Omit<Granted, 'id'> & Requester & { id: string }
+/** A signature with a vault key (its entry's fields), or with a key of the user's own agent (`forwarded`). */
+type Sign = Requester & { id: string } & (({ forwarded: false } & Omit<Granted, 'id'>) | { forwarded: true })
 type VaultState = 'absent' | 'locked' | 'open'
 type VaultEntry = ViewEntry & { created: number }
 type Decision = 'give' | 'session' | 'refuse'
@@ -737,7 +738,7 @@ async function onAsk($: EngineInterface, ask: Asked) {
     const reply = await callRelay($, 'POST', '/answer', { id: ask.id, cancel: true })
     if (reply === null) return
     if (reply.status !== 204 && reply.status !== 410) say($, `Not refused: the relay answered ${reply.status}.`, true)
-    else say($, `Refused ${ask.entry?.name ?? ask.prompt} to ${source}: this session refuses it (Vault tab).`, false)
+    else say($, `Refused ${ask.entry?.name ?? ask.prompt} to ${source}: ${refusedWhy(ask.entry?.access === 'refused')}.`, false)
     return
   }
   const request: Request = {
@@ -746,7 +747,7 @@ async function onAsk($: EngineInterface, ask: Asked) {
     prompt: ask.prompt,
     source: requestSource(ask, calls.map(r => r.command)),
     since: clockTime(),
-    pick: decision === 'typed card' ? null : 'vault',
+    pick: 'vault',
     tag: ask.tag,
   }
   // A give that fails leaves the program waiting: it gets the card instead.
@@ -755,17 +756,24 @@ async function onAsk($: EngineInterface, ask: Asked) {
   await $.ui.notify(`Password needed: ${ask.prompt}`, { title: 'secrets' })
 }
 
+/** Why a request was refused: the session refuses its entry, else it is, or may be, a subagent's. */
+function refusedWhy(bySession: boolean): string {
+  return bySession ? 'this session refuses it (Vault tab)' : 'subagents and teammates get nothing'
+}
+
 async function onSign($: EngineInterface, sign: Sign) {
   const calls = callsBy(sign)
   const decision = signDecision(sign, calls)
+  const key = sign.forwarded ? "your own ssh-agent's key" : sign.name
+  const source = requestSource(sign, calls.map(r => r.command))
   // A decision that fails leaves the program waiting: it gets the card instead.
   if (decision !== 'ask' && (await decideRequest($, sign.id, decision))) {
-    if (sign.access === 'refused') say($, `Refused ${sign.name} to ${requestSource(sign, calls.map(r => r.command))}: this session refuses it (Vault tab).`, false)
+    if (decision === 'refuse') say($, `Refused ${key} to ${source}: ${refusedWhy(!sign.forwarded && sign.access === 'refused')}.`, false)
     return
   }
-  const source = requestSource(sign, calls.map(r => r.command))
-  await addRequest($, { id: sign.id, kind: 'sign', prompt: `${sign.name} · ${sign.tag}`, source, since: clockTime(), pick: null, tag: null })
-  await $.ui.notify(`Vault key wanted: ${sign.name}`, { title: 'secrets' })
+  const prompt = sign.forwarded ? key : `${sign.name} · ${sign.tag}`
+  await addRequest($, { id: sign.id, kind: 'sign', prompt, source, since: clockTime(), pick: null, tag: null })
+  await $.ui.notify(sign.forwarded ? `Key wanted: ${key}` : `Vault key wanted: ${key}`, { title: 'secrets' })
 }
 
 /** Takes in what the vault shows: entries and suggestions, never a value. */

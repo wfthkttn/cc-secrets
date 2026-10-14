@@ -910,11 +910,18 @@ fn forwarding_offers_and_signs_with_the_users_own_agent_only_when_switched_on() 
     assert!(!run(agent_sign(&relay.agent(), &theirs, &message)).status.success());
 
     assert_eq!(post(&relay.socket, "/session", &serde_json::json!({ "id": "forwarding" })), "204");
+    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }));
     assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "forward", "on": true })), "200");
+    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }));
     assert_eq!(listed(&relay.agent()), [public_of(&mine), public_of(&theirs)]);
-    let out = run(agent_sign(&relay.agent(), &theirs, &message));
+    let sign = agent_sign(&relay.agent(), &theirs, &message).spawn().unwrap();
+    assert_eq!(relay.decide_next("sign", "give")["forwarded"], true, "a forwarded signature waits on the hooks too");
+    let out = sign.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(verified(&theirs, &message));
+    let refused = agent_sign(&relay.agent(), &theirs, &message).spawn().unwrap();
+    relay.decide_next("sign", "refuse");
+    assert!(!refused.wait_with_output().unwrap().status.success(), "a refused forwarded signature isn't passed on");
     drop(relay);
 
     let resumed = Relay::start_with("forward-resumed", &data, &[("SECRETS_UPSTREAM_AGENT", &upstream_socket)]);

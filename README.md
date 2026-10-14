@@ -16,9 +16,10 @@ Linux only, provided as is. See [Why Linux only](#why-linux-only).
 - **Vault.** An encrypted file of your passwords, tokens and ssh keys (Argon2id, 64 MiB, t=3; XChaCha20-Poly1305),
   one for every session, unlocked once in the Vault tab. Each session decides per entry: **ask** (a card each time),
   **allowed** (given with no card), **refused** (never given); the choice is kept per Claude Code session id, so a
-  resumed session keeps it. Subagents and teammates get nothing from the vault.
+  resumed session keeps it. Subagents and teammates get nothing: their asks and signatures are refused, with no card.
 - **ssh-agent.** Each session's `SSH_AUTH_SOCK` is a vault agent: it signs with the vault's keys as the session
-  allows, and, when you tick it for the session, with your own agent's keys too.
+  allows. Ticked for the session, it also offers your own agent's keys and signs with them as your agent would, with
+  no card, for anything but a subagent's or a teammate's command.
 - **Masking.** Every Bash command runs under `secrets-mask-run` (as `CLAUDE_CODE_SHELL_PREFIX`): what the command
   prints is masked before Claude Code reads it, with the open vault's values and the value the command was handed.
   Other tool results are masked too. A tool call that carries a vault value is stopped before it runs, and a write of

@@ -42,27 +42,34 @@ export function runsIn(cmdline: string, command: string): boolean {
   return cmdline.replace(QUOTED_QUOTE, "'").includes(command)
 }
 
+/** A subagent's or a teammate's call, or one that can't be told from theirs: it gets nothing. */
+function isSubagents(call: Call | 'unknown' | undefined): boolean {
+  return call === 'unknown' || call?.agentId !== undefined
+}
+
 /**
- * What a signature with a vault key gets: nothing with a key the session refused, nor for a subagent's or a
- * teammate's command, nor one that can't be told from a subagent's; a main-loop command a key allowed for the
- * session; anything else (a `!` command, a background task, a process outside the session) the person's card.
+ * What a signature gets: nothing for a subagent's or a teammate's command, nor one that can't be told from a
+ * subagent's. A key of the user's own agent (`forwarded`) signs for anything else with no card, as that agent would.
+ * A vault key: nothing when the session refused it; a main-loop command a key allowed for the session; anything else
+ * (a `!` command, a background task, a process outside the session) the person's card.
  */
-export function signDecision(sign: Requester & Granted, calls: Calls): 'refuse' | 'give' | 'ask' {
-  if (sign.access === 'refused') return 'refuse'
+export function signDecision(sign: Requester & ({ forwarded: true } | ({ forwarded: false } & Granted)), calls: Calls): 'refuse' | 'give' | 'ask' {
+  if (!sign.forwarded && sign.access === 'refused') return 'refuse'
   const call = callFor(sign, calls)
-  if (call === 'unknown' || call?.agentId !== undefined) return 'refuse'
+  if (isSubagents(call)) return 'refuse'
+  if (sign.forwarded) return 'give'
   return call !== undefined && sign.access === 'allowed' ? 'give' : 'ask'
 }
 
 /**
- * How a `secrets ask` is answered: refused when its tag names an entry the session refused; a main-loop command
- * whose tagged entry is allowed for the session gets it without a card; any other gets a card, with the vault's
- * entries to pick unless it is, or may be, a subagent's or a teammate's.
+ * How a `secrets ask` is answered: refused when its tag names an entry the session refused, or when it is, or may
+ * be, a subagent's or a teammate's; a main-loop command whose tagged entry is allowed for the session gets it without
+ * a card; any other gets a card.
  */
-export function askDecision(ask: Requester & { entry: Granted | null }, calls: Calls): 'refuse' | 'give' | 'card' | 'typed card' {
+export function askDecision(ask: Requester & { entry: Granted | null }, calls: Calls): 'refuse' | 'give' | 'card' {
   if (ask.entry?.access === 'refused') return 'refuse'
   const call = callFor(ask, calls)
-  if (call === 'unknown' || call?.agentId !== undefined) return 'typed card'
+  if (isSubagents(call)) return 'refuse'
   return call !== undefined && ask.entry !== null && ask.entry.access === 'allowed' ? 'give' : 'card'
 }
 

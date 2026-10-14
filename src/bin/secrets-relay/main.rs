@@ -28,7 +28,8 @@
 //! - `POST /session {id, projects?}`: whose grants and forwarding these are (`session_named`).
 //! - `POST /decide {id, decision: "give" | "session" | "refuse"}`: 204, 410 no such request.
 //! - `GET /vault`: `{state, entries, suggestions, forward, upstream}`; never a value. Each entry, like those in `ask`
-//!   and `sign` events, carries the session's `access`: `"ask" | "allowed" | "refused"`.
+//!   events and `sign` events with `forwarded: false`, carries the session's `access`: `"ask" | "allowed" |
+//!   "refused"`. A `sign` event with `forwarded: true` is for a key of the user's own agent and names no entry.
 //! - `POST /vault {op: "add" | "edit" | "delete" | "access" | "save" | "dismiss" | "forward", …}`: 200 `{id}`; 400
 //!   with a reason.
 //! - `POST /settings {maskMinLength}`: 204.

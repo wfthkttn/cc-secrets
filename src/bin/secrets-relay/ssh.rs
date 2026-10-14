@@ -1,6 +1,6 @@
 //! Each session's ssh-agent: it offers the open vault's ssh keys, and each signature waits on the session's `sign`
 //! decision. With the session's forwarding on, it also offers the user's own agent's keys and passes their signatures
-//! through.
+//! through, each on a `sign` decision too: only the hooks can tell a subagent's command, which gets none.
 
 use std::path::Path;
 
@@ -78,7 +78,7 @@ async fn reply(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option
         agent::Request::Sign { blob, data, flags } => match vault_keys(ctx).into_iter().find(|(_, _, b)| *b == blob) {
             Some((entry, key, _)) => sign_with(stream, ctx, session, peer, &entry, &key, &data, flags).await,
             None => match &upstream {
-                Some(path) => ask_upstream(path, body).await.unwrap_or_else(|| vec![agent::FAILURE]),
+                Some(path) => forward(stream, ctx, session, peer, path, body).await,
                 None => vec![agent::FAILURE],
             },
         },
@@ -86,18 +86,32 @@ async fn reply(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option
     }
 }
 
+/// The session's `sign` event: who asks, and the vault entry whose key signs, or none for a key of the user's own
+/// agent (`forwarded`). None once the session ended.
+fn sign_event(ctx: &Context, session: Id, peer: Option<i32>, entry: Option<&Entry>) -> Option<serde_json::Value> {
+    let state = lock(ctx);
+    let open = state.sessions.get(&session)?;
+    let by = peer::requester(peer, &ctx.mask_run, open.claude_code);
+    let live = state.filter.live(open.claude_code);
+    Some(match entry {
+        Some(entry) => json!({ "forwarded": false, "tag": entry.tag, "name": entry.name, "kind": entry.kind, "access": open.access.of(&entry.id), "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live }),
+        None => json!({ "forwarded": true, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live }),
+    })
+}
+
+/// Passes a signature request on to the user's own agent once the session's hooks give it.
+async fn forward(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option<i32>, path: &Path, body: &[u8]) -> Vec<u8> {
+    let Some(event) = sign_event(ctx, session, peer, None) else { return vec![agent::FAILURE] };
+    if !matches!(decide(stream, ctx, session, "sign", event).await, Some(Decision::Give | Decision::Session)) {
+        return vec![agent::FAILURE];
+    }
+    ask_upstream(path, body).await.unwrap_or_else(|| vec![agent::FAILURE])
+}
+
 /// Signs with a vault key once the session's hooks give it.
 #[expect(clippy::too_many_arguments, reason = "the request's parts, as the agent protocol hands them over")]
 async fn sign_with(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option<i32>, entry: &Entry, key: &ssh_key::PrivateKey, data: &[u8], flags: u32) -> Vec<u8> {
-    let event = {
-        let state = lock(ctx);
-        state.sessions.get(&session).map(|s| {
-            let by = peer::requester(peer, &ctx.mask_run, s.claude_code);
-            let live = state.filter.live(s.claude_code);
-            json!({ "tag": entry.tag, "name": entry.name, "kind": entry.kind, "access": s.access.of(&entry.id), "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live })
-        })
-    };
-    let Some(event) = event else { return vec![agent::FAILURE] };
+    let Some(event) = sign_event(ctx, session, peer, Some(entry)) else { return vec![agent::FAILURE] };
     let decision = decide(stream, ctx, session, "sign", event).await;
     if decision == Some(Decision::Session)
         && let Err(error) = locker::grant(&mut lock(ctx), session, &entry.id, Grant::Allowed)

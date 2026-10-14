@@ -11,7 +11,7 @@ export const VAULT_DESCRIPTION = [
   'To use a secret, have the command that needs it ask for it: put `secrets ask --tag TAG "what it is for"` inside that Bash command, so the value goes straight in and you never see it, e.g. `PGPASSWORD="$(secrets ask --tag db \'Prod DB\')" psql -h db.internal app`.',
   'Without --tag, or with no entry for the tag, the user types the value or picks an entry on a card. sudo -A, ssh and git ask through the vault by themselves (tags sudo, ssh, git).',
   'A value goes only into the command that uses it, to the service it belongs to, or into the env or config file its program reads (.env, kubeconfig, .netrc). Never print it, write it anywhere else (notes, logs, scripts, temp files), or send it anywhere else.',
-  'Output that carries a secret shows [secret], and a call that carries a vault value is stopped. Subagents get nothing from the vault.',
+  'Output that carries a secret shows [secret], and a call that carries a vault value is stopped. Subagents get nothing: their asks and ssh signatures are refused.',
 ].join('\n')
 
 /** Whether a call of the tool runs: the main loop's with no dialog, a subagent's or a teammate's (`agentId`) never. */

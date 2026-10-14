@@ -500,7 +500,7 @@ fn split_values_encoded_forms_and_glued_tokens_are_masked() {
         (r#"printf "the hun""#, "the hun"),
         (r#"printf "pw=hunter""#, "[secret]"),
         (r#"printf "auth: %s\n" "$(printf "alex:%s" "$x" | base64)""#, "auth: [secret]\n"),
-        (r#"printf "pw=%s;rest more\n" "$x""#, "[secret] more\n"),
+        (r#"printf "pw=%s;rest more\n" "$x""#, "[secret];rest more\n"),
     ];
     for (command, want) in cases {
         let child = relay.mask_run(&format!(r#"x=$("$SECRETS" ask t4); {command}"#)).spawn().unwrap();

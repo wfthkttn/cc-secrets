@@ -7,7 +7,9 @@ test('the listing: one entry a line under a header, never a value; a closed or e
     { tag: 'db', kind: 'password' as const, access: 'allowed' as const, name: 'Prod DB' },
     { tag: 'deploy', kind: 'token' as const, access: 'refused' as const, name: 'Deploy' },
   ]
-  expect(vaultListing('open', entries)).toBe('tag\tkind\taccess\tname\ndb\tpassword\tallowed\tProd DB\ndeploy\ttoken\trefused\tDeploy')
+  expect(vaultListing('open', entries)).toBe(
+    ['tag     kind      access   name', 'db      password  allowed  Prod DB', 'deploy  token     refused  Deploy'].join('\n'),
+  )
   for (const state of ['absent', 'locked'] as const) expect(vaultListing(state, entries)).toContain('`secrets ask` still works')
   expect(vaultListing('locked', entries)).toContain('Vault tab')
   expect(vaultListing('open', [])).toBe('The vault has no entries. `secrets ask` still works: the user types the value.')

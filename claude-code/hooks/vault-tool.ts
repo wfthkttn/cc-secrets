@@ -21,10 +21,13 @@ export function vaultVerdict(agentId: string | undefined): { decision: 'allow' }
 
 const STILL_ASKS = '`secrets ask` still works: the user types the value.'
 
-/** What the tool answers: the entries one a line, tab-separated under a header; else why there are none. */
+/** What the tool answers: the entries one a line in space-padded columns under a header; else why there are none. */
 export function vaultListing(state: 'absent' | 'locked' | 'open', entries: readonly { tag: string; kind: EntryKind; access: Access; name: string }[]): string {
   if (state === 'absent') return `No vault yet. ${STILL_ASKS}`
   if (state === 'locked') return `The vault is locked; the user unlocks it in the 🔐 Vault tab. ${STILL_ASKS}`
   if (entries.length === 0) return `The vault has no entries. ${STILL_ASKS}`
-  return ['tag\tkind\taccess\tname', ...entries.map(e => `${e.tag}\t${e.kind}\t${e.access}\t${e.name}`)].join('\n')
+  const rows: { tag: string; kind: string; access: string; name: string }[] = [{ tag: 'tag', kind: 'kind', access: 'access', name: 'name' }, ...entries]
+  const width = (column: 'tag' | 'kind' | 'access') => Math.max(...rows.map(row => row[column].length)) + 2
+  const [tag, kind, access] = [width('tag'), width('kind'), width('access')]
+  return rows.map(row => row.tag.padEnd(tag) + row.kind.padEnd(kind) + row.access.padEnd(access) + row.name).join('\n')
 }

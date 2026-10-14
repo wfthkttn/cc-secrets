@@ -286,7 +286,8 @@ export function register(on: On) {
     // through unmasked.
     const relay = await startRelay($)
     await useRelay($, relay)
-    vault = { state: relay.state, entries: [], suggestions: [], forward: upstream === '' ? null : false }
+    // An open vault sends no event at the attach: its entries are fetched here, or the session lists none.
+    await refreshVault($)
     if (unlockAtStart && vault.state === 'locked') {
       drawerTab = 'vault'
       await $.sidebar.select({ id: SIDEBAR_ID })

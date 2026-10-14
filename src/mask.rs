@@ -1,4 +1,4 @@
-//! Finds a secret's forms in output and replaces the whitespace-delimited token holding one with `[secret]`.
+//! Finds a secret's forms in output and replaces each, with the base64-alphabet run around it, with `[secret]`.
 //! `claude-code/hooks/mask.ts` makes the same forms; `claude-code/tests/mask-cases.ts` holds the cases both pass.
 
 use std::collections::BTreeSet;
@@ -10,11 +10,14 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 pub const MASK: &[u8] = b"[secret]";
 /// A stream that ends on this many bytes or more of a form's start has that tail masked.
 const PARTIAL_MIN: usize = 4;
-/// Past this many bytes without whitespace, output goes out even mid-token.
+/// Past this many bytes in one run, output goes out even mid-run.
 const MAX_HOLD: usize = 65536;
 
-fn is_space(b: u8) -> bool {
-    b" \t\n\r\x0c\x0b".contains(&b)
+/// The bytes a match widens over: a base64 core's neighbours in its encoded run carry some of the value's bits, and
+/// every one of them is in the standard or URL-safe alphabet. Quotes, commas, braces, `:`, `@` and whitespace end it,
+/// so a value inside JSON, a URL or a header leaves the rest readable.
+fn in_run(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"+/=-_".contains(&b)
 }
 
 /// JSON string escaping as Python's `json.dumps` writes it, quotes left off; `ascii` also escapes all but printable ASCII.
@@ -157,9 +160,9 @@ impl Masker {
         self.patterns.extend(forms(value));
     }
 
-    /// Each token holding a form, as merged `(start, end)` ranges.
+    /// Each form with its run around it, as merged `(start, end)` ranges.
     pub fn spans(&self, data: &[u8]) -> Vec<(usize, usize)> {
-        let opens = |at: usize| data.get(at).is_some_and(|b| !is_space(*b));
+        let opens = |at: usize| data.get(at).is_some_and(|b| in_run(*b));
         let mut found = Vec::new();
         for pattern in &self.patterns {
             for at in memchr::memmem::find_iter(data, pattern) {
@@ -195,14 +198,14 @@ impl Masker {
     }
 
     /// `mask_found` for the last of a stream: a tail of `PARTIAL_MIN` bytes or more that a form starts with is masked
-    /// too, with the rest of its token, since nothing more will come to tell it apart.
+    /// too, with the rest of its run, since nothing more will come to tell it apart.
     pub fn mask_end(&self, data: &[u8]) -> (Vec<u8>, bool) {
         let mut spans = self.spans(data);
         let tail = self.partial(data);
         if tail >= PARTIAL_MIN {
             let start = data.len() - tail;
-            let token = data.get(..start).unwrap_or_default().iter().rposition(|b| is_space(*b)).map_or(0, |at| at + 1);
-            // a form holding whitespace can reach into the tail's token
+            let token = data.get(..start).unwrap_or_default().iter().rposition(|b| !in_run(*b)).map_or(0, |at| at + 1);
+            // a form holding bytes outside the run can reach into the tail's run
             let from = spans.iter().filter(|&&(_, end)| end > token).map(|&(start, _)| start).fold(token, usize::min);
             spans.retain(|&(_, end)| end <= from);
             spans.push((from, data.len()));
@@ -225,7 +228,7 @@ impl Masker {
         longest
     }
 
-    /// How much of `data` can be masked and written now; the rest may still grow into a token holding a form.
+    /// How much of `data` can be masked and written now; the rest may still grow into a run holding a form.
     /// Idle, only a tail that could become a form is kept back.
     pub fn cut(&self, data: &[u8], idle: bool) -> usize {
         if self.patterns.is_empty() {
@@ -233,7 +236,7 @@ impl Masker {
         }
         let mut cut = data.len() - self.partial(data);
         if !idle {
-            let token_start = data.iter().rposition(|b| is_space(*b)).map_or(0, |at| at + 1);
+            let token_start = data.iter().rposition(|b| !in_run(*b)).map_or(0, |at| at + 1);
             cut = cut.min(token_start);
             if data.len() - cut > MAX_HOLD {
                 let longest = self.patterns.iter().map(Vec::len).max().unwrap_or(0);
@@ -300,5 +303,103 @@ mod tests {
     #[test]
     fn with_nothing_to_mask_everything_goes_out_at_once() {
         assert_eq!(Masker::new(6).cut(b"first sec", false), 9);
+    }
+
+    const VALUES: [&str; 7] = ["hunter22", "p@ss w0rd!", "a\"b\\c-123", "it's-secret", "ключик-42", "tok_9f-8E+/=", "50%off&more"];
+    /// Every byte that ends a run, as output frames values: quoting, JSON, URLs, headers, shell, whitespace.
+    const DELIMITERS: [&str; 24] =
+        ["\"", "'", "`", ",", ":", ";", "@", "&", "?", "#", "|", "!", "*", "(", ")", "[", "]", "{", "}", "<", ">", " ", "\t", "\n"];
+
+    fn masker_of(value: &str) -> Masker {
+        let mut masker = Masker::new(6);
+        masker.add(value);
+        masker
+    }
+
+    /// What a stream cut into `chunks` comes out as, frame by frame as the relay masks it, the last frame ending it.
+    fn streamed(masker: &Masker, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut held = Vec::new();
+        let mut out = Vec::new();
+        let Some((last, before)) = chunks.split_last() else { return out };
+        for chunk in before {
+            held.extend_from_slice(chunk);
+            let cut = masker.cut(&held, false);
+            out.extend(masker.mask(&held[..cut]));
+            held.drain(..cut);
+        }
+        held.extend_from_slice(last);
+        out.extend(masker.mask_end(&held).0);
+        out
+    }
+
+    /// Every way of cutting `data` in two, and byte by byte, comes out as the whole of it does.
+    fn assert_streams_as_whole(masker: &Masker, data: &[u8]) {
+        let whole = masker.mask_end(data).0;
+        for at in 0..=data.len() {
+            let (head, tail) = data.split_at(at);
+            assert_eq!(streamed(masker, &[head, tail]), whole, "{:?} cut at {at}", String::from_utf8_lossy(data));
+        }
+        let bytes: Vec<&[u8]> = data.chunks(1).collect();
+        assert_eq!(streamed(masker, &bytes), whole, "{:?} byte by byte", String::from_utf8_lossy(data));
+    }
+
+    #[test]
+    fn each_form_between_delimiters_is_masked_alone_and_the_delimiters_stay() {
+        for value in VALUES {
+            let masker = masker_of(value);
+            for form in forms(value) {
+                let form = String::from_utf8(form).unwrap();
+                for d in DELIMITERS {
+                    let input = format!("k{d}{form}{d}k");
+                    assert_eq!(String::from_utf8(masker.mask(input.as_bytes())).unwrap(), format!("k{d}[secret]{d}k"), "{value:?} as {form:?}");
+                    assert_streams_as_whole(&masker, input.as_bytes());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_form_glued_to_run_bytes_takes_the_run_with_it() {
+        for value in ["hunter22", "tok_9f-8E+/="] {
+            let masker = masker_of(value);
+            for (glued, d) in [("pw=", ";"), ("x-", ","), ("Bearer+", "\""), ("ab/", "@")] {
+                let input = format!("{d}{glued}{value}{glued}{d}");
+                assert_eq!(String::from_utf8(masker.mask(input.as_bytes())).unwrap(), format!("{d}[secret]{d}"), "{value:?} in {input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_base64_run_holding_the_value_is_masked_whole_at_every_offset() {
+        use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+        for value in VALUES {
+            let masker = masker_of(value);
+            for engine in [STANDARD, URL_SAFE, STANDARD_NO_PAD, URL_SAFE_NO_PAD] {
+                for prefix in ["", "u", "us", "use", "user", "user:"] {
+                    for suffix in ["", "\n", "@h", "xyz"] {
+                        let encoded = engine.encode(format!("{prefix}{value}{suffix}"));
+                        for d in DELIMITERS {
+                            let input = format!("x{d}{encoded}{d}x");
+                            assert_eq!(
+                                String::from_utf8(masker.mask(input.as_bytes())).unwrap(),
+                                format!("x{d}[secret]{d}x"),
+                                "{value:?} behind {prefix:?} encoded {encoded:?}"
+                            );
+                        }
+                        assert_streams_as_whole(&masker, format!("auth: {encoded}, next").as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn values_side_by_side_are_masked_each_and_what_is_between_them_stays() {
+        let mut masker = Masker::new(6);
+        masker.add("hunter22");
+        masker.add("tok_9f-8E+/=");
+        let input = r#"{"a":"hunter22","b":"tok_9f-8E+/="} hunter22,tok_9f-8E+/="#;
+        assert_eq!(String::from_utf8(masker.mask(input.as_bytes())).unwrap(), r#"{"a":"[secret]","b":"[secret]"} [secret],[secret]"#);
+        assert_streams_as_whole(&masker, input.as_bytes());
     }
 }

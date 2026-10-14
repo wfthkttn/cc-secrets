@@ -30,6 +30,47 @@ Linux only, provided as is. See [Why Linux only](#why-linux-only).
 - **Config tab.** Unlock at session start, the shortest value masked (default 6 characters), and an
   `autoMode.environment` line for the auto-mode classifier, applied to `~/.claude/settings.json` on your click.
 
+## What the agent sees
+
+A recorded session with a dummy vault (tags `db`, `deploy`, `github`) and a local stand-in API that echoes the
+bearer token back. The prompt: *Check that the staging API accepts our deploy token: GET
+http://localhost:8080/v1/whoami with it as a Bearer token.*
+
+![The request card, the open drawer, and the masked reply](docs/demo.gif)
+
+The agent looks the vault up:
+
+```
+mcp__secrets__vault {}
+```
+```
+tag     kind      access  name
+db      password  ask     Prod DB
+deploy  token     ask     Deploy token
+github  ssh-key   ask     GitHub
+```
+
+It puts the ask inside the command that needs the value:
+
+```sh
+curl -sS -w '\nHTTP %{http_code}\n' \
+  -H "Authorization: Bearer $(secrets ask --tag deploy 'Deploy token for staging API whoami check')" \
+  http://localhost:8080/v1/whoami
+```
+
+A card for the `deploy` entry pops out in the sidebar. **Once** hands the token to this call; **Session** also allows
+the entry for the rest of the session, so its next asks get it with no card. The API sends the token back in its
+reply; what reaches the agent is:
+
+```
+{"user":"deploy-bot","scopes":["deploy:staging"],"token":"[secret]"}
+HTTP 200
+```
+
+and it answers from what it could see: *The staging API accepts the deploy token. GET /v1/whoami returned HTTP 200:
+User: deploy-bot, Scopes: deploy:staging. The response also sent the token back in a token field. It was redacted in
+the output, so I never saw the token itself.*
+
 ## Threat model
 
 It guards against **accidents**: an agent printing a secret, writing it into a file, a log or a note, pasting it into

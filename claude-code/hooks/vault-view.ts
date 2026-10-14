@@ -562,21 +562,32 @@ export function onClick(state: ViewState, props: VaultProps, y: number, x: numbe
   return onHit(state, props, hit)
 }
 
+/** The state a new instance starts from: the last one posted, else a fresh one. */
+export function startState(props: Pick<VaultProps, 'resume' | 'formEpoch' | 'state'>, instance: string): ViewState {
+  return props.resume === null ? initialState(props.formEpoch, instance, props.state !== 'open') : { ...props.resume, pending: [] }
+}
+
+/** Every change posts, with the state the next instance resumes from. */
+function sent(result: Result): VaultMessage {
+  const { pending: _pending, ...ui } = result.state
+  return { ...(result.post ?? postOf(result.state)), ui }
+}
+
 const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const { columns } = props
   surface.onPointer(p => {
     if (p.type !== 'down') return
     const result = onClick(surface.state as ViewState, props, p.y, p.x)
     surface.setState(result.state)
-    if (result.post) surface.post(result.post)
+    surface.post(sent(result))
   })
   surface.onKey(k => {
     const result = onKey(surface.state as ViewState, props, k)
     surface.setState(result.state)
-    if (result.post) surface.post(result.post)
+    surface.post(sent(result))
   })
   const isClosed = props.state !== 'open'
-  let state = surface.state ?? initialState(props.formEpoch, Math.random().toString(36).slice(2), isClosed)
+  let state = surface.state ?? startState(props, Math.random().toString(36).slice(2))
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, rekeying: false, open: null, formEpoch: props.formEpoch }

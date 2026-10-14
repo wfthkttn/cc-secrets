@@ -2,18 +2,18 @@ import type { EngineInterface, On, Timer } from 'claude-code'
 import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from 'sidebar'
 
 import { appliedText, SUGGESTED, withText } from './auto-mode'
-import type { ConfigAction, ConfigMessage, ConfigProps } from './config-view-props'
+import type { ConfigAction, ConfigMessage, ConfigProps, ConfigResume } from './config-view-props'
 import { allowKey, carriersSeen } from './guard'
 import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
-import type { Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
+import type { ListResume, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { fillSlot, hasSlot } from './slot'
 import { askDecision, listDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
 import { drawPage as configLines } from './config-view'
 import { contentRows } from './vault-view'
-import type { Access, Collision, SecretField, Suggestion, TagChoice, VaultAction, VaultMessage, VaultProps, ViewEntry } from './vault-view-props'
+import type { Access, Collision, SecretField, Suggestion, TagChoice, VaultAction, VaultMessage, VaultProps, VaultResume, ViewEntry } from './vault-view-props'
 
 const SIDEBAR_ID = 'pass'
 const DRAWER_SLOT: SidebarDrawerSlot = `sidebar-drawer:${SIDEBAR_ID}`
@@ -159,6 +159,13 @@ function emptyFields(...names: SecretField[]) {
 }
 /** The last edit applied per list instance; replaced, never changed in place. */
 let applied: Record<string, number> = {}
+/**
+ * Each view's state as its instance last posted it, by Client key: the sidebar draws the views over the bottom
+ * transcript row, so every new row makes new instances, which go on from here.
+ */
+let listResume: Record<string, ListResume> = {}
+let vaultResume: VaultResume | null = null
+let configResume: ConfigResume | null = null
 /** Set by any message from the list (a click gives it the keyboard); cleared by a key the prompt takes. */
 let listFocused = false
 /** The prompt's draft while the list holds the keyboard; a different draft at the prompt's next key or submit means a paste landed there unseen. */
@@ -337,13 +344,21 @@ export function register(on: On) {
       listFocused = true
       // The keyboard is on another tab now: a paste is no request's.
       listSelected = null
-      if (e.element === VAULT_KEY) await onVaultMessage($, e.data as VaultMessage)
-      else await onConfigMessage($, e.data as ConfigMessage)
+      if (e.element === VAULT_KEY) {
+        const message = e.data as VaultMessage
+        if (message.ui !== undefined) vaultResume = message.ui
+        await onVaultMessage($, message)
+      } else {
+        const message = e.data as ConfigMessage
+        if (message.ui !== undefined) configResume = message.ui
+        await onConfigMessage($, message)
+      }
       $.ui.invalidate('ui.render')
       return next(e)
     }
     if (e.element !== LIST_KEY && e.element !== POPOUT_KEY) return next(e)
     const message = e.data as RequestsMessage
+    if (message.ui !== undefined) listResume = { ...listResume, [e.element]: message.ui }
     unsay($, false)
     if (!listFocused) draftAtFocus = (await $.prompt.read()).text
     listFocused = true
@@ -512,7 +527,7 @@ export function register(on: On) {
       const message = notice === null ? null : notice.text
       const tabRows = tabs === null ? 0 : TAB_ROWS
       const height = listHeight(entries, columns, message, rows - tabRows)
-      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height }
+      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height, resume: listResume[key] ?? null }
       return Client({ key, module: './requests.ts', props, width: columns, height: height + tabRows })
     }
     // The vault and config views get the whole room to lay out in, and are as tall as what they show.
@@ -533,6 +548,7 @@ export function register(on: On) {
         peeked: Object.fromEntries([...vaultPeek].map(field => [field, fields[field]])),
         formEpoch,
         error: vaultError,
+        resume: vaultResume,
       }
       const height = Math.min(room, TAB_ROWS + contentRows(props))
       return Client({ key: VAULT_KEY, module: './vault-view.ts', props, width: columns, height })
@@ -549,6 +565,7 @@ export function register(on: On) {
         unlockAtStart,
         maskMinLength,
         error: configError,
+        resume: configResume,
       }
       const height = Math.min(room, TAB_ROWS + configLines(props, { focus: 'text', pending: [] }).length)
       return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })

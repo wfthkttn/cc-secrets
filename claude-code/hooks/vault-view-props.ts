@@ -1,4 +1,8 @@
 import type { Tab, Tabs } from './tabs'
+import type { ViewState } from './vault-view'
+
+/** The view's state less its pending edits: what a new instance of the view starts from. */
+export type VaultResume = Omit<ViewState, 'pending'>
 
 export type EntryKind = 'password' | 'token' | 'ssh-key'
 
@@ -75,6 +79,11 @@ export type VaultProps = {
   formEpoch: number
   /** Why the last save, delete or unlock failed. */
   error: string | null
+  /**
+   * The state the last instance posted. The sidebar draws the view over the bottom transcript row, so each new row
+   * makes a new instance; it goes on from here.
+   */
+  resume: VaultResume | null
 }
 
 export type VaultMessage = {
@@ -84,4 +93,6 @@ export type VaultMessage = {
   focused: SecretField | null
   /** A form is open, which a turn to the Requests tab would drop. */
   formOpen: boolean
+  /** The view's state for the next instance; every post from a drawn view carries it. */
+  ui?: VaultResume
 }

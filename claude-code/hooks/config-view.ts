@@ -170,20 +170,26 @@ export function onClick(state: ConfigState, props: ConfigProps, y: number, x: nu
   return onHit(state, props, hitAt(drawPage(props, state)[y - TAB_ROWS], x))
 }
 
+/** Every change posts, with the state the next instance resumes from. */
+function sent(result: Result): ConfigMessage {
+  const { pending: _pending, ...ui } = result.state
+  return { ...(result.post ?? postOf(result.state)), ui }
+}
+
 const ConfigView: ClientModule<ConfigProps, ConfigState> = (props, surface) => {
   const { columns } = props
   surface.onPointer(p => {
     if (p.type !== 'down') return
     const result = onClick(surface.state as ConfigState, props, p.y, p.x)
     surface.setState(result.state)
-    if (result.post) surface.post(result.post)
+    surface.post(sent(result))
   })
   surface.onKey(k => {
     const result = onKey(surface.state as ConfigState, props, k)
     surface.setState(result.state)
-    if (result.post) surface.post(result.post)
+    surface.post(sent(result))
   })
-  let state = surface.state ?? initialState(Math.random().toString(36).slice(2))
+  let state = surface.state ?? (props.resume === null ? initialState(Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
   const confirmed = confirm(state, props.confirmed[state.instance])
   if (confirmed !== null) state = confirmed
   if (state !== surface.state) surface.setState(state)

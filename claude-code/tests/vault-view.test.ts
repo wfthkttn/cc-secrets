@@ -4,7 +4,7 @@ import { expect, test } from 'claude-code/testing'
 import { hitAt } from '../hooks/controls'
 import { TAB_ROWS, tabSpans } from '../hooks/tabs'
 import VaultView, { accessLabel, contentRows, drawPage, initialState, onClick, onKey, pageOf, shownPage, shownText, tagOptions, type ViewState } from '../hooks/vault-view'
-import type { ValueEdit, VaultAction, VaultProps, ViewEntry } from '../hooks/vault-view-props'
+import type { ValueEdit, VaultAction, VaultMessage, VaultProps, ViewEntry } from '../hooks/vault-view-props'
 
 const ENTRIES: ViewEntry[] = [
   { id: 'e1', name: 'Prod DB', tag: 'db', kind: 'password', access: 'allowed' },
@@ -28,6 +28,7 @@ const PROPS: VaultProps = {
   peeked: {},
   formEpoch: 0,
   error: null,
+  resume: null,
 }
 const LOCKED: VaultProps = { ...PROPS, state: 'locked', entries: [], suggestions: [] }
 const START = initialState(0, 'v1')
@@ -75,6 +76,63 @@ function draw(props: VaultProps, state?: ViewState): string[] {
 const expectWidths = (rows: string[]) => {
   for (const row of rows) expect([...row].length).toBe(PROPS.columns)
 }
+
+/** One instance of the view, as the engine runs it: its own state, the listeners it set, what it posted. */
+function instance(props: VaultProps) {
+  let current: unknown
+  let onPointer: (p: object) => void = () => {}
+  let onKeyFn: (k: object) => void = () => {}
+  const posts: VaultMessage[] = []
+  const surface = {
+    elements: { Box: (p: object) => ({ type: 'Box', ...p }), Text: (p: object) => ({ type: 'Text', ...p }) },
+    get state() {
+      return current
+    },
+    setState: (next: unknown) => {
+      current = next
+    },
+    columns: 0,
+    rows: 0,
+    every: () => () => {},
+    onPointer: (fn: (p: object) => void) => ((onPointer = fn), () => {}),
+    onKey: (fn: (k: object) => void) => ((onKeyFn = fn), () => {}),
+    post: (data: VaultMessage) => posts.push(data),
+  }
+  const text = (node: unknown): string => (typeof node === 'string' ? node : ((node as { children?: unknown[] }).children ?? []).map(text).join(''))
+  const view = VaultView as unknown as (p: VaultProps, s: typeof surface) => { children: unknown[] }
+  const draw = (p: VaultProps) => view(p, surface).children.map(text)
+  draw(props)
+  return {
+    draw,
+    posts,
+    click: (hit: string) => {
+      const { y, x } = cellOf(props, current as ViewState, hit)
+      onPointer({ type: 'down', y: y + TAB_ROWS, x })
+    },
+    key: (key: string) => onKeyFn({ key }),
+  }
+}
+
+test('a new instance, as each new transcript row makes, goes on from the state the last one posted', async () => {
+  const first = instance(PROPS)
+  first.click('add')
+  first.key('G')
+  first.key('tab')
+  first.key('return')
+  const ui = first.posts.at(-1)!.ui!
+  expect([ui.form?.name, ui.focus, ui.open]).toEqual(['G', 'tag', 'tag'])
+  expect('pending' in ui).toBe(false)
+  const resumed = { ...PROPS, resume: ui }
+  const next = instance(resumed)
+  const rows = next.draw(resumed)
+  expect(rows[TAB_ROWS]).toMatch(/^ New entry/)
+  expect(rows.some(r => r.startsWith(' Name    [ G '))).toBe(true)
+  expect(rows.some(r => r.includes('▸ Your own tag…'))).toBe(true)
+  next.key('up')
+  next.key('return')
+  expect(next.posts.at(-1)!.ui!.form?.tag).toBe('sudo')
+  expect(instance({ ...PROPS, resume: { ...ui, isClosed: false } }).draw({ ...PROPS, state: 'locked', resume: ui })[TAB_ROWS]).toMatch(/^ Vault locked/)
+})
 
 test('a locked vault: one passphrase field with Show, and Unlock; typing fills it, Enter or Unlock opens', async () => {
   const rows = draw(LOCKED, CLOSED)

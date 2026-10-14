@@ -1,4 +1,8 @@
+import type { ListState } from './requests'
 import type { Tab, Tabs } from './tabs'
+
+/** The list's state less its pending edits, which hold typed characters: what a new instance starts from. */
+export type ListResume = Omit<ListState, 'pending'>
 
 /** A vault entry a request can be answered with: no value. */
 export type Offered = { id: string; label: string }
@@ -51,6 +55,8 @@ export type RequestsProps = {
   columns: number
   /** The list's height; cards past it scroll. */
   rows: number
+  /** The state the last instance posted; a new instance (each new transcript row makes one) goes on from here. */
+  resume: ListResume | null
 }
 
 /**
@@ -62,4 +68,6 @@ export type RequestsMessage = {
   instance: string
   selected: string | null
   edits: Edit[]
+  /** The list's state for the next instance; every post from a drawn list carries it. */
+  ui?: ListResume
 }

@@ -422,6 +422,12 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   return { state: { ...focused, selected: row.id }, post: postOf(state, row.id) }
 }
 
+/** Every change posts, with the state the next instance resumes from. */
+function sent(result: Result, entries: RequestEntry[]): RequestsMessage {
+  const { pending: _pending, ...ui } = result.state
+  return { ...(result.post ?? postOf(result.state, selectedOf(result.state, entries))), ui }
+}
+
 const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   const { Box, Text } = surface.elements
   const { columns } = props
@@ -434,19 +440,19 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
       if (tab === null || tab === 'requests') return
       const result = onTab(surface.state as ListState, props.entries, tab)
       surface.setState(result.state)
-      if (result.post) surface.post(result.post)
+      surface.post(sent(result, props.entries))
       return
     }
     const result = onClick(surface.state as ListState, props.entries, frame, p.y - tabRows, p.x)
     surface.setState(result.state)
-    if (result.post) surface.post(result.post)
+    surface.post(sent(result, props.entries))
   })
   surface.onKey(k => {
     const result = onKey(surface.state as ListState, props.entries, frame, k)
     surface.setState(result.state)
-    if (result.post) surface.post(result.post)
+    surface.post(sent(result, props.entries))
   })
-  let state = surface.state ?? initialState(props.focusEpoch, Math.random().toString(36).slice(2))
+  let state = surface.state ?? (props.resume === null ? initialState(props.focusEpoch, Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.epoch !== props.focusEpoch) state = { ...state, isFocused: false, isMenuOpen: false, epoch: props.focusEpoch }

@@ -1,4 +1,8 @@
+import type { ConfigState } from './config-view'
 import type { Tab, Tabs } from './tabs'
+
+/** The view's state less its pending edits: what a new instance of the view starts from. */
+export type ConfigResume = Omit<ConfigState, 'pending'>
 
 /**
  * One change, numbered per view instance and carried in every post until the hooks confirm it: an edit of the
@@ -26,6 +30,8 @@ export type ConfigProps = {
   maskMinLength: number
   /** Why the last apply or change failed. */
   error: string | null
+  /** The state the last instance posted; a new instance (each new transcript row makes one) goes on from here. */
+  resume: ConfigResume | null
 }
 
 export type ConfigMessage = {
@@ -33,4 +39,6 @@ export type ConfigMessage = {
   edits: TextEdit[]
   /** The text field has the keyboard, so a paste belongs in it. */
   textFocused: boolean
+  /** The view's state for the next instance; every post from a drawn view carries it. */
+  ui?: ConfigResume
 }

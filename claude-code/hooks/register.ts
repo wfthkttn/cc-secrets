@@ -28,6 +28,9 @@ const DRAWER_COLUMNS = 64
 const POPOUT_MS = 15000
 const NOTICE_MS = 10000
 const RELAY_START_MS = 5000
+/** The waits before attaching again once an attach ended, doubling from the first; past the last it stops trying. */
+const REATTACH_FIRST_MS = 1000
+const REATTACH_LAST_MS = 60000
 const DEFAULT_MASK_MIN = 6
 const UNSEEN_PASTE = 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
 const UNTARGETED_PASTE = 'The paste went into the prompt: no request was selected. Click a request first.'
@@ -61,7 +64,7 @@ type VaultEntry = ViewEntry & { created: number }
 type Decision = 'give' | 'session' | 'refuse'
 
 type RelayEvent =
-  | { ready: string; vault: VaultState; bin: string }
+  | { ready: string; agent: string; vault: VaultState; bin: string }
   | { ask: Asked }
   | { gone: string }
   | { sign: Sign }
@@ -114,9 +117,12 @@ let vaultFocused: SecretField | null = null
 let vaultFormOpen = false
 /** Tags agents asked for this session that no entry held then, newest last. */
 let askedTags: readonly string[] = []
+/** The session's socket on the secrets daemon. */
 let relaySocket: string | null = null
-/** The relay listens: calls to it can go out. */
+/** The session is attached: calls to the daemon can go out. */
 let relayReady = false
+/** The user's own ssh-agent, which the session's agent may forward to; empty when there is none. */
+let upstream = ''
 /** Claude Code's transcripts folder, from the last classic session start; unknown before it. */
 let projectsDir: string | null = null
 /** Masking replaced something this session, so `[secret]` in content may be a masked read; kept across reloads in `$.state`. */
@@ -252,7 +258,8 @@ export function register(on: On) {
     await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
     popouts = new Popouts(POPOUT_MS, (ms, fn) => $.clock.after(ms, fn), () => syncPopout($))
     await $.command.register({ name: 'pass-demo', description: 'Show one sample request of each kind; no program waits on them' })
-    // A reload starts with no requests and a new relay; the host still shows what the old module set.
+    // A reload starts with no requests until the daemon sends the waiting ones again; the host still shows what the
+    // old module set.
     await $.sidebar.badge({ id: SIDEBAR_ID, count: 0, level: 'urgent' })
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
     maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
@@ -262,44 +269,19 @@ export function register(on: On) {
 
     const runtimeDir = await $.env.get('XDG_RUNTIME_DIR')
     if (!runtimeDir) {
-      throw new Error('secrets: XDG_RUNTIME_DIR is not set, so the relay socket has nowhere to live')
+      throw new Error("secrets: XDG_RUNTIME_DIR is not set, so the secrets daemon's socket is unknown")
     }
-    const socket = `${runtimeDir}/claude-secrets-${randomId()}.sock`
-    relaySocket = socket
+    const daemon = (await $.env.get('SECRETS_DAEMON')) || `${runtimeDir}/secrets.sock`
     const agent = await $.env.get('SSH_AUTH_SOCK')
-    // On a reload the agent is the old relay's; the one found first is the user's.
-    if (agent && !agent.startsWith(`${runtimeDir}/claude-secrets-`)) await $.env.set('SECRETS_ORIG_SSH_AUTH_SOCK', agent)
-    const upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
-    // Commands see the relay only once it listens: before, secrets-mask-run would let their output through unmasked.
-    const relay = await startRelay($, socket, upstream)
-    relayReady = true
-    await nameSession($, await $.session.id())
+    // On a reload the agent is this session's own, or an older build's relay's; the one found first is the user's.
+    if (agent && !agent.startsWith(daemon + '-') && !agent.startsWith(`${runtimeDir}/claude-secrets-`)) await $.env.set('SECRETS_ORIG_SSH_AUTH_SOCK', agent)
+    upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
+    // Commands see the daemon only once the session is attached: before, secrets-mask-run would let their output
+    // through unmasked.
+    const relay = await startRelay($)
+    await useRelay($, relay)
     vault = { state: relay.state, entries: [], suggestions: [], forward: upstream === '' ? null : false }
-    await sendSettings($)
-    // After a reload, the session's own switch in the Config tab stands, not the start setting.
-    const switched = (await $.state.get({ plugin: 'secrets', key: 'forward' })).value
-    if (upstream !== '' && (switched ?? forwardAtStart)) {
-      const refused = await relayChange($, { op: 'forward', on: true })
-      if (refused !== null) throw new Error(`secrets: the relay didn't forward to your ssh-agent: ${refused}`)
-      vault = { ...vault, forward: true }
-    }
-    await $.env.set('SSH_AUTH_SOCK', socket + '.agent')
-    // The relay's own resolved directory, not the plugin's: a rebuild moves the plugin's path to new binaries,
-    // while this session's relay serves only the mask-run beside it.
-    const bin = relay.bin
-    await $.env.set('SECRETS_RELAY', socket)
-    await $.env.set('SUDO_ASKPASS', bin + '/secrets-askpass-sudo')
-    await $.env.set('SSH_ASKPASS', bin + '/secrets-askpass-ssh')
-    await $.env.set('SSH_ASKPASS_REQUIRE', 'force')
-    await $.env.set('GIT_ASKPASS', bin + '/secrets-askpass-git')
-    const path = (await $.env.get('PATH')) ?? ''
-    // On a reload the plugin's bin leads PATH already.
-    if (!path.startsWith(bin + ':')) await $.env.set('PATH', `${bin}:${path}`)
-    const maskRun = bin + '/secrets-mask-run'
-    const prefix = await $.env.get('CLAUDE_CODE_SHELL_PREFIX')
-    // On a reload the prefix is a mask-run of ours, maybe from an older build; the one found first is the user's.
-    if (prefix && !prefix.endsWith('/secrets-mask-run')) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
-    await $.env.set('CLAUDE_CODE_SHELL_PREFIX', maskRun)
+    await forwardAsSwitched($)
     if (unlockAtStart && vault.state === 'locked') {
       drawerTab = 'vault'
       await $.sidebar.select({ id: SIDEBAR_ID })
@@ -595,28 +577,86 @@ export function register(on: On) {
   })
 }
 
+type Attached = { state: VaultState; socket: string; agent: string; bin: string }
+
 /**
- * Starts the relay; resolves once it listens with the vault's state and the relay's resolved helper directory. A
- * later failure shows in the list.
+ * Attaches the session to the secrets daemon; resolves once attached with the vault's state, the session's sockets
+ * and the daemon's helper directory. When the attach ends later (the daemon restarted), attaches again.
  */
-function startRelay($: EngineInterface, socket: string, upstream: string): Promise<{ state: VaultState; bin: string }> {
+function startRelay($: EngineInterface): Promise<Attached> {
   return new Promise((resolve, reject) => {
     let isReady = false
-    const timer = $.clock.after(RELAY_START_MS, () => reject(new Error(`secrets: the relay didn't start within ${RELAY_START_MS} ms`)))
-    readRelay($, socket, upstream, started => {
+    const timer = $.clock.after(RELAY_START_MS, () => reject(new Error(`secrets: no attach to the secrets daemon within ${RELAY_START_MS} ms`)))
+    readRelay($, started => {
       isReady = true
       timer.cancel()
       resolve(started)
     }).catch((error: Error) => {
       timer.cancel()
-      if (isReady) say($, `Requests stopped: ${error.message}`, true)
+      if (isReady) void reattach($, error, REATTACH_FIRST_MS)
       else reject(error)
     })
   })
 }
 
-async function readRelay($: EngineInterface, socket: string, upstream: string, ready: (started: { state: VaultState; bin: string }) => void) {
-  const relay = $.process.spawn({ argv: [$.plugin.root + '/bin/secrets-relay', socket], env: { SECRETS_UPSTREAM_AGENT: upstream } })
+/**
+ * The attach ended, and with it the daemon's requests of this session: they leave the list. Attaches again, waiting
+ * longer after each failure, and points the session's commands at the new sockets.
+ */
+async function reattach($: EngineInterface, why: Error, wait: number) {
+  relayReady = false
+  for (const request of requests) dropRequest(request.id)
+  await syncBadge($)
+  if (wait > REATTACH_LAST_MS) {
+    say($, `Requests stopped: ${why.message}`, true)
+    return
+  }
+  await $.clock.sleep(wait)
+  try {
+    const relay = await startRelay($)
+    await useRelay($, relay)
+    await refreshVault($)
+    await forwardAsSwitched($)
+    say($, 'The secrets daemon restarted: requests waiting before it did are gone.', false)
+  } catch (error) {
+    await reattach($, error as Error, wait * 2)
+  }
+}
+
+/** Points the session's commands at the attached session's sockets and the daemon's helpers, and names the session. */
+async function useRelay($: EngineInterface, relay: Attached) {
+  relaySocket = relay.socket
+  await $.env.set('SSH_AUTH_SOCK', relay.agent)
+  // The daemon's own resolved directory, not the plugin's: the daemon serves only the mask-run beside it.
+  const bin = relay.bin
+  await $.env.set('SECRETS_RELAY', relay.socket)
+  await $.env.set('SUDO_ASKPASS', bin + '/secrets-askpass-sudo')
+  await $.env.set('SSH_ASKPASS', bin + '/secrets-askpass-ssh')
+  await $.env.set('SSH_ASKPASS_REQUIRE', 'force')
+  await $.env.set('GIT_ASKPASS', bin + '/secrets-askpass-git')
+  const path = (await $.env.get('PATH')) ?? ''
+  // On a reload the daemon's bin leads PATH already.
+  if (!path.startsWith(bin + ':')) await $.env.set('PATH', `${bin}:${path}`)
+  const prefix = await $.env.get('CLAUDE_CODE_SHELL_PREFIX')
+  // On a reload the prefix is a mask-run of ours, maybe from an older build; the one found first is the user's.
+  if (prefix && !prefix.endsWith('/secrets-mask-run')) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
+  await $.env.set('CLAUDE_CODE_SHELL_PREFIX', bin + '/secrets-mask-run')
+  relayReady = true
+  await nameSession($, await $.session.id())
+  await sendSettings($)
+}
+
+/** The session's ssh-agent forwards to the user's own as the Config tab says: the session's switch, else the start setting. */
+async function forwardAsSwitched($: EngineInterface) {
+  const switched = (await $.state.get({ plugin: 'secrets', key: 'forward' })).value
+  if (upstream === '' || !(switched ?? forwardAtStart)) return
+  const refused = await relayChange($, { op: 'forward', on: true })
+  if (refused !== null) throw new Error(`secrets: the daemon didn't forward to your ssh-agent: ${refused}`)
+  vault = { ...vault, forward: true }
+}
+
+async function readRelay($: EngineInterface, ready: (started: Attached) => void) {
+  const relay = $.process.spawn({ argv: [$.plugin.root + '/bin/secrets-relay', 'attach'], env: { SECRETS_UPSTREAM_AGENT: upstream } })
   let buffered = ''
   for await (const chunk of relay) {
     if (chunk.stream === 'stderr') {
@@ -630,8 +670,8 @@ async function readRelay($: EngineInterface, socket: string, upstream: string, r
       buffered = buffered.slice(newline + 1)
       newline = buffered.indexOf('\n')
       if ('ready' in event) {
-        if (typeof event.bin !== 'string') throw new Error("secrets: the relay's ready event has no bin, the directory of the helpers it serves")
-        ready({ state: event.vault, bin: event.bin })
+        if (typeof event.bin !== 'string') throw new Error("secrets: the daemon's ready event has no bin, the directory of the helpers it serves")
+        ready({ state: event.vault, socket: event.ready, agent: event.agent, bin: event.bin })
       } else if ('ask' in event) await onAsk($, event.ask)
       else if ('gone' in event) dropRequest(event.gone)
       else if ('sign' in event) await onSign($, event.sign)
@@ -645,7 +685,7 @@ async function readRelay($: EngineInterface, socket: string, upstream: string, r
       await syncBadge($)
     }
   }
-  throw new Error('the relay exited')
+  throw new Error('the attach to the secrets daemon ended')
 }
 
 /** A Bash result whose command runs on in the background. */
@@ -839,6 +879,10 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
   }
   if (action.kind === 'open') await openVault($)
   else if (action.kind === 'rekey') await rekeyVault($)
+  else if (action.kind === 'lock') {
+    const reply = await callRelay($, 'POST', '/lock', {})
+    if (reply !== null) vaultError = reply.status === 204 ? null : reply.text || `The daemon answered ${reply.status}.`
+  }
   else if (action.kind === 'access') await changeVault($, { op: 'access', id: action.id, access: action.access })
   else if (action.kind === 'delete') {
     if (await changeVault($, { op: 'delete', id: action.id })) closeForm()

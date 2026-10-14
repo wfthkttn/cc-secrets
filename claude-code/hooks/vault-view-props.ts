@@ -48,6 +48,8 @@ export type VaultAction =
   | { kind: 'open' }
   /** Seals the open vault under the passphrase typed twice. */
   | { kind: 'rekey' }
+  /** Closes the vault for every session. */
+  | { kind: 'lock' }
 
 export type VaultProps = {
   state: 'absent' | 'locked' | 'open'

@@ -31,7 +31,7 @@ export type ViewState = {
 export type Row =
   | { kind: 'closed'; text: string }
   | { kind: 'door'; field: Door }
-  | { kind: 'add' | 'rekey' }
+  | { kind: 'add' | 'rekey' | 'lock' }
   | { kind: 'entryHead' }
   | { kind: 'entry'; entry: ViewEntry }
   | { kind: 'suggestion'; suggestion: Suggestion }
@@ -92,7 +92,7 @@ export function tagOptions(props: Pick<VaultProps, 'tagChoices' | 'entries'>, fo
 
 /** What a selectable list row is, whatever its position. */
 function rowKey(row: Row): string | null {
-  if (row.kind === 'add' || row.kind === 'rekey') return row.kind
+  if (row.kind === 'add' || row.kind === 'rekey' || row.kind === 'lock') return row.kind
   return row.kind === 'entry' ? 'entry:' + row.entry.id : row.kind === 'suggestion' ? 'suggestion:' + row.suggestion.id : null
 }
 
@@ -118,7 +118,7 @@ export function rekeyRows(error: string | null): Row[] {
 }
 
 export function listRows(props: Pick<VaultProps, 'entries' | 'suggestions'>): Row[] {
-  const rows: Row[] = [{ kind: 'add' }, { kind: 'rekey' }]
+  const rows: Row[] = [{ kind: 'add' }, { kind: 'rekey' }, { kind: 'lock' }]
   rows.push(props.entries.length === 0 ? { kind: 'none' } : { kind: 'entryHead' })
   for (const entry of props.entries) rows.push({ kind: 'entry', entry })
   if (props.suggestions.length > 0) rows.push({ kind: 'suggestHead' })
@@ -259,6 +259,7 @@ function stopRekey(state: ViewState): Result {
 /** Opens the form on a list row; the hooks drop any value left from an earlier form. */
 function open(state: ViewState, row: Row, choices: readonly TagChoice[]): Result {
   if (row.kind === 'rekey') return startRekey(state)
+  if (row.kind === 'lock') return act(state, { kind: 'lock' })
   const form: Form | null =
     row.kind === 'add'
       ? { id: null, suggestion: null, name: '', tag: '', kind: 'password', use: 'session' }
@@ -583,6 +584,8 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
           return line(' + Add', look)
         case 'rekey':
           return line(' ⟳ Change passphrase', look)
+        case 'lock':
+          return line(' ⊘ Lock the vault (every session)', look)
         case 'none':
           return line(' No entries', { dimColor: true })
         case 'entryHead':

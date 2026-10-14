@@ -3,7 +3,7 @@
 //! still running and, while the vault is open, every value it holds. The hooks send other tools' results to `/mask`
 //! and tool calls' input to `/check`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use secrets::filter::{self as frame, BODY_MAX};
 use secrets::mask::{Masker, forms};
@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use zeroize::{Zeroize as _, Zeroizing};
 
+use crate::session::Id;
 use crate::{Context, emit, lock, peer, respond};
 
 /// A running call: the values it was handed, and its matcher, built from those and the vault's.
@@ -22,6 +23,8 @@ struct Call {
     masker: Masker,
     /// Its `secrets-mask-run`'s, which holds the command.
     cmdline: String,
+    /// The Claude Code process of the session it runs in.
+    claude_code: i32,
 }
 
 pub struct Filter {
@@ -33,8 +36,9 @@ pub struct Filter {
     /// The open vault's values, entries and suggestions; empty while it is closed.
     vault_values: Vec<Zeroizing<String>>,
     vault: Masker,
-    /// Something was masked this session; told to the hooks once, for their write-back guard.
-    has_masked: bool,
+    /// The Claude Code processes of the sessions where something was masked; told to the hooks once per session, for
+    /// their write-back guard.
+    has_masked: HashSet<i32>,
     /// What the hooks were last told of whether `/mask` has values to mask.
     told_masking: bool,
 }
@@ -47,14 +51,19 @@ impl Filter {
             typed: Vec::new(),
             vault_values: Vec::new(),
             vault: Masker::new(min_length),
-            has_masked: false,
+            has_masked: HashSet::new(),
             told_masking: false,
         }
     }
 
-    /// The command lines of the calls whose output runs through here now.
-    pub fn live(&self) -> Vec<String> {
-        self.calls.values().map(|call| call.cmdline.clone()).collect()
+    /// The command lines of the session's calls whose output runs through here now.
+    pub fn live(&self, claude_code: i32) -> Vec<String> {
+        self.calls.values().filter(|call| call.claude_code == claude_code).map(|call| call.cmdline.clone()).collect()
+    }
+
+    /// Whether `/mask` has values to mask, as the hooks were last told.
+    pub fn masking(&self) -> bool {
+        self.told_masking
     }
 
     /// Tells the hooks when `/mask` starts or stops having values to mask: the open vault's, or one typed for a
@@ -149,9 +158,10 @@ impl Filter {
         }
     }
 
-    fn found(&mut self, found: bool) {
-        if found && !self.has_masked {
-            self.has_masked = true;
+    /// Something was masked in the session of `claude_code`. Every session is told the first time, as the event
+    /// names no session; a guard on where nothing was masked costs nothing.
+    fn found(&mut self, found: bool, claude_code: i32) {
+        if found && self.has_masked.insert(claude_code) {
             emit(&json!({ "masked": true }));
         }
     }
@@ -159,7 +169,7 @@ impl Filter {
     /// One request frame of the call `pid` against what its stream holds back: the bytes to write now.
     fn take(&mut self, pid: i32, held: &mut Vec<u8>, kind: u8, body: &[u8]) -> Vec<u8> {
         held.extend_from_slice(body);
-        let Some(masker) = self.calls.get(&pid).map(|call| &call.masker) else { return std::mem::take(held) };
+        let Some((masker, claude_code)) = self.calls.get(&pid).map(|call| (&call.masker, call.claude_code)) else { return std::mem::take(held) };
         let (cut, (out, found)) = if kind == frame::END {
             (held.len(), masker.mask_end(held))
         } else {
@@ -167,21 +177,22 @@ impl Filter {
             (cut, masker.mask_found(held.get(..cut).unwrap_or_default()))
         };
         held.drain(..cut);
-        self.found(found);
+        self.found(found, claude_code);
         out
     }
 }
 
 /// Serves one call's output stream until mask-run hangs up, then forgets what the call was handed.
-pub async fn serve(stream: &mut UnixStream, ctx: &Context) {
-    let Some(pid) = peer::mask_run_pid(stream, &ctx.mask_run) else {
+pub async fn serve(stream: &mut UnixStream, ctx: &Context, session: Id) {
+    let claude_code = lock(ctx).sessions.get(&session).map(|s| s.claude_code);
+    let Some((pid, claude_code)) = claude_code.and_then(|cc| Some((peer::mask_run_pid(stream, &ctx.mask_run, cc)?, cc))) else {
         return respond(stream, "403 Forbidden", b"").await;
     };
     let cmdline = peer::cmdline_of(i64::from(pid));
     {
         let mut state = lock(ctx);
         let masker = state.filter.masker_for(Some(pid), &[]);
-        state.filter.calls.insert(pid, Call { values: Vec::new(), masker, cmdline });
+        state.filter.calls.insert(pid, Call { values: Vec::new(), masker, cmdline, claude_code });
     }
     if stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.is_ok() {
         let mut held = [Vec::new(), Vec::new()];
@@ -217,8 +228,8 @@ impl Drop for Texts {
     }
 }
 
-/// `/mask`: the texts with the open vault's values masked.
-pub fn mask_texts(ctx: &Context, body: &[u8]) -> Option<serde_json::Value> {
+/// `/mask`: the texts with the open vault's values masked, for the session of `claude_code`.
+pub fn mask_texts(ctx: &Context, claude_code: i32, body: &[u8]) -> Option<serde_json::Value> {
     let parsed = serde_json::from_slice::<Texts>(body).ok()?;
     let mut state = lock(ctx);
     let mut any = false;
@@ -231,7 +242,7 @@ pub fn mask_texts(ctx: &Context, body: &[u8]) -> Option<serde_json::Value> {
             String::from_utf8_lossy(&out).into_owned()
         })
         .collect();
-    state.filter.found(any);
+    state.filter.found(any, claude_code);
     Some(json!({ "texts": masked }))
 }
 

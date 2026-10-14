@@ -107,9 +107,9 @@ impl Access {
     }
 }
 
-/// Removes the files under `dir` of sessions other than `own` with no transcript left in `projects` (Claude Code's
-/// `<projects>/<project>/<session-id>.jsonl`): no resume can bring them back. The names removed.
-pub fn sweep(dir: &Path, projects: &Path, own: &str) -> Result<Vec<String>, String> {
+/// Removes the files under `dir` of sessions other than those `running` with no transcript left in `projects` (Claude
+/// Code's `<projects>/<project>/<session-id>.jsonl`): no resume can bring them back. The names removed.
+pub fn sweep(dir: &Path, projects: &Path, running: &[String]) -> Result<Vec<String>, String> {
     let listed = |path: &Path| std::fs::read_dir(path).map_err(|e| format!("can't list {}: {e}", path.display()));
     let mut resumable = HashSet::new();
     for project in listed(projects)? {
@@ -133,7 +133,7 @@ pub fn sweep(dir: &Path, projects: &Path, own: &str) -> Result<Vec<String>, Stri
     for file in files {
         let path = file.map_err(|e| e.to_string())?.path();
         let Some(id) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".json")) else { continue };
-        if id == own || resumable.contains(id) {
+        if running.iter().any(|r| r == id) || resumable.contains(id) {
             continue;
         }
         std::fs::remove_file(&path).map_err(|e| format!("can't remove {}: {e}", path.display()))?;
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_keeps_resumable_sessions_and_its_own() {
+    fn a_sweep_keeps_resumable_and_running_sessions() {
         let dir = temp("sweep");
         let projects = dir.join("projects");
         std::fs::create_dir_all(projects.join("-home-x")).unwrap();
@@ -183,7 +183,7 @@ mod tests {
         for id in ["kept", "gone", "own"] {
             Access::load(&sessions, id).unwrap().set("e", Grant::Allowed).unwrap();
         }
-        assert_eq!(sweep(&sessions, &projects, "own").unwrap(), vec!["gone".to_owned()]);
+        assert_eq!(sweep(&sessions, &projects, &["own".to_owned()]).unwrap(), vec!["gone".to_owned()]);
         let mut left: Vec<_> = std::fs::read_dir(&sessions).unwrap().map(|f| f.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         assert_eq!(left, ["kept.json", "own.json"]);

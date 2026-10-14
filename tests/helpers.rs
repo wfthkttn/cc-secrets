@@ -1,4 +1,5 @@
-//! Runs secrets-relay, secrets-mask-run, secrets and secrets-askpass together, without Claude Code.
+//! Runs the secrets-relay daemon, its attach, secrets-mask-run, secrets and secrets-askpass together, without Claude
+//! Code: the test process stands in for Claude Code, the parent of the attach and of the calls.
 // clippy.toml's test allowances reach #[test] functions, not this file's helpers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -6,7 +7,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use secrets::vault::{Costs, Entry, Kind, Use, Vault};
@@ -16,14 +17,21 @@ const MASK_RUN: &str = env!("CARGO_BIN_EXE_secrets-mask-run");
 const SECRETS: &str = env!("CARGO_BIN_EXE_secrets");
 const ASKPASS: &str = env!("CARGO_BIN_EXE_secrets-askpass");
 
+/// A daemon and this process's session of it.
 struct Relay {
-    child: Child,
+    daemon: Child,
+    daemon_socket: PathBuf,
+    attach: Child,
     events: BufReader<ChildStdout>,
+    /// The session's socket and ssh-agent.
     socket: PathBuf,
-    /// The vault state the relay started with.
+    agent: PathBuf,
+    /// The vault state at the attach.
     vault: String,
     /// The helpers it pinned, as the hooks run them.
     bin: PathBuf,
+    /// The attach's environment, for a re-attach.
+    env: Vec<(String, PathBuf)>,
 }
 
 /// A data dir of the test's own, so no test touches the user's vault.
@@ -31,6 +39,23 @@ fn data_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("secrets-test-data-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// Attaches this process to the daemon at `daemon_socket`: the attach, its events, and its ready event.
+fn attach_to(daemon_socket: &Path, env: &[(String, PathBuf)]) -> (Child, BufReader<ChildStdout>, serde_json::Value) {
+    let mut attach = Command::new(RELAY);
+    attach.arg("attach").env("SECRETS_DAEMON", daemon_socket).env_remove("SECRETS_UPSTREAM_AGENT").stdout(Stdio::piped());
+    for (key, value) in env {
+        attach.env(key, value);
+    }
+    let mut child = attach.spawn().unwrap();
+    let mut events = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    events.read_line(&mut ready).unwrap();
+    assert!(!ready.is_empty(), "the attach ended without a ready event");
+    let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+    assert!(ready["ready"].is_string(), "{ready}");
+    (child, events, ready)
 }
 
 impl Relay {
@@ -44,21 +69,29 @@ impl Relay {
 
     fn start_with(name: &str, data: &Path, env: &[(&str, &Path)]) -> Self {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-        let socket = dir.join(format!("secrets-test-{name}-{}.sock", std::process::id()));
-        let mut relay = Command::new(RELAY);
-        relay.arg(&socket).env("XDG_DATA_HOME", data).env_remove("SECRETS_UPSTREAM_AGENT").stdout(Stdio::piped());
-        for (key, value) in env {
-            relay.env(key, value);
+        let daemon_socket = dir.join(format!("secrets-test-{name}-{}.sock", std::process::id()));
+        let daemon = Command::new(RELAY).args(["daemon", "--socket"]).arg(&daemon_socket).env("XDG_DATA_HOME", data).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&daemon_socket).is_err() {
+            assert!(Instant::now() < deadline, "the daemon didn't listen on {}", daemon_socket.display());
+            std::thread::sleep(Duration::from_millis(20));
         }
-        let mut child = relay.spawn().unwrap();
-        let mut events = BufReader::new(child.stdout.take().unwrap());
-        let mut ready = String::new();
-        events.read_line(&mut ready).unwrap();
-        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
-        assert!(ready["ready"].is_string(), "{ready}");
+        let env: Vec<(String, PathBuf)> = env.iter().map(|(k, v)| ((*k).to_owned(), v.to_path_buf())).collect();
+        let (attach, events, ready) = attach_to(&daemon_socket, &env);
+        let field = |name: &str| PathBuf::from(ready[name].as_str().unwrap());
+        let (socket, agent, bin) = (field("ready"), field("agent"), field("bin"));
         let vault = ready["vault"].as_str().unwrap().to_owned();
-        let bin = PathBuf::from(ready["bin"].as_str().unwrap());
-        Self { child, events, socket, vault, bin }
+        Self { daemon, daemon_socket, attach, events, socket, agent, vault, bin, env }
+    }
+
+    /// Ends the attach and attaches again, as a reload of the hooks does; the new ready event.
+    fn reattach(&mut self) -> serde_json::Value {
+        let _ = self.attach.kill();
+        let _ = self.attach.wait();
+        let (attach, events, ready) = attach_to(&self.daemon_socket, &self.env);
+        self.attach = attach;
+        self.events = events;
+        ready
     }
 
     fn raw_event(&mut self) -> serde_json::Value {
@@ -101,7 +134,7 @@ impl Relay {
     }
 
     fn agent(&self) -> PathBuf {
-        PathBuf::from(format!("{}.agent", self.socket.display()))
+        self.agent.clone()
     }
 
     /// Adds an entry; its id.
@@ -160,24 +193,98 @@ impl Relay {
 }
 
 impl Relay {
-    /// Ends it as Claude Code does, with SIGTERM, so it removes what it made; killed if it doesn't end soon.
+    /// Ends the daemon as systemd does, with SIGTERM, so it removes what it made; killed if it doesn't end soon.
     fn stop(&mut self) {
-        let pid = rustix::process::Pid::from_raw(i32::try_from(self.child.id()).unwrap()).unwrap();
+        let _ = self.attach.kill();
+        let _ = self.attach.wait();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(self.daemon.id()).unwrap()).unwrap();
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while self.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        while self.daemon.try_wait().unwrap().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
     }
 }
 
 impl Drop for Relay {
     fn drop(&mut self) {
         self.stop();
-        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.daemon_socket);
     }
+}
+
+/// Another Claude Code as the daemon sees it: a shell running each line it is sent, so its attach and its calls are
+/// its own children. Its attach's events are its stdout.
+struct OtherSession {
+    shell: Child,
+    stdin: ChildStdin,
+    events: BufReader<ChildStdout>,
+    socket: PathBuf,
+}
+
+impl OtherSession {
+    fn attach(relay: &Relay) -> (Self, serde_json::Value) {
+        let mut shell = Command::new("/bin/sh")
+            .args(["-c", r#"while IFS= read -r line; do eval "$line"; done"#])
+            .env("SECRETS_DAEMON", &relay.daemon_socket)
+            .env("RELAY", RELAY)
+            .env_remove("SECRETS_UPSTREAM_AGENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = shell.stdin.take().unwrap();
+        let mut events = BufReader::new(shell.stdout.take().unwrap());
+        writeln!(stdin, r#""$RELAY" attach &"#).unwrap();
+        let mut ready = String::new();
+        events.read_line(&mut ready).unwrap();
+        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+        let socket = PathBuf::from(ready["ready"].as_str().unwrap());
+        (Self { shell, stdin, events, socket }, ready)
+    }
+
+    /// The next event but `masked` and `masking`.
+    fn next_event(&mut self) -> serde_json::Value {
+        loop {
+            let mut line = String::new();
+            self.events.read_line(&mut line).unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event != serde_json::json!({ "masked": true }) && event.get("masking").is_none() {
+                return event;
+            }
+        }
+    }
+
+    /// Runs `command` as a call of this session, in the background, its output into `out`.
+    fn call(&mut self, bin: &Path, command: &str, out: &Path) {
+        let line = format!(
+            "SECRETS_RELAY='{}' SECRETS='{}' '{}' '{}' > '{}' 2>&1 &",
+            self.socket.display(),
+            bin.join("secrets").display(),
+            bin.join("secrets-mask-run").display(),
+            command,
+            out.display()
+        );
+        writeln!(self.stdin, "{line}").unwrap();
+    }
+}
+
+impl Drop for OtherSession {
+    fn drop(&mut self) {
+        let _ = self.shell.kill();
+        let _ = self.shell.wait();
+    }
+}
+
+/// Waits for `path` to hold `want`.
+fn file_holds(path: &Path, want: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_to_string(path).unwrap_or_default() != want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::read_to_string(path).unwrap_or_default() == want
 }
 
 fn post(socket: &Path, path: &str, body: &serde_json::Value) -> String {
@@ -248,47 +355,85 @@ fn a_call_whose_relay_goes_away_withholds_the_rest_of_its_output() {
 }
 
 #[test]
-fn the_relay_ends_when_its_parent_goes() {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-    let socket = dir.join(format!("secrets-test-orphan-{}.sock", std::process::id()));
-    let data = data_dir("orphan");
-    let mut parent = Command::new("/bin/sh")
-        .args(["-c", r#""$0" "$1" > /dev/null & echo $!; sleep 30"#, RELAY])
-        .arg(&socket)
-        .env("XDG_DATA_HOME", &data)
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut pid = String::new();
-    BufReader::new(parent.stdout.as_mut().unwrap()).read_line(&mut pid).unwrap();
-    let _reaped = KilledPid(pid.trim().to_owned());
-    let alive = PathBuf::from(format!("/proc/{}", pid.trim()));
+fn a_session_ends_with_its_claude_code_process_and_its_waiting_requests_are_refused() {
+    let data = data_dir("ended");
+    std::fs::create_dir_all(&data).unwrap();
+    let relay = Relay::start_in("ended", &data);
+    let (mut other, _) = OtherSession::attach(&relay);
+    let out = data.join("asked");
+    other.call(&relay.bin, r#"x=$("$SECRETS" ask late) || echo refused"#, &out);
+    assert_eq!(other.next_event()["ask"]["prompt"], "late");
+    let socket = other.socket.clone();
+    assert!(socket.exists());
+    drop(other);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !socket.exists() && Instant::now() < deadline {
+    while socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(alive.exists() && socket.exists(), "the relay didn't start");
-    parent.kill().unwrap();
-    parent.wait().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while alive.exists() && std::fs::read_to_string(alive.join("stat")).is_ok_and(|s| !s.contains(") Z ")) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        !alive.exists() || std::fs::read_to_string(alive.join("stat")).is_ok_and(|s| s.contains(") Z ")),
-        "the orphaned relay still runs: {:?}",
-        std::fs::read_to_string(alive.join("stat"))
-    );
-    assert!(!PathBuf::from(format!("{}.bin", socket.display())).exists(), "its helper copies are gone");
+    assert!(!socket.exists(), "the ended session's socket is gone");
+    assert!(file_holds(&out, "secrets: the user cancelled: late\nrefused\n"), "{:?}", std::fs::read_to_string(&out));
+    assert!(relay.socket.exists(), "the daemon and this session go on");
+    drop(relay);
+    std::fs::remove_dir_all(&data).unwrap();
 }
 
-/// Kills a process by pid when dropped, so a failing test leaves nothing running.
-struct KilledPid(String);
+#[test]
+fn a_reattach_keeps_the_open_vault_and_brings_back_the_waiting_requests() {
+    let mut relay = Relay::start("reattach");
+    relay.create_vault("pass phrase");
+    relay.add("Kept", "kept", "password", "session", "kept-value-1");
+    let asking = relay.mask_run(r#"x=$("$SECRETS" ask kept); echo "got $x""#).spawn().unwrap();
+    let ask = relay.next_ask();
+    let ready = relay.reattach();
+    assert_eq!((ready["ready"].as_str(), ready["vault"].as_str()), (relay.socket.to_str(), Some("open")), "{ready}");
+    assert_eq!(relay.raw_event(), serde_json::json!({ "masking": true }), "the open vault's values are masked");
+    assert_eq!(relay.next_ask(), ask, "the waiting request comes back");
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["id"], "secret": "typed-after-reload" })), "204");
+    assert_eq!(stdout(&asking.wait_with_output().unwrap()), "got [secret]\n");
+}
 
-impl Drop for KilledPid {
-    fn drop(&mut self) {
-        let _ = Command::new("kill").arg(&self.0).stderr(Stdio::null()).status();
-    }
+#[test]
+fn every_session_shares_the_one_vault_and_gets_its_own_requests() {
+    let data = data_dir("shared");
+    let mut relay = Relay::start_in("shared", &data);
+    let (mut other, ready) = OtherSession::attach(&relay);
+    assert_eq!(ready["vault"], "absent");
+    assert_ne!(other.socket, relay.socket);
+    relay.create_vault("pass phrase");
+    assert_eq!(other.next_event(), serde_json::json!({ "vault": "open" }), "opened once, open for every session");
+    let late = data.join("late");
+    other.call(&relay.bin, "sleep 1; echo value-late-1", &late);
+    relay.add("Late", "late", "password", "session", "value-late-1");
+    assert_eq!(other.next_event(), serde_json::json!({ "vault": "open" }));
+    assert!(file_holds(&late, "[secret]\n"), "a running call masks what another session saved: {:?}", std::fs::read_to_string(&late));
+    let asked = data.join("asked");
+    other.call(&relay.bin, r#"x=$("$SECRETS" ask --tag late theirs); echo "got $x""#, &asked);
+    let ask = other.next_event();
+    assert_eq!((ask["ask"]["prompt"].as_str(), ask["ask"]["inside"].as_bool(), ask["ask"]["entry"]["tag"].as_str()), (Some("theirs"), Some(true), Some("late")));
+    assert_eq!(post(&relay.socket, "/answer", &serde_json::json!({ "id": ask["ask"]["id"], "secret": "x" })), "410", "another session's request isn't this one's");
+    assert_eq!(post(&other.socket, "/answer", &serde_json::json!({ "id": ask["ask"]["id"], "secret": "x" })), "403", "only its own Claude Code answers it");
+    assert_eq!(post(&relay.socket, "/lock", &serde_json::json!({})), "204");
+    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "locked" }));
+    assert_eq!(other.next_event(), serde_json::json!({ "vault": "locked" }), "locked once, locked for every session");
+    assert_eq!(post(&relay.socket, "/lock", &serde_json::json!({})), "409");
+    assert_eq!(stdout(&run(relay.mask_run("echo value-late-1"))), "value-late-1\n");
+    drop((other, relay));
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn only_the_daemons_own_attach_gets_a_session() {
+    let relay = Relay::start("foreign");
+    let mut stream = UnixStream::connect(&relay.daemon_socket).unwrap();
+    write!(stream, "POST /attach HTTP/1.0\r\nContent-Length: 2\r\n\r\n{{}}").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.0 403"), "{reply}");
+    let mut stream = UnixStream::connect(&relay.daemon_socket).unwrap();
+    write!(stream, "GET /vault HTTP/1.0\r\n\r\n").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.0 404"), "the daemon's socket serves attaches only: {reply}");
 }
 
 #[test]
@@ -299,32 +444,6 @@ fn an_oversized_body_is_refused_before_it_is_read() {
     let mut reply = String::new();
     stream.read_to_string(&mut reply).unwrap();
     assert!(reply.starts_with("HTTP/1.0 413"), "{reply}");
-}
-
-#[test]
-fn two_sessions_change_one_vault_without_losing_each_others_changes() {
-    let data = data_dir("shared");
-    let mut first = Relay::start_in("shared-a", &data);
-    let second = Relay::start_in("shared-b", &data);
-    assert_eq!(second.vault, "absent");
-    first.create_vault("pass phrase");
-    assert_eq!(post_reply(&second.socket, "/create", &serde_json::json!({ "passphrase": "other" })).0, "409", "a vault made meanwhile is not replaced");
-    assert_eq!(second.get("/vault").1["state"], "locked");
-    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "pass phrase" })), "204");
-    first.add("One", "one", "password", "session", "value-one-1");
-    let add = |tag: &str| serde_json::json!({ "op": "add", "name": tag, "tag": tag, "kind": "password", "use": "session", "value": format!("value-{tag}-1") });
-    assert_eq!(post(&second.socket, "/vault", &add("two")), "200");
-    assert_eq!(post(&first.socket, "/vault", &add("three")), "200");
-    let tags = |relay: &Relay| relay.get("/vault").1["entries"].as_array().unwrap().iter().map(|e| e["tag"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-    assert_eq!(tags(&first), ["one", "two", "three"]);
-    assert_eq!(tags(&second), ["one", "two", "three"]);
-    assert_eq!(stdout(&run(second.mask_run("echo value-three-1"))), "[secret]\n", "the other session's new entry is masked");
-    let one = first.get("/vault").1["entries"][0]["id"].as_str().unwrap().to_owned();
-    assert_eq!(post(&first.socket, "/vault", &serde_json::json!({ "op": "delete", "id": one })), "200");
-    assert_eq!(post(&second.socket, "/vault", &add("four")), "200");
-    assert_eq!(tags(&second), ["two", "three", "four"], "a deleted entry stays deleted");
-    drop((first, second));
-    std::fs::remove_dir_all(&data).unwrap();
 }
 
 #[test]
@@ -452,28 +571,13 @@ fn a_refused_mask_run_runs_only_under_another_one() {
 fn helpers_in_a_tree_that_can_change_are_copies_removed_when_the_relay_ends() {
     let mut relay = Relay::start("pinned");
     let built = Path::new(MASK_RUN).parent().unwrap();
-    assert_eq!(relay.bin, PathBuf::from(format!("{}.bin", relay.socket.display())));
+    assert_eq!(relay.bin, PathBuf::from(format!("{}.bin", relay.daemon_socket.display())));
     for helper in ["secrets-mask-run", "secrets", "secrets-askpass", "secrets-askpass-sudo", "secrets-askpass-ssh", "secrets-askpass-git"] {
         assert_eq!(std::fs::read(relay.bin.join(helper)).unwrap(), std::fs::read(built.join(helper)).unwrap(), "{helper}");
     }
     assert_eq!(stdout(&run(relay.mask_run("echo pinned"))), "pinned\n");
     relay.stop();
     assert!(!relay.bin.exists());
-}
-
-#[test]
-fn a_running_call_masks_what_another_session_saves_meanwhile() {
-    let data = data_dir("watched");
-    let mut first = Relay::start_in("watched-a", &data);
-    let second = Relay::start_in("watched-b", &data);
-    first.create_vault("pass phrase");
-    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "pass phrase" })), "204");
-    let running = first.mask_run("sleep 1; echo value-late-1").spawn().unwrap();
-    let add = serde_json::json!({ "op": "add", "name": "Late", "tag": "late", "kind": "password", "use": "session", "value": "value-late-1" });
-    assert_eq!(post(&second.socket, "/vault", &add), "200");
-    assert_eq!(stdout(&running.wait_with_output().unwrap()), "[secret]\n");
-    drop((first, second));
-    std::fs::remove_dir_all(&data).unwrap();
 }
 
 #[test]
@@ -600,23 +704,22 @@ fn a_value_typed_while_the_vault_is_open_is_only_suggested_and_kept_when_saved()
 }
 
 #[test]
-fn a_new_passphrase_keeps_the_entries_and_closes_the_vault_in_other_sessions() {
+fn a_new_passphrase_keeps_the_entries_and_the_sessions_access() {
     let data = data_dir("rekey");
-    let mut first = Relay::start_in("rekey-a", &data);
-    let second = Relay::start_in("rekey-b", &data);
-    first.create_vault("old phrase");
-    let id = first.add("Login", "sudo", "password", "session", "sudo-pw-34");
-    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "old phrase" })), "204");
-    assert_eq!(post(&first.socket, "/vault", &serde_json::json!({ "op": "access", "id": id, "access": "allowed" })), "200");
-    assert_eq!(post_reply(&first.socket, "/passphrase", &serde_json::json!({ "passphrase": "" })).0, "400");
-    assert_eq!(post(&first.socket, "/passphrase", &serde_json::json!({ "passphrase": "new phrase" })), "204");
-    let shown = first.get("/vault").1;
+    let mut relay = Relay::start_in("rekey", &data);
+    relay.create_vault("old phrase");
+    let id = relay.add("Login", "sudo", "password", "session", "sudo-pw-34");
+    assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "access", "id": id, "access": "allowed" })), "200");
+    assert_eq!(post_reply(&relay.socket, "/passphrase", &serde_json::json!({ "passphrase": "" })).0, "400");
+    assert_eq!(post(&relay.socket, "/passphrase", &serde_json::json!({ "passphrase": "new phrase" })), "204");
+    let shown = relay.get("/vault").1;
     assert_eq!((shown["state"].as_str(), shown["entries"][0]["access"].as_str()), (Some("open"), Some("allowed")), "{shown}");
-    assert_eq!(second.get("/vault").1["state"], "locked", "the other session's key no longer fits");
-    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "old phrase" })), "403");
-    assert_eq!(post(&second.socket, "/unlock", &serde_json::json!({ "passphrase": "new phrase" })), "204");
-    assert_eq!(second.get("/vault").1["entries"][0]["tag"], "sudo");
-    drop((first, second));
+    assert_eq!(post(&relay.socket, "/lock", &serde_json::json!({})), "204");
+    assert_eq!(post(&relay.socket, "/unlock", &serde_json::json!({ "passphrase": "old phrase" })), "403");
+    assert_eq!(post(&relay.socket, "/unlock", &serde_json::json!({ "passphrase": "new phrase" })), "204");
+    let shown = relay.get("/vault").1;
+    assert_eq!((shown["entries"][0]["tag"].as_str(), shown["entries"][0]["access"].as_str()), (Some("sudo"), Some("allowed")), "{shown}");
+    drop(relay);
     std::fs::remove_dir_all(&data).unwrap();
 }
 
@@ -668,23 +771,6 @@ fn a_sessions_access_outlives_its_relay_and_ends_with_its_transcript() {
     }
     assert_eq!(left(), 0, "the files of sessions without a transcript go; the resumable one has none yet");
     drop(resumed);
-    std::fs::remove_dir_all(&data).unwrap();
-}
-
-#[test]
-fn typed_entries_another_relay_saves_are_dropped() {
-    let data = data_dir("typedsave");
-    let mut relay = Relay::start_in("typedsave", &data);
-    relay.create_vault("pass phrase");
-    relay.add("Kept", "kept", "password", "session", "kept-value-1");
-    let file = data.join("secrets/vault");
-    let mut older = Vault::open(&file, b"pass phrase").unwrap();
-    older.entries.push(Entry { id: "typed-1".to_owned(), name: "typed".to_owned(), tag: "typed-1".to_owned(), kind: Kind::Typed, use_: Use::Each, value: "old-typed-value".to_owned(), created: 0 });
-    older.save(&file).unwrap();
-    let tags: Vec<String> = relay.get("/vault").1["entries"].as_array().unwrap().iter().map(|e| e["tag"].as_str().unwrap().to_owned()).collect();
-    assert_eq!(tags, ["kept"]);
-    assert_eq!(stdout(&run(relay.mask_run("echo old-typed-value kept-value-1"))), "old-typed-value [secret]\n");
-    drop(relay);
     std::fs::remove_dir_all(&data).unwrap();
 }
 

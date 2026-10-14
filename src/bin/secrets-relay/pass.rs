@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use secrets::vault::Use;
 
 use crate::access::Grant;
+use crate::session::{self, Id};
 use crate::{Context, emit, hung_up, lock, locker, peer, respond};
 
 struct Asking {
@@ -20,11 +21,20 @@ struct Asking {
     prompt: String,
     /// The asking call's `secrets-mask-run`, whose output masks the value; none when it asks from outside a call.
     call: Option<i32>,
+    /// The `ask` event, sent again to a later attach.
+    event: serde_json::Value,
 }
 
 #[derive(Default)]
 pub struct Pass {
     waiting: HashMap<String, Asking>,
+}
+
+impl Pass {
+    /// The `ask` events of the requests still waiting.
+    pub fn events(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
+        self.waiting.values().map(|asking| asking.event.clone())
+    }
 }
 
 #[derive(Deserialize)]
@@ -34,29 +44,38 @@ struct Ask {
     tag: Option<String>,
 }
 
-/// `POST /ask {prompt, tag?}`: 200 with the value once answered, 403 when cancelled.
-pub async fn ask(stream: &mut UnixStream, ctx: &Context, body: &[u8]) {
+/// `POST /ask {prompt, tag?}`: 200 with the value once answered, 403 when cancelled or the session ended.
+pub async fn ask(stream: &mut UnixStream, ctx: &Context, session: Id, body: &[u8]) {
     let Ok(ask) = serde_json::from_slice::<Ask>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let Ok(id) = secrets::vault::random_hex::<16>() else { return respond(stream, "500 Internal Server Error", b"").await };
-    let by = peer::requester(peer::peer_pid(stream), &ctx.mask_run);
     let (tx, rx) = oneshot::channel();
-    let (entry, live) = {
-        let mut state = lock(ctx);
-        state.pass.waiting.insert(id.clone(), Asking { tx, prompt: ask.prompt.clone(), call: by.inside.then_some(by.pid) });
-        let tagged = ask.tag.as_deref().and_then(|tag| state.vault.tagged(tag));
-        let entry = tagged.map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "access": state.access.of(&e.id) }));
-        (entry, state.filter.live())
+    let asked = {
+        let mut guard = lock(ctx);
+        let state = &mut *guard;
+        state.sessions.get_mut(&session).map(|open| {
+            let by = peer::requester(peer::peer_pid(stream), &ctx.mask_run, open.claude_code);
+            let tagged = ask.tag.as_deref().and_then(|tag| state.vault.tagged(tag));
+            let entry = tagged.map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "use": e.use_, "access": open.access.of(&e.id) }));
+            let live = state.filter.live(open.claude_code);
+            let fields = json!({ "id": id, "prompt": ask.prompt, "tag": ask.tag, "entry": entry, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live });
+            let event = json!({ "ask": fields });
+            session::tell(session, &event);
+            open.pass.waiting.insert(id.clone(), Asking { tx, prompt: ask.prompt.clone(), call: by.inside.then_some(by.pid), event });
+        })
     };
-    let event = json!({ "id": id, "prompt": ask.prompt, "tag": ask.tag, "entry": entry, "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live });
-    emit(&json!({ "ask": event }));
+    if asked.is_none() {
+        return respond(stream, "403 Forbidden", b"").await;
+    }
     tokio::select! {
         answer = rx => match answer {
             Ok(Some(value)) => respond(stream, "200 OK", value.as_bytes()).await,
             _ => respond(stream, "403 Forbidden", b"").await,
         },
         () = hung_up(stream) => {
-            lock(ctx).pass.waiting.remove(&id);
-            emit(&json!({ "gone": id }));
+            if let Some(open) = lock(ctx).sessions.get_mut(&session) {
+                open.pass.waiting.remove(&id);
+            }
+            session::tell(session, &json!({ "gone": id }));
         }
     }
 }
@@ -75,32 +94,37 @@ struct Answer {
 
 /// `POST /answer` from the hooks: 204 taken, 410 no such ask, 409 with the reason when a picked entry can't be
 /// handed out (the ask keeps waiting).
-pub async fn answer(stream: &mut UnixStream, ctx: &Context, body: &[u8]) {
+pub async fn answer(stream: &mut UnixStream, ctx: &Context, session: Id, body: &[u8]) {
     let (status, reason) = match serde_json::from_slice::<Answer>(body) {
-        Ok(answer) => take(ctx, answer),
+        Ok(answer) => take(ctx, session, answer),
         Err(_) => ("400 Bad Request", ""),
     };
     respond(stream, status, reason.as_bytes()).await;
 }
 
-fn take(ctx: &Context, answer: Answer) -> (&'static str, &'static str) {
+fn take(ctx: &Context, session: Id, answer: Answer) -> (&'static str, &'static str) {
     let mut state = lock(ctx);
-    let Some(asking) = state.pass.waiting.remove(&answer.id) else { return ("410 Gone", "") };
+    let Some(asking) = state.sessions.get_mut(&session).and_then(|s| s.pass.waiting.remove(&answer.id)) else { return ("410 Gone", "") };
+    let put_back = |state: &mut crate::State, asking: Asking| {
+        if let Some(open) = state.sessions.get_mut(&session) {
+            open.pass.waiting.insert(answer.id.clone(), asking);
+        }
+    };
     if answer.cancel {
         let _ = asking.tx.send(None);
         return ("204 No Content", "");
     }
     let typed = answer.secret.is_some() && answer.entry.is_none();
-    let value = match (answer.entry, answer.secret) {
+    let value = match (answer.entry.as_ref(), answer.secret) {
         (Some(entry), _) => {
-            let Some((value, use_)) = state.vault.hand_out(&entry) else {
-                state.pass.waiting.insert(answer.id, asking);
+            let Some((value, use_)) = state.vault.hand_out(entry) else {
+                put_back(&mut state, asking);
                 return ("409 Conflict", "no such entry, or the vault is closed");
             };
             // The value goes out either way: the person picked it; a grant that can't be kept is only told.
             if answer.session
                 && use_ == Use::Session
-                && let Err(error) = locker::grant(&mut state, &entry, Grant::Allowed)
+                && let Err(error) = locker::grant(&mut state, session, entry, Grant::Allowed)
             {
                 emit(&json!({ "trouble": format!("vault: not allowed for the session: {error}") }));
             }
@@ -116,7 +140,7 @@ fn take(ctx: &Context, answer: Answer) -> (&'static str, &'static str) {
             secret
         }
         (None, None) => {
-            state.pass.waiting.insert(answer.id, asking);
+            put_back(&mut state, asking);
             return ("400 Bad Request", "");
         }
     };

@@ -8,6 +8,7 @@ import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
 import type { ListResume, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
+import { pathWith } from './session-path'
 import { fillSlot, hasSlot } from './slot'
 import { askDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
@@ -29,6 +30,7 @@ const DRAWER_COLUMNS = 64
 const POPOUT_MS = 15000
 const NOTICE_MS = 10000
 const RELAY_START_MS = 5000
+const MASK_RUN = '/secrets-mask-run'
 /** The waits before attaching again once an attach ended, doubling from the first; past the last it stops trying. */
 const REATTACH_FIRST_MS = 1000
 const REATTACH_LAST_MS = 60000
@@ -658,13 +660,13 @@ async function useRelay($: EngineInterface, relay: Attached) {
   await $.env.set('SSH_ASKPASS', bin + '/secrets-askpass-ssh')
   await $.env.set('SSH_ASKPASS_REQUIRE', 'force')
   await $.env.set('GIT_ASKPASS', bin + '/secrets-askpass-git')
-  const path = (await $.env.get('PATH')) ?? ''
-  // On a reload the daemon's bin leads PATH already.
-  if (!path.startsWith(bin + ':')) await $.env.set('PATH', `${bin}:${path}`)
   const prefix = await $.env.get('CLAUDE_CODE_SHELL_PREFIX')
-  // On a reload the prefix is a mask-run of ours, maybe from an older build; the one found first is the user's.
-  if (prefix && !prefix.endsWith('/secrets-mask-run')) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
-  await $.env.set('CLAUDE_CODE_SHELL_PREFIX', bin + '/secrets-mask-run')
+  // On a reload or a reattach the prefix is a mask-run of ours, maybe from an older build, whose bin is on PATH; the
+  // one found first is the user's.
+  const previous = prefix?.endsWith(MASK_RUN) ? prefix.slice(0, -MASK_RUN.length) : null
+  if (prefix && previous === null) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
+  await $.env.set('PATH', pathWith((await $.env.get('PATH')) ?? '', bin, previous))
+  await $.env.set('CLAUDE_CODE_SHELL_PREFIX', bin + MASK_RUN)
   relayReady = true
   await nameSession($, await $.session.id())
   await sendSettings($)

@@ -2,32 +2,16 @@
 
 use std::path::Path;
 
+pub use secrets::process::{parent_of, start_time};
 use tokio::net::UnixStream;
 
 pub fn cmdline_of(pid: i64) -> String {
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_owned())
-        .unwrap_or_default()
-}
-
-/// The fields of `/proc/<pid>/stat` after the command name, which may hold spaces: the state first.
-fn stat_fields(pid: i32) -> Option<Vec<String>> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    Some(stat.rsplit_once(')')?.1.split_whitespace().map(str::to_owned).collect())
-}
-
-pub fn parent_of(pid: i32) -> Option<i32> {
-    stat_fields(pid)?.get(1)?.parse().ok()
-}
-
-/// When the process started, in clock ticks since boot: with the pid, it names one process, a reused pid another.
-pub fn start_time(pid: i32) -> Option<u64> {
-    stat_fields(pid)?.get(19)?.parse().ok()
+    i32::try_from(pid).ok().and_then(secrets::process::cmdline).unwrap_or_default()
 }
 
 /// The process runs the executable at `exe` (canonical).
 pub fn runs(pid: i32, exe: &Path) -> bool {
-    std::fs::canonicalize(format!("/proc/{pid}/exe")).is_ok_and(|path| path == exe)
+    secrets::process::executable(pid).is_some_and(|path| path == exe)
 }
 
 pub fn peer_pid(stream: &UnixStream) -> Option<i32> {

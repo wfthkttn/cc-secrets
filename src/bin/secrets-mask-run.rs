@@ -209,20 +209,16 @@ fn copy(outputs: &mut [Output; 2], mut filter: Option<Filter>) {
 
 /// Another `secrets-mask-run` is among this process's ancestors.
 fn under_mask_run() -> bool {
-    let parent_of = |pid: i32| -> Option<i32> {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
-    };
     let mut at = rustix::process::getppid().map_or(0, Pid::as_raw_pid);
     for _ in 0..64 {
         if at <= 1 {
             return false;
         }
-        let exe = std::fs::read_link(format!("/proc/{at}/exe"));
-        if exe.is_ok_and(|exe| exe.file_name().is_some_and(|name| name == "secrets-mask-run")) {
+        let exe = secrets::process::executable(at);
+        if exe.is_some_and(|exe| exe.file_name().is_some_and(|name| name == "secrets-mask-run")) {
             return true;
         }
-        let Some(parent) = parent_of(at) else { return false };
+        let Some(parent) = secrets::process::parent_of(at) else { return false };
         at = parent;
     }
     false

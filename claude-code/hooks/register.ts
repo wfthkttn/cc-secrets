@@ -276,9 +276,10 @@ export function register(on: On) {
     unlockAtStart = await option($, 'unlockAtStart', true)
     hasMasked = (await $.state.get({ plugin: 'secrets', key: 'hasMasked' })).value ?? false
 
-    const runtimeDir = await $.env.get('XDG_RUNTIME_DIR')
+    // macOS has no XDG_RUNTIME_DIR; its per-user private directory is TMPDIR, where the daemon there listens.
+    const runtimeDir = ((await $.env.get('XDG_RUNTIME_DIR')) || (await $.env.get('TMPDIR')))?.replace(/\/+$/, '')
     if (!runtimeDir) {
-      throw new Error("secrets: XDG_RUNTIME_DIR is not set, so the secrets daemon's socket is unknown")
+      throw new Error("secrets: neither XDG_RUNTIME_DIR nor TMPDIR is set, so the secrets daemon's socket is unknown")
     }
     const daemon = (await $.env.get('SECRETS_DAEMON')) || `${runtimeDir}/secrets.sock`
     const agent = await $.env.get('SSH_AUTH_SOCK')

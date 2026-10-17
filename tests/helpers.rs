@@ -41,6 +41,28 @@ fn data_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Where the daemons' sockets go. macOS's `$TMPDIR` is too long: with a session's suffix the path passes the
+/// 104-byte limit of a socket path. Canonical, as the daemon names its helpers' directory after it.
+fn socket_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return std::fs::canonicalize("/tmp").unwrap();
+    }
+    std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
+}
+
+/// The daemon binary. On macOS it runs only when signed with the hardened runtime, as an install signs it.
+fn signed_relay() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        static SIGNED: std::sync::Once = std::sync::Once::new();
+        SIGNED.call_once(|| {
+            let status = Command::new("codesign").args(["-f", "-s", "-", "-o", "runtime", RELAY]).status().unwrap();
+            assert!(status.success(), "codesign couldn't sign {RELAY}");
+        });
+    }
+    RELAY
+}
+
 /// Attaches this process to the daemon at `daemon_socket`: the attach, its events, and its ready event.
 fn attach_to(daemon_socket: &Path, env: &[(String, PathBuf)]) -> (Child, BufReader<ChildStdout>, serde_json::Value) {
     let mut attach = Command::new(RELAY);
@@ -68,9 +90,8 @@ impl Relay {
     }
 
     fn start_with(name: &str, data: &Path, env: &[(&str, &Path)]) -> Self {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-        let daemon_socket = dir.join(format!("secrets-test-{name}-{}.sock", std::process::id()));
-        let daemon = Command::new(RELAY).args(["daemon", "--socket"]).arg(&daemon_socket).env("XDG_DATA_HOME", data).spawn().unwrap();
+        let daemon_socket = socket_dir().join(format!("secrets-test-{name}-{}.sock", std::process::id()));
+        let daemon = Command::new(signed_relay()).args(["daemon", "--socket"]).arg(&daemon_socket).env("XDG_DATA_HOME", data).spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while UnixStream::connect(&daemon_socket).is_err() {
             assert!(Instant::now() < deadline, "the daemon didn't listen on {}", daemon_socket.display());

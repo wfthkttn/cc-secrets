@@ -1,11 +1,12 @@
 //! Usage: secrets-relay daemon [--socket PATH] | secrets-relay attach
 //!
 //! `daemon`: the vault and the requests of every Claude Code session, one per user. It listens on the socket systemd
-//! passes it, else on PATH (default `$XDG_RUNTIME_DIR/secrets.sock`), where only `attach` is served (`session.rs`).
-//! The vault lives at `$XDG_DATA_HOME/secrets/vault`. It ends on SIGTERM.
+//! or launchd passes it, else on PATH (default `$XDG_RUNTIME_DIR/secrets.sock`, on macOS `$TMPDIR/secrets.sock`),
+//! where only `attach` is served (`session.rs`). The vault lives at `$XDG_DATA_HOME/secrets/vault`. It ends on
+//! SIGTERM.
 //!
-//! `attach`: run by the hooks. Attaches its parent, Claude Code, to the daemon at `$SECRETS_DAEMON` (default
-//! `$XDG_RUNTIME_DIR/secrets.sock`), with `$SECRETS_UPSTREAM_AGENT` as the user's own ssh-agent, and prints the
+//! `attach`: run by the hooks. Attaches its parent, Claude Code, to the daemon at `$SECRETS_DAEMON` (default as
+//! above), with `$SECRETS_UPSTREAM_AGENT` as the user's own ssh-agent, and prints the
 //! session's events to stdout as JSON lines until the daemon hangs up; exits 1 with a line on stderr when it can't
 //! attach. The first event is `{"ready": socket, "agent": path, "vault": "absent" | "locked" | "open", "bin": dir}`:
 //! the session's socket, its ssh-agent, and the directory of the helpers the daemon pins (`pinned`), its
@@ -78,6 +79,9 @@ const MASK_MIN: usize = 6;
 /// What runs from `bin`: the shell prefix, the CLI on PATH, the askpass helpers.
 const HELPERS: [&str; 6] =
     ["secrets-mask-run", "secrets", "secrets-askpass", "secrets-askpass-sudo", "secrets-askpass-ssh", "secrets-askpass-git"];
+/// The `Sockets` entry of the launchd job that holds the daemon's socket.
+#[cfg(target_os = "macos")]
+const LAUNCHD_SOCKET: &std::ffi::CStr = c"secrets";
 
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -363,11 +367,22 @@ fn vault_path() -> Option<PathBuf> {
 }
 
 /// `$SECRETS_DAEMON`, else `$XDG_RUNTIME_DIR/secrets.sock`.
+#[cfg(target_os = "linux")]
 fn daemon_socket() -> Result<PathBuf, &'static str> {
     if let Some(path) = std::env::var_os("SECRETS_DAEMON").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(path));
     }
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).ok_or("neither SECRETS_DAEMON nor XDG_RUNTIME_DIR is set")?;
+    Ok(PathBuf::from(runtime).join("secrets.sock"))
+}
+
+/// `$SECRETS_DAEMON`, else `$TMPDIR/secrets.sock`: macOS's per-user private directory.
+#[cfg(target_os = "macos")]
+fn daemon_socket() -> Result<PathBuf, &'static str> {
+    if let Some(path) = std::env::var_os("SECRETS_DAEMON").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let runtime = std::env::var_os("TMPDIR").filter(|v| !v.is_empty()).ok_or("neither SECRETS_DAEMON nor TMPDIR is set")?;
     Ok(PathBuf::from(runtime).join("secrets.sock"))
 }
 
@@ -395,11 +410,46 @@ fn pinned(mask_run: &Path, copies: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(copies.join("secrets-mask-run"))
 }
 
-/// The socket systemd passed, else a fresh bind of `path` (mode 0600); true when bound here, so the file is ours to
-/// remove.
-fn listener(path: &Path) -> Result<(UnixListener, bool), String> {
+/// The socket systemd passed, if any.
+#[cfg(target_os = "linux")]
+fn passed_listener() -> Result<Option<std::os::unix::net::UnixListener>, String> {
     let mut passed = listenfd::ListenFd::from_env();
-    if let Some(listener) = passed.take_unix_listener(0).map_err(|e| format!("can't take the socket systemd passed: {e}"))? {
+    passed.take_unix_listener(0).map_err(|e| format!("can't take the socket systemd passed: {e}"))
+}
+
+/// The socket launchd holds for this job, if launchd started it: its plist's `Sockets` entry `LAUNCHD_SOCKET`.
+#[cfg(target_os = "macos")]
+fn passed_listener() -> Result<Option<std::os::unix::net::UnixListener>, String> {
+    use std::os::fd::FromRawFd as _;
+
+    unsafe extern "C" {
+        fn launch_activate_socket(name: *const std::ffi::c_char, fds: *mut *mut std::ffi::c_int, cnt: *mut usize) -> std::ffi::c_int;
+    }
+    let mut fds: *mut std::ffi::c_int = std::ptr::null_mut();
+    let mut count = 0usize;
+    // SAFETY: the name is NUL-terminated; on success launchd points `fds` at `count` descriptors it allocated.
+    let error = unsafe { launch_activate_socket(LAUNCHD_SOCKET.as_ptr(), &raw mut fds, &raw mut count) };
+    if error == libc::ESRCH {
+        return Ok(None);
+    }
+    if error != 0 {
+        return Err(format!("can't take the socket launchd holds: {}", std::io::Error::from_raw_os_error(error)));
+    }
+    // SAFETY: launchd handed over `count` open descriptors at `fds`, which this process now owns.
+    let owned: Vec<std::os::fd::OwnedFd> = (0..count).map(|i| unsafe { std::os::fd::OwnedFd::from_raw_fd(*fds.add(i)) }).collect();
+    // SAFETY: `fds` came from launchd's malloc and is read no more.
+    unsafe { libc::free(fds.cast()) };
+    let mut owned = owned.into_iter();
+    match (owned.next(), owned.next()) {
+        (Some(fd), None) => Ok(Some(std::os::unix::net::UnixListener::from(fd))),
+        _ => Err(format!("launchd passed {count} sockets for {LAUNCHD_SOCKET:?}, not one")),
+    }
+}
+
+/// The socket the service manager passed, else a fresh bind of `path` (mode 0600); true when bound here, so the file
+/// is ours to remove.
+fn listener(path: &Path) -> Result<(UnixListener, bool), String> {
+    if let Some(listener) = passed_listener()? {
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         return UnixListener::from_std(listener).map(|l| (l, false)).map_err(|e| e.to_string());
     }
@@ -413,9 +463,40 @@ fn listener(path: &Path) -> Result<(UnixListener, bool), String> {
     bound.map(|l| (l, true))
 }
 
+/// No other process of the user, nor a core dump, can read this one's memory.
+#[cfg(target_os = "linux")]
+fn harden() -> Result<(), String> {
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|error| format!("can't make this process non-dumpable: {error}"))
+}
+
+/// No other process of the user, nor a core dump, can read this one's memory: the binary must be signed with the
+/// hardened runtime and without get-task-allow (`codesign -s - -o runtime`), which keeps debuggers out, root's too.
+#[cfg(target_os = "macos")]
+fn harden() -> Result<(), String> {
+    const CS_OPS_STATUS: std::ffi::c_uint = 0;
+    const CS_GET_TASK_ALLOW: u32 = 0x4;
+    const CS_RUNTIME: u32 = 0x1_0000;
+    unsafe extern "C" {
+        fn csops(pid: libc::pid_t, ops: std::ffi::c_uint, useraddr: *mut std::ffi::c_void, usersize: usize) -> std::ffi::c_int;
+    }
+    let no_core = rustix::process::Rlimit { current: Some(0), maximum: Some(0) };
+    rustix::process::setrlimit(rustix::process::Resource::Core, no_core).map_err(|error| format!("can't turn core dumps off: {error}"))?;
+    let mut flags = 0u32;
+    // SAFETY: CS_OPS_STATUS writes one u32 to the buffer, which holds one.
+    let failed = unsafe { csops(rustix::process::getpid().as_raw_pid(), CS_OPS_STATUS, (&raw mut flags).cast(), size_of::<u32>()) };
+    if failed != 0 {
+        return Err(format!("can't read this binary's code signature: {}", std::io::Error::last_os_error()));
+    }
+    if flags & CS_RUNTIME == 0 || flags & CS_GET_TASK_ALLOW != 0 {
+        return Err("this binary isn't signed with the hardened runtime, so a debugger could read its memory: sign it with `codesign -f -s - -o runtime`".to_owned());
+    }
+    Ok(())
+}
+
 fn daemon(socket: Option<PathBuf>) -> ExitCode {
-    if let Err(error) = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable) {
-        note(&format!("can't make this process non-dumpable: {error}"));
+    if let Err(error) = harden() {
+        note(&error);
         return ExitCode::FAILURE;
     }
     let exe = match std::env::current_exe().and_then(std::fs::canonicalize) {

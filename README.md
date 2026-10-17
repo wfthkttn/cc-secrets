@@ -6,7 +6,7 @@ When a command needs a secret (`sudo -A`, ssh, git, or `secrets ask` inside a co
 Claude Code sidebar. You type the value, or pick an entry from your vault, and it goes straight to the program that
 asked. The agent sees `[secret]` wherever the value would have shown.
 
-Linux only, provided as is. See [Why Linux only](#why-linux-only).
+Linux and macOS, provided as is. See [Platforms](#platforms).
 
 ## What it does
 
@@ -79,8 +79,8 @@ another command, or sending it somewhere it doesn't belong. It does **not** defe
 malicious plugin, or another process running as you:
 
 - A process running as your user can talk to your ssh-agent socket and ask the daemon for things the same way a
-  command can; the daemon checks who asks by the peer's process (`SO_PEERCRED`, `/proc/<pid>/exe`), which holds
-  against a mistaken command, not against code built to imitate one.
+  command can; the daemon checks who asks by the peer's process (see [Platforms](#platforms)), which holds against a
+  mistaken command, not against code built to imitate one.
 - Plugins loaded before this one are not checked; Claude Code runs them first.
 - Your own settings hooks (`PostToolUse` and the like) receive tool results before they are masked.
 - A value a command has been handed is in that command's memory and environment; what the command does with it is
@@ -98,16 +98,25 @@ malicious plugin, or another process running as you:
 - A restart of the daemon (an update, a crash) locks the vault, and requests waiting at that moment fail.
 - Your own prompt text is never masked.
 
-## Why Linux only
+## Platforms
 
-The security rests on the kernel and the init system: the daemon identifies callers with `SO_PEERCRED` and
-`/proc/<pid>/exe`, marks itself non-dumpable, relies on Yama `ptrace_scope` 1 or higher so one command can't read
-another's memory, and runs as a systemd user service with socket activation. Another OS would need a different
-design, not a port, and other systems aren't supported.
+The security rests on the kernel and the service manager, so each platform has its own way to the same guarantees;
+other systems aren't supported.
+
+- **Linux.** The daemon identifies callers with `SO_PEERCRED` and `/proc/<pid>/{exe,stat,cmdline}`, marks itself
+  non-dumpable, relies on Yama `ptrace_scope` 1 or higher so one command can't read another's memory, and runs as a
+  systemd user service with socket activation.
+- **macOS.** Callers are identified with `LOCAL_PEEREPID`, `proc_pidinfo`, `proc_pidpath` and `kern.procargs2`. The
+  peer pid macOS reports is the last process that used the peer's socket, where Linux reports the one that
+  connected; a socket passed to or shared with another process counts as that process's. The daemon is signed with
+  the hardened runtime and without `get-task-allow`, which keeps every debugger out, root's included, and refuses to
+  start when it isn't; core dumps are off. It runs as a launchd agent that holds its socket, `$TMPDIR/secrets.sock`,
+  and starts it on the first connection.
 
 ## Requirements
 
-- Linux with systemd (user services) and Yama `ptrace_scope` ≥ 1.
+- Linux with systemd (user services) and Yama `ptrace_scope` ≥ 1, or macOS with Xcode's command line tools
+  (`codesign`).
 - Claude Code 2.1.293 or later, in fullscreen rendering.
 - The [sidebar](https://github.com/wfthkttn/sidebar) plugin, which draws the 🔐 drawer.
 
@@ -184,9 +193,31 @@ Then in `~/.claude/settings.json`, with the two clones' paths:
 After a rebuild, `systemctl --user restart secrets.service`, so the daemon runs the build the plugin calls; the
 restart locks the vault.
 
+### macOS
+
+Needs Rust 1.95 or later.
+
+```sh
+git clone https://github.com/wfthkttn/sidebar
+git clone https://github.com/wfthkttn/claude-secrets
+claude-secrets/macos/install.sh
+```
+
+It builds, installs the binaries and the plugin under `~/.local/lib/secrets`, signs the daemon, and loads the launchd
+agent `local.claude-secrets`; its log is `~/Library/Logs/claude-secrets.log`. Run it again after an update; it
+stops the running daemon, which locks the vault. Then in `~/.claude/settings.json`, with your home and the sidebar
+clone's path:
+
+```json
+"env": {
+  "CLAUDE_CODE_PLUGIN_DIRS": "/Users/you/.local/lib/secrets/claude-code:/path/to/sidebar"
+}
+```
+
 ## How it works
 
-- `secrets-relay daemon`: one per user, started by `secrets.socket`. It owns the vault file
+- `secrets-relay daemon`: one per user, started by its socket (systemd's `secrets.socket`, launchd's
+  `local.claude-secrets`). It owns the vault file
   (`$XDG_DATA_HOME/secrets/vault`, else `~/.local/share/secrets/vault`) and each session's access file
   (`sessions/<session-id>.json` beside it).
 - `secrets-relay attach`: started by the plugin's hooks in each session; the session's Claude Code process is its
@@ -203,6 +234,9 @@ cargo build --release      # claude-code/bin points at target/release
 cargo test                 # run outside a session that has this plugin loaded
 cd claude-code && claude plugin test && claude plugin validate .
 ```
+
+On macOS, `cargo test -- --test-threads=4`: each test's daemon copies its helpers, macOS checks a new executable at
+its first run (about 0.3 s), and with a test on every core the timing tests run out of time.
 
 ## Licence
 

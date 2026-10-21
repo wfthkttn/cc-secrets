@@ -8,6 +8,7 @@ import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
 import type { ListResume, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
+import { failureKind } from './relay-failure'
 import { pathWith } from './session-path'
 import { fillSlot, hasSlot } from './slot'
 import { askDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
@@ -179,6 +180,8 @@ let collisions: readonly (Collision & { events: readonly string[] })[] = []
 let popouts: Popouts | null = null
 /** Shown above the cards; a sticky one stays until its ✕, any other also goes on the next action or after `NOTICE_MS`. */
 let notice: { text: string; sticky: boolean; timer: Timer | null } | null = null
+/** The notice of the last failed relay call, while no call got through since. */
+let relayFailure: { text: string; sticky: boolean; timer: Timer | null } | null = null
 
 function randomId(): string {
   return Math.random().toString(36).slice(2)
@@ -799,18 +802,24 @@ async function addRequest($: EngineInterface, request: Request) {
   }
 }
 
-/** The relay's reply, or null after saying why there is none. */
+/**
+ * The relay's reply, or null after saying why there is none. The notice of a failed call
+ * goes once a later call gets through: what it reported is over.
+ */
 async function callRelay($: EngineInterface, method: 'GET' | 'POST', path: string, body: object | null) {
   if (relaySocket === null) throw new Error('secrets: called the relay before it started')
+  let reply
   try {
     const init = body === null ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
-    return await $.http.fetch('http://relay' + path, { method, socketPath: relaySocket, ...init })
+    reply = await $.http.fetch('http://relay' + path, { method, socketPath: relaySocket, ...init })
   } catch (error) {
-    // The fetch error's text may carry the request, and with it the secret.
-    const code = /\bE[A-Z]{2,}\b/.exec((error as Error).message)?.[0] ?? 'no error code'
-    say($, `Not sent: the relay can't be reached (${code}).`, true)
+    say($, `Not sent: the call to the relay failed (${failureKind(error)}).`, true)
+    relayFailure = notice
     return null
   }
+  if (relayFailure !== null && notice === relayFailure) unsay($, true)
+  relayFailure = null
+  return reply
 }
 
 /** A JSON reply the hooks can't go on without: GET with no body, else POST; throws naming the path when there is none. */

@@ -3,11 +3,12 @@ import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from '
 
 import { appliedText, SUGGESTED, withText } from './auto-mode'
 import type { ConfigAction, ConfigMessage, ConfigProps, ConfigResume } from './config-view-props'
+import { editText, END_CARET, type PasteMark } from './controls'
 import { allowKey, carriersSeen } from './guard'
 import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
-import type { ListResume, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
+import type { ListResume, Offered, RequestEntry, RequestPaste, RequestsMessage, RequestsProps } from './requests-props'
 import { failureKind } from './relay-failure'
 import { pathWith } from './session-path'
 import { fillSlot, hasSlot } from './slot'
@@ -16,7 +17,20 @@ import { type Tab, TAB_ROWS, type Tabs } from './tabs'
 import { drawPage as configLines } from './config-view'
 import { contentRows } from './vault-view'
 import { VAULT_DESCRIPTION, VAULT_TOOL, VAULT_TOOL_NAME, vaultListing, vaultVerdict } from './vault-tool'
-import type { Access, Collision, SecretField, Suggestion, TagChoice, VaultAction, VaultMessage, VaultProps, VaultResume, ViewEntry } from './vault-view-props'
+import type {
+  Access,
+  Collision,
+  SecretField,
+  Suggestion,
+  TagChoice,
+  TextField,
+  VaultAction,
+  VaultMessage,
+  VaultPaste,
+  VaultProps,
+  VaultResume,
+  ViewEntry,
+} from './vault-view-props'
 
 const SIDEBAR_ID = 'pass'
 const DRAWER_SLOT: SidebarDrawerSlot = `sidebar-drawer:${SIDEBAR_ID}`
@@ -39,11 +53,12 @@ const DEFAULT_MASK_MIN = 6
 const UNSEEN_PASTE = 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.'
 const UNTARGETED_PASTE = 'The paste went into the prompt: no request was selected. Click a request first.'
 const UNTYPED_PASTE = "The paste went into the prompt: the selected request doesn't take typing now."
+const FIELDLESS_PASTE = 'The paste went into the prompt: no text field was selected. Click one first.'
 /** The tags the askpass helpers ask with (`secrets-askpass-*`), each with what asks. */
 const ASKPASS_TAGS: readonly TagChoice[] = [
-  { tag: 'sudo', what: 'sudo -A asks for your password' },
-  { tag: 'ssh', what: 'ssh asks for a password or passphrase' },
-  { tag: 'git', what: 'git asks for a username or password' },
+  { tag: 'sudo', what: 'your sudo password' },
+  { tag: 'ssh', what: 'an ssh password or key passphrase' },
+  { tag: 'git', what: 'a git username or password' },
 ]
 const WRITE_BACK = 'secrets: this would write [secret], a masked value, over the real one; edit around the masked span instead.'
 const ROW_COMPONENTS = [
@@ -116,8 +131,16 @@ let vaultApplied: Record<string, number> = {}
 /** Bumped when a save or delete went through, which closes the form. */
 let formEpoch = 0
 let vaultError: string | null = null
-let vaultFocused: SecretField | null = null
+let vaultFocused: SecretField | TextField | null = null
+/** The caret in that field, where a paste into a held field goes. */
+let vaultCaret = 0
 let vaultFormOpen = false
+/** Pastes for the vault view: Name's or Tag's text, or where one went into a held field; kept until its post says it took them in. */
+let vaultPastes: readonly VaultPaste[] = []
+/** Numbers every view's pastes from the clock: a view instance that outlived a reload of these hooks still takes new ones. */
+let pasteSeq = Date.now()
+/** The view the keyboard went to last, which a paste that reached the prompt names. */
+let keyboardOn: 'requests' | 'vault' | 'config' = 'requests'
 /** Tags agents asked for this session that no entry held then, newest last. */
 let askedTags: readonly string[] = []
 /** The session's socket on the secrets daemon. */
@@ -142,9 +165,17 @@ let configApplied: string | null = null
 let configConfirmed: Record<string, number> = {}
 let configError: string | null = null
 let configTextFocused = false
+/** The caret in the auto-mode text, where a paste goes. */
+let configCaret = 0
+/** Pastes into the auto-mode text, kept until the config view's post says it took them in. */
+let configPastes: readonly PasteMark[] = []
 let focusEpoch = 0
 /** The value typed or pasted for each request; the lists only learn its length. */
 const held = new Map<string, string>()
+/** The caret in the selected request's value, from the list that last had the keyboard; where a paste goes. */
+let listCaret = 0
+/** Pastes into requests' values, kept until a list's post says it took them in. */
+let requestPastes: readonly RequestPaste[] = []
 /** The requests whose typed value the person asked to see in plain text. */
 const requestPeek = new Set<string>()
 
@@ -225,7 +256,7 @@ async function storedList($: EngineInterface, key: 'allowedPlugins' | 'refusedPl
 
 /** Why a typed value can't be sent now, naming the plugins that could read it; null when it can. */
 function typingOff(): string | null {
-  return collisions.length === 0 ? null : `off: ${collisions.map(c => c.name).join(', ')} could read it · Vault tab`
+  return collisions.length === 0 ? null : `off while ${collisions.map(c => c.name).join(', ')} can read it (Vault tab)`
 }
 
 /** The entries a card offers, worked out now: an offer of the vault's follows its state. */
@@ -255,7 +286,7 @@ export function register(on: On) {
     const carriers = carriersSeen(e.uses.events)
     if (carriers.length === 0) return next(e)
     if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
-      return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (Refuse in the Vault tab)` }
+      return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (blocked in the Vault tab)` }
     }
     const isAllowed = (await storedList($, 'allowedPlugins')).includes(allowKey(e.name, e.uses.events))
     const decided = await next(e)
@@ -361,13 +392,22 @@ export function register(on: On) {
       listFocused = true
       // The keyboard is on another tab now: a paste is no request's.
       listSelected = null
+      keyboardOn = e.element === VAULT_KEY ? 'vault' : 'config'
       if (e.element === VAULT_KEY) {
         const message = e.data as VaultMessage
-        if (message.ui !== undefined) vaultResume = message.ui
+        if (message.ui !== undefined) {
+          vaultResume = message.ui
+          const taken = message.ui.pasted
+          vaultPastes = vaultPastes.filter(p => p.seq > taken)
+        }
         await onVaultMessage($, message)
       } else {
         const message = e.data as ConfigMessage
-        if (message.ui !== undefined) configResume = message.ui
+        if (message.ui !== undefined) {
+          configResume = message.ui
+          const taken = message.ui.pasted
+          configPastes = configPastes.filter(p => p.seq > taken)
+        }
         await onConfigMessage($, message)
       }
       $.ui.invalidate('ui.render')
@@ -375,10 +415,16 @@ export function register(on: On) {
     }
     if (e.element !== LIST_KEY && e.element !== POPOUT_KEY) return next(e)
     const message = e.data as RequestsMessage
-    if (message.ui !== undefined) listResume = { ...listResume, [e.element]: message.ui }
+    if (message.ui !== undefined) {
+      listResume = { ...listResume, [e.element]: message.ui }
+      const taken = message.ui.pasted
+      requestPastes = requestPastes.filter(p => p.seq > taken)
+    }
+    listCaret = message.caret
     unsay($, false)
     if (!listFocused) draftAtFocus = (await $.prompt.read()).text
     listFocused = true
+    keyboardOn = 'requests'
     vaultFocused = null
     configTextFocused = false
     listSelected = message.selected
@@ -412,12 +458,11 @@ export function register(on: On) {
         continue
       }
       const value = held.get(edit.id) ?? ''
-      if (edit.kind === 'append') held.set(edit.id, value + edit.text)
-      else if (edit.kind === 'back') held.set(edit.id, [...value].slice(0, -1).join(''))
-      else if (edit.kind === 'clear') {
+      if (edit.kind === 'clear') {
         held.set(edit.id, '')
         requestPeek.delete(edit.id)
       }
+      else if (edit.kind === 'insert' || edit.kind === 'back' || edit.kind === 'del') held.set(edit.id, editText(value, edit))
       else if (edit.kind === 'submit') {
         const off = typingOff()
         if (off !== null) say($, `Not sent: typing is ${off}.`, true)
@@ -447,8 +492,19 @@ export function register(on: On) {
     // While the list holds the keyboard, keys go to it; a key-less edit reaching the prompt is a paste.
     if (listFocused && (vaultFocused !== null || configTextFocused) && e.inputText !== '') {
       const pasted = e.inputText.replace(/\r?\n$/, '')
-      if (vaultFocused !== null) fields = { ...fields, [vaultFocused]: fields[vaultFocused] + pasted }
-      else configDraft += pasted.replace(/\r?\n/g, ' ')
+      pasteSeq += 1
+      if (vaultFocused === 'name' || vaultFocused === 'tag') {
+        vaultPastes = [...vaultPastes, { seq: pasteSeq, field: vaultFocused, text: pasted.replace(/\r\n?|\n/g, ' ') }]
+      } else if (vaultFocused !== null) {
+        const at = Math.min(vaultCaret, [...fields[vaultFocused]].length)
+        fields = { ...fields, [vaultFocused]: editText(fields[vaultFocused], { kind: 'insert', at, text: pasted }) }
+        vaultPastes = [...vaultPastes, { seq: pasteSeq, field: vaultFocused, at, length: [...pasted].length }]
+      } else {
+        const text = pasted.replace(/\r?\n/g, ' ')
+        const at = Math.min(configCaret, [...configDraft].length)
+        configDraft = editText(configDraft, { kind: 'insert', at, text })
+        configPastes = [...configPastes, { seq: pasteSeq, at, length: [...text].length }]
+      }
       $.ui.invalidate('ui.render')
       return { text: e.text, cursor: e.cursor }
     }
@@ -456,11 +512,17 @@ export function register(on: On) {
     const goes = pasteTarget(target && { kind: target.kind, chosen: chosenFor(target) }, typingOff())
     if (!listFocused || target === undefined || goes !== 'card' || e.inputText === '') {
       const box = await next(e)
-      if (listFocused && e.inputText !== '') say($, goes === 'no card' ? UNTARGETED_PASTE : UNTYPED_PASTE, false)
+      const why = keyboardOn !== 'requests' ? FIELDLESS_PASTE : goes === 'no card' ? UNTARGETED_PASTE : UNTYPED_PASTE
+      if (listFocused && e.inputText !== '') say($, why, false)
       if (listFocused) draftAtFocus = box.text
       return box
     }
-    held.set(target.id, (held.get(target.id) ?? '') + e.inputText.replace(/\r?\n$/, ''))
+    const value = held.get(target.id) ?? ''
+    const pasted = e.inputText.replace(/\r?\n$/, '')
+    const at = Math.min(listCaret, [...value].length)
+    held.set(target.id, editText(value, { kind: 'insert', at, text: pasted }))
+    pasteSeq += 1
+    requestPastes = [...requestPastes, { seq: pasteSeq, id: target.id, at, length: [...pasted].length }]
     $.ui.invalidate('ui.render')
     return { text: e.text, cursor: e.cursor }
   })
@@ -544,7 +606,8 @@ export function register(on: On) {
       const message = notice === null ? null : notice.text
       const tabRows = tabs === null ? 0 : TAB_ROWS
       const height = listHeight(entries, columns, message, rows - tabRows)
-      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height, resume: listResume[key] ?? null }
+      const pastes = requestPastes.filter(p => shown.some(r => r.id === p.id))
+      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height, pastes, resume: listResume[key] ?? null }
       return Client({ key, module: './requests.ts', props, width: columns, height: height + tabRows })
     }
     // The vault and config views get the whole room to lay out in, and are as tall as what they show.
@@ -563,6 +626,7 @@ export function register(on: On) {
         applied: vaultApplied,
         lengths: { value: [...fields.value].length, passphrase: [...fields.passphrase].length, again: [...fields.again].length },
         peeked: Object.fromEntries([...vaultPeek].map(field => [field, fields[field]])),
+        pastes: [...vaultPastes],
         formEpoch,
         error: vaultError,
         resume: vaultResume,
@@ -579,12 +643,13 @@ export function register(on: On) {
         draft: configDraft,
         applied: configApplied,
         confirmed: configConfirmed,
+        pastes: [...configPastes],
         unlockAtStart,
         maskMinLength,
         error: configError,
         resume: configResume,
       }
-      const height = Math.min(room, TAB_ROWS + configLines(props, { focus: 'text', pending: [] }).length)
+      const height = Math.min(room, TAB_ROWS + configLines(props, { focus: 'text', pending: [], caret: END_CARET }).length)
       return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })
     }
     let filled = tree
@@ -646,7 +711,7 @@ async function reattach($: EngineInterface, why: Error, wait: number) {
     const relay = await startRelay($)
     await useRelay($, relay)
     await refreshVault($)
-    say($, 'The secrets daemon restarted: requests waiting before it did are gone.', false)
+    say($, 'The secrets daemon restarted; the requests waiting then were dropped.', false)
   } catch (error) {
     await reattach($, error as Error, wait * 2)
   }
@@ -729,7 +794,7 @@ function vaultOffer(): Pickable[] {
 
 /** Offered in the vault form's tag field: the askpass helpers' tags, then those agents asked for with no entry. */
 function tagChoices(): TagChoice[] {
-  const asked = askedTags.filter(tag => !ASKPASS_TAGS.some(c => c.tag === tag)).map(tag => ({ tag, what: 'an agent asked for it this session' }))
+  const asked = askedTags.filter(tag => !ASKPASS_TAGS.some(c => c.tag === tag)).map(tag => ({ tag, what: 'requested by the agent' }))
   return [...ASKPASS_TAGS, ...asked]
 }
 
@@ -742,8 +807,8 @@ async function onAsk($: EngineInterface, ask: Asked) {
     // Refused, the asking program fails at once; one already gone needs no answer.
     const reply = await callRelay($, 'POST', '/answer', { id: ask.id, cancel: true })
     if (reply === null) return
-    if (reply.status !== 204 && reply.status !== 410) say($, `Not refused: the relay answered ${reply.status}.`, true)
-    else say($, `Refused ${ask.entry?.name ?? ask.prompt} to ${source}: ${refusedWhy(ask.entry?.access === 'refused')}.`, false)
+    if (reply.status !== 204 && reply.status !== 410) say($, `Not denied: the relay answered ${reply.status}.`, true)
+    else say($, `Denied ${ask.entry?.name ?? ask.prompt} to ${source}: ${refusedWhy(ask.entry?.access === 'refused')}.`, false)
     return
   }
   const request: Request = {
@@ -763,22 +828,22 @@ async function onAsk($: EngineInterface, ask: Asked) {
 
 /** Why a request was refused: the session refuses its entry, else it is, or may be, a subagent's. */
 function refusedWhy(bySession: boolean): string {
-  return bySession ? 'this session refuses it (Vault tab)' : 'subagents and teammates get nothing'
+  return bySession ? 'set to Deny for this session (Vault tab)' : 'subagents and teammates get no secrets'
 }
 
 async function onSign($: EngineInterface, sign: Sign) {
   const calls = callsBy(sign)
   const decision = signDecision(sign, calls)
-  const key = sign.forwarded ? "your own ssh-agent's key" : sign.name
+  const key = sign.forwarded ? "your SSH agent's key" : sign.name
   const source = requestSource(sign, calls.map(r => r.command))
   // A decision that fails leaves the program waiting: it gets the card instead.
   if (decision !== 'ask' && (await decideRequest($, sign.id, decision))) {
-    if (decision === 'refuse') say($, `Refused ${key} to ${source}: ${refusedWhy(!sign.forwarded && sign.access === 'refused')}.`, false)
+    if (decision === 'refuse') say($, `Denied ${key} to ${source}: ${refusedWhy(!sign.forwarded && sign.access === 'refused')}.`, false)
     return
   }
   const prompt = sign.forwarded ? key : `${sign.name} · ${sign.tag}`
   await addRequest($, { id: sign.id, kind: 'sign', prompt, source, since: clockTime(), pick: null, tag: null })
-  await $.ui.notify(sign.forwarded ? `Key wanted: ${key}` : `Vault key wanted: ${key}`, { title: 'secrets' })
+  await $.ui.notify(sign.forwarded ? `Key requested: ${key}` : `Vault key requested: ${key}`, { title: 'secrets' })
 }
 
 /** Takes in what the vault shows: entries and suggestions, never a value. */
@@ -874,6 +939,7 @@ async function turnTo($: EngineInterface, tab: Tab) {
 
 async function onVaultMessage($: EngineInterface, message: VaultMessage) {
   vaultFocused = message.focused
+  vaultCaret = message.caret
   vaultFormOpen = message.formOpen
   configTextFocused = false
   for (const edit of message.edits) {
@@ -888,10 +954,7 @@ async function onVaultMessage($: EngineInterface, message: VaultMessage) {
     else if (edit.kind === 'clear') {
       emptyFields(edit.field)
       vaultError = null
-    } else {
-      const text = fields[edit.field]
-      fields = { ...fields, [edit.field]: edit.kind === 'append' ? text + edit.text : [...text].slice(0, -1).join('') }
-    }
+    } else fields = { ...fields, [edit.field]: editText(fields[edit.field], edit) }
   }
 }
 
@@ -906,7 +969,7 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
   const carriesSecret =
     action.kind === 'open' || action.kind === 'rekey' || (action.kind === 'save' && action.form.suggestion === null && fields.value !== '')
   if (carriesSecret && collisions.length > 0) {
-    vaultError = `Off while ${collisions.map(c => c.name).join(', ')} could read it.`
+    vaultError = `Off while ${collisions.map(c => c.name).join(', ')} can read it.`
     return
   }
   if (action.kind === 'open') await openVault($)
@@ -916,6 +979,7 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
     if (reply !== null) vaultError = reply.status === 204 ? null : reply.text || `The daemon answered ${reply.status}.`
   }
   else if (action.kind === 'access') await changeVault($, { op: 'access', id: action.id, access: action.access })
+  else if (action.kind === 'move') await changeVault($, { op: 'move', id: action.id, to: action.to })
   else if (action.kind === 'forward') await changeVault($, { op: 'forward', on: action.on })
   else if (action.kind === 'delete') {
     if (await changeVault($, { op: 'delete', id: action.id })) closeForm()
@@ -923,10 +987,10 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
     if (await changeVault($, { op: 'dismiss', id: action.id })) closeForm()
   } else {
     const { id, suggestion, name, tag, kind } = action.form
-    if (name.trim() === '') vaultError = 'Name it.'
+    if (name.trim() === '') vaultError = 'Enter a name.'
     else if (suggestion !== null) {
       if (await changeVault($, { op: 'save', id: suggestion, name, tag, kind })) closeForm()
-    } else if (id === null && fields.value === '') vaultError = 'A new entry needs a value.'
+    } else if (id === null && fields.value === '') vaultError = 'Enter a value.'
     else {
       const value = fields.value
       const change =
@@ -959,11 +1023,11 @@ async function decideCollision($: EngineInterface, name: string, decision: 'allo
 async function openVault($: EngineInterface) {
   const create = vault.state === 'absent'
   if (fields.passphrase === '') {
-    vaultError = 'Type the passphrase.'
+    vaultError = 'Enter the passphrase.'
     return
   }
   if (create && fields.passphrase !== fields.again) {
-    vaultError = 'The two differ.'
+    vaultError = "The passphrases don't match."
     emptyFields('again')
     return
   }
@@ -976,11 +1040,11 @@ async function openVault($: EngineInterface) {
 /** Seals the open vault under the new passphrase typed twice; the fields empty either way, the form closes once done. */
 async function rekeyVault($: EngineInterface) {
   if (fields.passphrase === '') {
-    vaultError = 'Type the new passphrase.'
+    vaultError = 'Enter the new passphrase.'
     return
   }
   if (fields.passphrase !== fields.again) {
-    vaultError = 'The two differ.'
+    vaultError = "The passphrases don't match."
     emptyFields('again')
     return
   }
@@ -1010,17 +1074,16 @@ async function relayChange($: EngineInterface, change: object): Promise<string |
 
 async function onConfigMessage($: EngineInterface, message: ConfigMessage) {
   configTextFocused = message.textFocused
+  configCaret = message.caret
   vaultFocused = null
   for (const edit of message.edits) {
     if (edit.seq <= (configConfirmed[message.instance] ?? 0)) continue
     configConfirmed = { ...configConfirmed, [message.instance]: edit.seq }
-    if (edit.kind === 'append') configDraft += edit.text
-    else if (edit.kind === 'back') configDraft = [...configDraft].slice(0, -1).join('')
-    else if (edit.kind === 'clear') configDraft = ''
-    else if (edit.kind === 'tab') {
+    if (edit.kind === 'tab') {
       configTextFocused = false
       await turnTo($, edit.tab)
     } else if (edit.kind === 'action') await onConfigAction($, edit.action)
+    else configDraft = editText(configDraft, edit)
   }
 }
 
@@ -1060,7 +1123,7 @@ async function applyAutoMode($: EngineInterface) {
     const before = (await $.fs.exists(path)) ? await $.fs.read(path) : '{}'
     await $.fs.write(path, withText(before, configDraft))
   } catch (error) {
-    configError = `Not applied: ${(error as Error).message}`
+    configError = `Not saved: ${(error as Error).message}`
     return
   }
   await readAutoMode($)

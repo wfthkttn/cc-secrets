@@ -3,15 +3,19 @@ import type { ClientKeyEvent, ClientModule } from 'claude-code'
 import {
   buttonRows,
   type ButtonSpec,
+  caretAfter,
+  caretText,
   checkbox,
   drawLine,
   dropdown,
-  field,
-  fieldRoom,
+  dropdownRoom,
+  editText,
+  END_CARET,
   fit,
   FOCUSED,
   heading,
   hitAt,
+  lengthAfter,
   type Line,
   listHeight,
   listRows as optionRows,
@@ -21,11 +25,27 @@ import {
   radios,
   seg,
   showButton,
+  type TextEdit,
+  textField,
+  textKey,
   textLine,
 } from './controls'
-import { cells, clip, displayed, pad } from './display'
+import { clip, displayed, pad } from './display'
 import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
-import type { Access, Collision, EntryKind, Form, SecretField, TagChoice, ValueEdit, VaultAction, VaultMessage, VaultProps } from './vault-view-props'
+import type {
+  Access,
+  Collision,
+  EntryKind,
+  Form,
+  SecretField,
+  TagChoice,
+  TextField,
+  ValueEdit,
+  VaultAction,
+  VaultMessage,
+  VaultProps,
+  ViewEntry,
+} from './vault-view-props'
 
 /** A Lock or a Delete waiting for the person to confirm it. */
 type Confirming = { kind: 'lock' } | { kind: 'delete'; id: string; name: string }
@@ -48,6 +68,12 @@ export type ViewState = {
   isClosed: boolean
   /** The form's tag as typed, kept while the tag field shows one of the offered tags. */
   ownTag: string
+  /** Where typing goes in the focused Name or Tag: a character index, past the end counting as the end. */
+  caret: number
+  /** The last of the hooks' pastes (`VaultProps.pastes`) this view took in. */
+  pasted: number
+  /** A list row held by the pointer: its entry, and the place in the list it goes to when let go. */
+  drag: { id: string; to: number } | null
   formEpoch: number
 }
 
@@ -63,20 +89,20 @@ const DOOR_LABEL_COLUMNS = 13
 const TAG_COLUMNS = 8
 const KIND_COLUMNS = 8
 const ACCESS_WIDTH = 13
-const DOOR_LABELS: Record<'passphrase' | 'again', string> = { passphrase: 'Passphrase', again: 'Again' }
+const DOOR_LABELS: Record<'passphrase' | 'again', string> = { passphrase: 'Passphrase', again: 'Repeat' }
 const KIND_NAMES: Record<EntryKind, string> = { password: 'Password', token: 'Token', 'ssh-key': 'SSH key' }
 const KINDS: readonly EntryKind[] = ['password', 'token', 'ssh-key']
 const ACCESSES: readonly Access[] = ['ask', 'allowed', 'refused']
 const ACCESS_OPTIONS: readonly Option[] = [
-  { label: 'Ask', what: 'a card each time it is asked for' },
-  { label: 'Allowed', what: 'given with no card' },
-  { label: 'Refused', what: 'never given' },
+  { label: 'Ask', what: 'confirm each use' },
+  { label: 'Allow', what: 'use without asking' },
+  { label: 'Deny', what: 'never hand it out' },
 ]
-const OWN_TAG: Option = { label: 'Your own tag…', what: 'type it in the field' }
-const NO_TAG = 'none: one is made up'
-const FORWARD_LABEL = "Use my own ssh-agent's keys in this session (no card)"
+const OWN_TAG: Option = { label: 'Custom tag…', what: 'type it in the field' }
+const NO_TAG = 'none (one is generated)'
+const FORWARD_LABEL = 'Forward my SSH agent to this session'
 const NEW_FORM: Form = { id: null, suggestion: null, name: '', tag: '', kind: 'password' }
-const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
+const REORDER_HINT = '   Drag a row or press Shift+↑/↓ to reorder'
 
 export function initialState(formEpoch: number, instance: string, isClosed = false): ViewState {
   return {
@@ -91,6 +117,9 @@ export function initialState(formEpoch: number, instance: string, isClosed = fal
     cursor: 0,
     isClosed,
     ownTag: '',
+    caret: END_CARET,
+    pasted: 0,
+    drag: null,
     formEpoch,
   }
 }
@@ -118,38 +147,44 @@ function tagList(options: readonly TagChoice[]): Option[] {
   return [...options.map(o => ({ label: o.tag, what: o.what })), OWN_TAG]
 }
 
+/** The list with the entry `id` taken out and put back at place `to`, as the daemon's move does. */
+function movedTo(entries: readonly ViewEntry[], id: string, to: number): ViewEntry[] {
+  const entry = entries.find(e => e.id === id)
+  if (entry === undefined) return [...entries]
+  const rest = entries.filter(e => e.id !== id)
+  rest.splice(Math.min(to, rest.length), 0, entry)
+  return rest
+}
+
+/** The entries in the order the list shows: this instance's unconfirmed moves applied, then a dragged row at its place. */
+export function shownEntries(entries: readonly ViewEntry[], state: Pick<ViewState, 'pending' | 'drag'>): ViewEntry[] {
+  let order = [...entries]
+  for (const edit of state.pending) if (edit.kind === 'action' && edit.action.kind === 'move') order = movedTo(order, edit.action.id, edit.action.to)
+  return state.drag === null ? order : movedTo(order, state.drag.id, state.drag.to)
+}
+
+/** This instance's unconfirmed edits of the held field `field`. */
+function editsOf(field: SecretField, pending: ValueEdit[]): TextEdit[] {
+  return pending.flatMap(edit => ('field' in edit && edit.field === field && edit.kind !== 'peek' ? [edit] : []))
+}
+
 export function shownLength(length: number, field: SecretField, pending: ValueEdit[]): number {
-  for (const edit of pending) {
-    if (!('field' in edit) || edit.field !== field) continue
-    if (edit.kind === 'append') length += [...edit.text].length
-    else if (edit.kind === 'back') length = Math.max(0, length - 1)
-    else if (edit.kind === 'clear') length = 0
-  }
-  return length
+  return editsOf(field, pending).reduce(lengthAfter, length)
 }
 
 /** A peeked field's text as shown: what the hooks hold, with this instance's unconfirmed edits on top. */
 export function shownText(text: string, field: SecretField, pending: ValueEdit[]): string {
-  for (const edit of pending) {
-    if (!('field' in edit) || edit.field !== field) continue
-    if (edit.kind === 'append') text += edit.text
-    else if (edit.kind === 'back') text = [...text].slice(0, -1).join('')
-    else if (edit.kind === 'clear') text = ''
-  }
-  return text
+  return editsOf(field, pending).reduce(editText, text)
 }
 
-/** A held field: dots, or its text while peeked, with its Show button; the end of a long value stays in view. */
+/** A held field: dots, or its text while peeked, with the caret while focused and its Show button. */
 function heldField(props: VaultProps, state: ViewState, name: SecretField, width: number, empty: string): Line {
-  const focused = state.focus === name
   const length = shownLength(props.lengths[name], name, state.pending)
   const peeked = props.peeked[name]
   const show = showButton(peeked !== undefined, 'show:' + name)
   const tail = state.focus === 'show:' + name ? { ...show, look: { ...show.look, ...FOCUSED, inverse: true } } : show
-  const room = fieldRoom(width, tail) - (focused ? 1 : 0)
-  const text = peeked === undefined ? '•'.repeat(length) : displayed(shownText(peeked, name, state.pending))
-  const fitted = cells(text) <= room ? text : '…' + [...text].slice(-(room - 1)).join('')
-  return field((length > 0 ? fitted : empty) + (focused ? '▏' : ''), width, name, focused, { dim: length === 0, tail })
+  const text = peeked === undefined ? '•'.repeat(length) : shownText(peeked, name, state.pending)
+  return textField(text, state.caret, width, name, state.focus === name, { placeholder: empty, tail })
 }
 
 function labelled(label: string, columns: number, control: Line, focused: boolean): Line {
@@ -163,12 +198,13 @@ function errorLines(error: string | null): Line[] {
 function collisionPage(collisions: readonly Collision[]): Drawn {
   const lines: Line[] = []
   for (const c of collisions) {
-    lines.push(textLine(` ⚠ ${displayed(c.name)} hooks ${c.carriers.join(', ')}`, { color: 'error' }))
-    lines.push(textLine(c.refused ? '   Refused from the next start; off until then.' : '   It could read secrets sent there: vault and typing off.', { dimColor: true }))
+    lines.push(textLine(` ⚠ ${displayed(c.name)} sees secrets in ${c.carriers.join(', ')}`, { color: 'error' }))
+    const notes = c.refused ? ['Blocked from the next session start.', 'The vault and typing stay off until then.'] : ['The vault and typing are off until you decide.']
+    lines.push(...notes.map(note => textLine('   ' + note, { dimColor: true })))
     if (!c.refused) {
       const buttons: ButtonSpec[] = [
         { hit: 'allow:' + c.name, label: 'Allow' },
-        { hit: 'refuse:' + c.name, label: 'Refuse', tone: 'danger' },
+        { hit: 'refuse:' + c.name, label: 'Block', tone: 'danger' },
       ]
       lines.push(...buttonRows(buttons, null, 3))
     }
@@ -191,13 +227,13 @@ function doorPage(props: VaultProps, state: ViewState, title: string, doors: rea
 
 function closedPage(props: VaultProps, state: ViewState): Drawn {
   const isNew = props.state === 'absent'
-  return doorPage(props, state, isNew ? 'No vault yet' : 'Vault locked', isNew ? ['passphrase', 'again'] : ['passphrase'], [
+  return doorPage(props, state, isNew ? 'Create a vault' : 'Vault locked', isNew ? ['passphrase', 'again'] : ['passphrase'], [
     { hit: 'open', label: isNew ? 'Create' : 'Unlock' },
   ])
 }
 
 function rekeyPage(props: VaultProps, state: ViewState): Drawn {
-  return doorPage(props, state, 'New passphrase', ['passphrase', 'again'], [
+  return doorPage(props, state, 'Change passphrase', ['passphrase', 'again'], [
     { hit: 'change', label: 'Change' },
     { hit: 'cancel', label: 'Cancel' },
   ])
@@ -206,8 +242,8 @@ function rekeyPage(props: VaultProps, state: ViewState): Drawn {
 function confirmPage(state: ViewState, confirming: Confirming): Drawn {
   const [question, note, verb] =
     confirming.kind === 'lock'
-      ? ['Lock the vault for every session?', 'Every session loses its entries until the vault is unlocked again.', 'Lock']
-      : [`Delete ${displayed(confirming.name)}?`, "It goes from the vault for every session; this can't be undone.", 'Delete']
+      ? ['Lock the vault?', 'Every session loses access until it is unlocked.', 'Lock']
+      : [`Delete ${displayed(confirming.name)}?`, "It is removed for all sessions. This can't be undone.", 'Delete']
   const buttons: ButtonSpec[] = [
     { hit: 'confirm', label: verb, tone: 'danger' },
     { hit: 'cancel', label: 'Cancel' },
@@ -218,32 +254,36 @@ function confirmPage(state: ViewState, confirming: Confirming): Drawn {
 function formPage(props: VaultProps, state: ViewState, form: Form): Drawn {
   const width = props.columns - LABEL_COLUMNS - 1
   const at = (hit: string) => state.focus === hit
-  const title = form.suggestion !== null ? 'Keep a typed value' : form.id === null ? 'New entry' : 'Entry'
+  const title = form.suggestion !== null ? 'Save typed value' : form.id === null ? 'New entry' : 'Edit entry'
   const lines: Line[] = [heading(title)]
-  lines.push(labelled('Name', LABEL_COLUMNS, field(displayed(form.name) + (at('name') ? '▏' : ''), width, 'name', at('name')), at('name')))
+  lines.push(labelled('Name', LABEL_COLUMNS, textField(form.name, state.caret, width, 'name', at('name')), at('name')))
 
   const options = tagOptions(props, form)
   const choice = options.find(o => o.tag === form.tag)
-  const cursor = at('tag') && choice === undefined ? '▏' : ''
-  const tagText = choice !== undefined ? `${choice.tag} · ${choice.what}` : form.tag !== '' ? displayed(form.tag) + cursor : cursor + NO_TAG
-  const isBare = choice === undefined && form.tag === ''
-  const tag = options.length === 0 ? field(tagText, width, 'tag', at('tag'), { dim: isBare }) : dropdown(tagText, width, 'tag', at('tag'), { dim: isBare })
+  let tag: Line
+  if (options.length === 0) tag = textField(form.tag, state.caret, width, 'tag', at('tag'), { placeholder: NO_TAG })
+  else {
+    // A click on a dropdown's text opens its list, so its text takes no click for the caret.
+    const typed = at('tag') ? caretText(form.tag, state.caret, dropdownRoom(width)) : displayed(form.tag)
+    const tagText = choice !== undefined ? `${choice.tag} · ${choice.what}` : form.tag === '' ? (at('tag') ? typed : '') + NO_TAG : typed
+    tag = dropdown(tagText, width, 'tag', at('tag'), { dim: choice === undefined && form.tag === '' })
+  }
   lines.push(labelled('Tag', LABEL_COLUMNS, tag, at('tag')))
   if (state.open === 'tag') lines.push(...optionRows(tagList(options), state.cursor, LABEL_COLUMNS, width, 'pick'))
 
   // A suggestion is a typed value: it can't become an ssh key.
   const kinds = form.suggestion === null ? KINDS : KINDS.filter(k => k !== 'ssh-key')
   const kind = radios(kinds.map(k => ({ value: k, label: KIND_NAMES[k] })), form.kind, 'kind', at('kind'))
-  lines.push(labelled('Kind', LABEL_COLUMNS, kind, at('kind')))
+  lines.push(labelled('Type', LABEL_COLUMNS, kind, at('kind')))
 
   const valueLabel = form.kind === 'ssh-key' ? 'File' : 'Value'
-  if (form.suggestion !== null) lines.push(labelled(valueLabel, LABEL_COLUMNS, textLine('typed this session', { dimColor: true }), false))
-  else lines.push(labelled(valueLabel, LABEL_COLUMNS, heldField(props, state, 'value', width, form.id === null ? '' : 'unchanged'), at('value') || at('show:value')))
+  if (form.suggestion !== null) lines.push(labelled(valueLabel, LABEL_COLUMNS, textLine('the value you typed', { dimColor: true }), false))
+  else lines.push(labelled(valueLabel, LABEL_COLUMNS, heldField(props, state, 'value', width, form.id === null ? '' : 'leave empty to keep'), at('value') || at('show:value')))
 
   const buttons: ButtonSpec[] = [
     { hit: 'save', label: 'Save' },
     ...(form.id !== null ? [{ hit: 'delete', label: 'Delete', tone: 'danger' } as const] : []),
-    ...(form.suggestion !== null ? [{ hit: 'dismiss', label: 'Dismiss', tone: 'danger' } as const] : []),
+    ...(form.suggestion !== null ? [{ hit: 'dismiss', label: 'Discard', tone: 'danger' } as const] : []),
     { hit: 'cancel', label: 'Cancel' },
   ]
   lines.push([], ...buttonRows(buttons, state.focus), ...errorLines(props.error))
@@ -264,17 +304,19 @@ function listPage(props: VaultProps, state: ViewState): Drawn {
   const columnsOf = (name: string, tag: string, kind: string) =>
     ' ' + pad(clip(name, nameColumns), nameColumns) + ' ' + pad(clip(tag, TAG_COLUMNS), TAG_COLUMNS) + ' ' + pad(kind, KIND_COLUMNS) + ' '
   if (props.entries.length === 0) lines.push(textLine('   No entries yet.', { dimColor: true }))
-  else lines.push(textLine(columnsOf('Name', 'Tag', 'Kind') + 'This session', { dimColor: true }))
-  for (const e of props.entries) {
+  else lines.push(textLine(columnsOf('Name', 'Tag', 'Type') + 'Access', { dimColor: true }))
+  for (const e of shownEntries(props.entries, state)) {
     const row = 'row:' + e.id
     const access = 'access:' + e.id
     const look: Look | undefined = e.access === 'allowed' ? { color: 'success' } : e.access === 'refused' ? { color: 'error' } : undefined
     const text = columnsOf(displayed(e.name), displayed(e.tag), KIND_NAMES[e.kind])
-    lines.push([seg(text, state.focus === row ? FOCUSED : undefined, row), ...dropdown(accessLabel(e.access), ACCESS_WIDTH, access, state.focus === access, look === undefined ? {} : { look })])
+    const rowLook = state.drag?.id === e.id ? { ...FOCUSED, inverse: true } : state.focus === row ? FOCUSED : undefined
+    lines.push([seg(text, rowLook, row), ...dropdown(accessLabel(e.access), ACCESS_WIDTH, access, state.focus === access, look === undefined ? {} : { look })])
     if (state.open === access) lines.push(...optionRows(ACCESS_OPTIONS, state.cursor, 1, columns - 2, 'pick'))
     groups.push([row, access])
   }
-  if (props.suggestions.length > 0) lines.push([], heading('Typed this session, not kept'))
+  if (props.entries.length > 1) lines.push(textLine(REORDER_HINT, { dimColor: true }))
+  if (props.suggestions.length > 0) lines.push([], heading('Unsaved values'))
   for (const s of props.suggestions) {
     const hit = 'sugg:' + s.id
     lines.push([seg('   ' + displayed(s.prompt), state.focus === hit ? FOCUSED : undefined, hit)])
@@ -343,17 +385,61 @@ function focusedOf(state: ViewState): SecretField | null {
   return name === 'value' || name === 'passphrase' || name === 'again' ? name : null
 }
 
-function postOf(state: ViewState, edits = state.pending): VaultMessage {
-  return { instance: state.instance, edits, focused: focusedOf(state), formOpen: state.form !== null }
+/** The text field a paste goes to: a held one, or the form's Name or Tag. */
+function pasteFieldOf(state: ViewState): SecretField | TextField | null {
+  const isForm = state.form !== null && !state.rekeying && state.confirming === null && !state.isClosed
+  if (isForm && (state.focus === 'name' || state.focus === 'tag')) return state.focus
+  return focusedOf(state)
 }
 
-/** Moves the keyboard; the hooks learn which held field a paste now goes to. */
+function postOf(state: ViewState, edits = state.pending): VaultMessage {
+  return { instance: state.instance, edits, focused: pasteFieldOf(state), caret: state.caret, formOpen: state.form !== null }
+}
+
+/** Moves the keyboard; the hooks learn which text field a paste now goes to. */
 function moved(state: ViewState): Result {
   return { state, post: postOf(state) }
 }
 
+/** The keyboard goes to `focus`; in a text field, the caret to its end. */
 function focusOn(state: ViewState, focus: string): Result {
-  return moved({ ...state, focus, open: null })
+  return moved({ ...state, focus, open: null, caret: END_CARET })
+}
+
+/** The text Name or Tag holds for editing: the tag's own, none while it shows an offered tag. */
+function textOf(options: readonly TagChoice[], form: Form, name: TextField): string {
+  if (name === 'name') return form.name
+  return options.some(o => o.tag === form.tag) ? '' : form.tag
+}
+
+/** Name or Tag holding `text`; on the tag, the person's own. */
+function withText(state: ViewState, form: Form, name: TextField, text: string, caret: number): ViewState {
+  if (name === 'name') return { ...state, form: { ...form, name: text }, caret }
+  return { ...state, form: { ...form, tag: text }, ownTag: text, caret }
+}
+
+/**
+ * Takes in the hooks' pastes this instance hasn't. Name's or Tag's goes in at the caret while the field has the
+ * keyboard, else at its end; past a held field's, which the hooks made at this view's caret, the caret moves.
+ */
+export function withPastes(state: ViewState, props: Pick<VaultProps, 'pastes' | 'tagChoices' | 'entries'>): ViewState {
+  let next = state
+  for (const paste of props.pastes) {
+    if (paste.seq <= next.pasted) continue
+    next = { ...next, pasted: paste.seq }
+    if ('at' in paste) {
+      if (next.focus === paste.field) next = { ...next, caret: paste.at + paste.length }
+      continue
+    }
+    const form = next.form
+    // A paste for a form closed since has nowhere to go.
+    if (form === null) continue
+    const text = textOf(tagOptions(props, form), form, paste.field)
+    const isFocused = next.focus === paste.field
+    const edit = { kind: 'insert' as const, at: Math.min(isFocused ? next.caret : END_CARET, [...text].length), text: paste.text }
+    next = withText(next, form, paste.field, editText(text, edit), isFocused ? caretAfter(edit) : next.caret)
+  }
+  return next
 }
 
 type EditBody = ValueEdit extends infer E ? (E extends ValueEdit ? Omit<E, 'seq'> : never) : never
@@ -391,7 +477,7 @@ function stopRekey(state: ViewState): Result {
 /** Opens the form; the hooks drop any value left from an earlier form. */
 function openForm(state: ViewState, form: Form, choices: readonly TagChoice[]): Result {
   const ownTag = choices.some(c => c.tag === form.tag) ? '' : form.tag
-  return withEdit({ ...state, form, focus: 'name', open: null, ownTag }, { field: 'value', kind: 'clear' })
+  return withEdit({ ...state, form, focus: 'name', open: null, ownTag, caret: END_CARET }, { field: 'value', kind: 'clear' })
 }
 
 function closeForm(state: ViewState, form: Form): Result {
@@ -418,7 +504,7 @@ function choose(state: ViewState, props: VaultProps, index: number): Result {
   const shut = { ...state, open: null }
   if (state.open === 'tag' && state.form !== null) {
     const picked = tagOptions(props, state.form)[index]
-    return moved({ ...shut, form: { ...state.form, tag: picked?.tag ?? state.ownTag } })
+    return moved({ ...shut, form: { ...state.form, tag: picked?.tag ?? state.ownTag }, caret: END_CARET })
   }
   if (state.open?.startsWith('access:')) {
     const access = ACCESSES[index]
@@ -437,6 +523,8 @@ function onHit(state: ViewState, props: VaultProps, hit: string | null): Result 
     if (hit.startsWith('refuse:')) return act(state, { kind: 'collision', name: hit.slice('refuse:'.length), decision: 'refuse' })
     return { state }
   }
+  const place = /^(name|tag|value|passphrase|again)@(\d+)$/.exec(hit)
+  if (place !== null) return moved({ ...state, focus: place[1]!, open: null, caret: Number(place[2]) })
   if (hit === 'passphrase' || hit === 'again' || hit === 'name' || hit === 'value') return focusOn(state, hit)
   if (hit === 'show:passphrase' || hit === 'show:again' || hit === 'show:value') return peek(state, hit.slice('show:'.length) as SecretField)
   if (page === 'closed') return hit === 'open' ? act(state, { kind: 'open' }) : moved(state)
@@ -480,29 +568,6 @@ function onHit(state: ViewState, props: VaultProps, hit: string | null): Result 
   return moved(state)
 }
 
-function typedText(k: ClientKeyEvent): string | null {
-  if (k.ctrl || k.meta) return null
-  if (k.key === 'space') return ' '
-  if (SPECIAL_KEYS.has(k.key) || /[\x00-\x1f\x7f]/.test(k.key)) return null
-  return k.key
-}
-
-/** A key on a text the view holds: the text after it, or null for a key that edits nothing. */
-function textAfter(text: string, k: ClientKeyEvent): string | null {
-  if (k.key === 'backspace' || k.key === 'delete') return [...text].slice(0, -1).join('')
-  if (k.ctrl && k.key === 'u') return ''
-  const typed = typedText(k)
-  return typed === null ? null : text + typed
-}
-
-/** A key on a held field: an edit the hooks apply; null for a key that edits nothing. */
-function heldEdit(name: SecretField, k: ClientKeyEvent): EditBody | null {
-  if (k.key === 'backspace' || k.key === 'delete') return { field: name, kind: 'back' }
-  if (k.ctrl && k.key === 'u') return { field: name, kind: 'clear' }
-  const text = typedText(k)
-  return text === null ? null : { field: name, kind: 'append', text }
-}
-
 export function onKey(state: ViewState, props: VaultProps, k: ClientKeyEvent): Result {
   const page = pageOf(props, state)
   if (page === 'collision') return { state }
@@ -520,30 +585,40 @@ export function onKey(state: ViewState, props: VaultProps, k: ClientKeyEvent): R
     const at = kinds.indexOf(form.kind)
     return setKind(state, form, kinds[(at + (k.key === 'left' ? -1 : 1) + kinds.length) % kinds.length]!)
   }
+  const f = state.focus
+  if (form !== null && page === 'form' && (f === 'name' || f === 'tag')) {
+    const options = tagOptions(props, form)
+    if (f === 'tag' && options.length > 0 && (isEnter || k.key === 'space')) return onHit(state, props, 'tag')
+    if (isEnter) return act(state, { kind: 'save', form })
+    // Typing on the tag writes the person's own, in place of an offered one, which Backspace or Delete takes out.
+    const before = textOf(options, form, f)
+    const isOffered = f === 'tag' && before === '' && form.tag !== ''
+    if (isOffered && (k.key === 'backspace' || k.key === 'delete')) return { state: withText(state, form, f, '', 0) }
+    const change = textKey(k, state.caret, [...before].length)
+    if (change?.kind === 'move') return { state: { ...state, caret: change.caret } }
+    if (change !== null) return { state: withText(state, form, f, editText(before, change), caretAfter(change)) }
+  }
+  const held = focusedOf(state)
+  if (k.ctrl && k.key === 'r' && held !== null) return peek(state, held)
+  if (held !== null && f === held) {
+    if (isEnter) return page === 'form' ? act(state, { kind: 'save', form: form! }) : act(state, { kind: page === 'rekey' ? 'rekey' : 'open' })
+    const change = textKey(k, state.caret, shownLength(props.lengths[held], held, state.pending))
+    if (change?.kind === 'move') return { state: { ...state, caret: change.caret } }
+    if (change !== null) return withEdit({ ...state, caret: caretAfter(change) }, { field: held, ...change })
+  }
+  if (page === 'list' && k.shift === true && (k.key === 'up' || k.key === 'down') && f.startsWith('row:')) {
+    const id = f.slice('row:'.length)
+    const order = shownEntries(props.entries, state)
+    const from = order.findIndex(e => e.id === id)
+    const to = from + (k.key === 'up' ? -1 : 1)
+    return from < 0 || to < 0 || to >= order.length ? { state } : act(state, { kind: 'move', id, to })
+  }
   const { groups } = drawPage(props, state)
   const to = moveFocus(groups, state.focus, k.key, k.shift === true)
   if (to !== null) return focusOn(state, to)
   // A control no longer drawn (its entry went) takes no key but the moves above.
   if (!groups.some(g => g.includes(state.focus))) return { state }
-  const held = focusedOf(state)
-  if (k.ctrl && k.key === 'r' && held !== null) return peek(state, held)
-  const f = state.focus
-  if (held !== null && f === held) {
-    if (isEnter) return page === 'form' ? act(state, { kind: 'save', form: form! }) : act(state, { kind: page === 'rekey' ? 'rekey' : 'open' })
-    const edit = heldEdit(held, k)
-    return edit === null ? { state } : withEdit(state, edit)
-  }
-  if (form !== null && page === 'form' && (f === 'name' || f === 'kind' || f === 'tag')) {
-    const options = tagOptions(props, form)
-    if (f === 'tag' && options.length > 0 && (isEnter || k.key === 'space')) return onHit(state, props, 'tag')
-    if (isEnter) return act(state, { kind: 'save', form })
-    if (f === 'kind') return { state }
-    // Typing on the tag writes the person's own, in place of an offered one.
-    const before = f === 'name' ? form.name : options.some(o => o.tag === form.tag) ? '' : form.tag
-    const after = textAfter(before, k)
-    if (after === null) return { state }
-    return f === 'name' ? { state: { ...state, form: { ...form, name: after } } } : { state: { ...state, form: { ...form, tag: after }, ownTag: after } }
-  }
+  if (form !== null && page === 'form' && f === 'kind') return isEnter ? act(state, { kind: 'save', form }) : { state }
   return isEnter || k.key === 'space' ? onHit(state, props, f) : { state }
 }
 
@@ -562,9 +637,45 @@ export function onClick(state: ViewState, props: VaultProps, y: number, x: numbe
   return onHit(state, props, hit)
 }
 
-/** The state a new instance starts from: the last one posted, else a fresh one. */
+/** The pointer went down: on a list row it holds the row, which a release opens or a drag moves; elsewhere a click. */
+export function onPress(state: ViewState, props: VaultProps, y: number, x: number): Result {
+  if (y >= TAB_ROWS && state.open === null && pageOf(props, state) === 'list') {
+    const hit = hitAt(shownPage(props, state).lines[y - TAB_ROWS], x)
+    if (hit?.startsWith('row:')) {
+      const id = hit.slice('row:'.length)
+      return moved({ ...state, focus: hit, drag: { id, to: shownEntries(props.entries, state).findIndex(e => e.id === id) } })
+    }
+  }
+  return onClick(state, props, y, x)
+}
+
+/** The pointer moved while a row is held: the row's place follows it; null when nothing changes. */
+export function onDrag(state: ViewState, props: VaultProps, y: number): Result | null {
+  if (state.drag === null) return null
+  const order = shownEntries(props.entries, state)
+  const lines = shownPage(props, state).lines
+  // The rows stand one a line, so the place under the pointer counts from any row on screen.
+  const line = lines.findIndex(l => l.some(s => s.hit?.startsWith('row:')))
+  if (line < 0) return null
+  const hit = lines[line]!.find(s => s.hit?.startsWith('row:'))!.hit!
+  const at = order.findIndex(e => 'row:' + e.id === hit)
+  const to = Math.max(0, Math.min(order.length - 1, at + y - TAB_ROWS - line))
+  return to === state.drag.to ? null : { state: { ...state, drag: { ...state.drag, to } } }
+}
+
+/** The pointer let go of a held row: back at its place it opens, elsewhere it moves there. */
+export function onRelease(state: ViewState, props: VaultProps): Result | null {
+  if (state.drag === null) return null
+  const { id, to } = state.drag
+  const done = { ...state, drag: null }
+  const from = shownEntries(props.entries, done).findIndex(e => e.id === id)
+  if (from < 0) return moved(done)
+  return to === from ? onHit(done, props, 'row:' + id) : act(done, { kind: 'move', id, to })
+}
+
+/** The state a new instance starts from: the last one posted, else a fresh one; a row held then stays with the old instance, which gets its release. */
 export function startState(props: Pick<VaultProps, 'resume' | 'formEpoch' | 'state'>, instance: string): ViewState {
-  return props.resume === null ? initialState(props.formEpoch, instance, props.state !== 'open') : { ...props.resume, pending: [] }
+  return props.resume === null ? initialState(props.formEpoch, instance, props.state !== 'open') : { ...props.resume, pending: [], drag: null }
 }
 
 /** Every change posts, with the state the next instance resumes from. */
@@ -576,8 +687,10 @@ function sent(result: Result): VaultMessage {
 const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const { columns } = props
   surface.onPointer(p => {
-    if (p.type !== 'down') return
-    const result = onClick(surface.state as ViewState, props, p.y, p.x)
+    const current = surface.state as ViewState
+    const result =
+      p.type === 'down' ? onPress(current, props, p.y, p.x) : p.type === 'move' ? onDrag(current, props, p.y) : p.type === 'up' ? onRelease(current, props) : null
+    if (result === null) return
     surface.setState(result.state)
     surface.post(sent(result))
   })
@@ -592,7 +705,11 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   if (confirmed !== null) state = confirmed
   if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, rekeying: false, open: null, formEpoch: props.formEpoch }
   if (state.isClosed !== isClosed) state = { ...state, isClosed, focus: isClosed ? 'passphrase' : 'add', confirming: null, open: null }
-  if (state !== surface.state) surface.setState(state)
+  const pasted = withPastes(state, props)
+  if (state !== surface.state || pasted !== state) surface.setState(pasted)
+  // The hooks drop a paste once a post says it was taken in.
+  if (pasted !== state) surface.post(sent({ state: pasted }))
+  state = pasted
 
   const lines = shownPage(props, state).lines
   // Blank lines to the view's height, so nothing a longer page drew stays.

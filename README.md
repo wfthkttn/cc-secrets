@@ -14,12 +14,13 @@ Linux only, provided as is. See [Why Linux only](#why-linux-only).
   `GIT_ASKPASS`); any command can ask with `secrets ask --tag TAG "what it is for"`. Each request is a card in the
   🔐 drawer, or a pop-out while the drawer is closed, naming the command that asked.
 - **Vault.** An encrypted file of your passwords, tokens and ssh keys (Argon2id, 64 MiB, t=3; XChaCha20-Poly1305),
-  one for every session, unlocked once in the Vault tab. Each session decides per entry: **ask** (a card each time),
-  **allowed** (given with no card), **refused** (never given); the choice is kept per Claude Code session id, so a
+  one for every session, unlocked once in the Vault tab. Each session decides per entry: **Ask** (a card each time),
+  **Allow** (given with no card), **Deny** (never given); the choice is kept per Claude Code session id, so a
   resumed session keeps it. Subagents and teammates get nothing: their asks and signatures are refused, with no card.
+  Entries stay in the order you drag them into (or move with Shift+↑/↓).
 - **ssh-agent.** Each session's `SSH_AUTH_SOCK` is a vault agent: it signs with the vault's keys as the session
-  allows. Ticked for the session, it also offers your own agent's keys and signs with them as your agent would, with
-  no card, for anything but a subagent's or a teammate's command.
+  allows. With **Forward my SSH agent** ticked for the session, it also offers your own agent's keys and signs with
+  them as your agent would, with no card, for anything but a subagent's or a teammate's command.
 - **Masking.** Every Bash command runs under `secrets-mask-run` (as `CLAUDE_CODE_SHELL_PREFIX`): what the command
   prints is masked before Claude Code reads it, with the open vault's values and the value the command was handed.
   Other tool results are masked too. A tool call that carries a vault value is stopped before it runs, and a write of
@@ -28,8 +29,8 @@ Linux only, provided as is. See [Why Linux only](#why-linux-only).
   name; never a value) and tells the agent how to ask for one.
 - **Collisions.** A plugin loaded after this one whose hooks would see secrets in transit (tool calls, HTTP fetches,
   process spawns, environment changes) is shown in the Vault tab; until you allow it, typing and the vault are off.
-- **Config tab.** Unlock at session start, the shortest value masked (default 6 characters), and an
-  `autoMode.environment` line for the auto-mode classifier, applied to `~/.claude/settings.json` on your click.
+- **Settings tab.** Unlock at session start, the shortest value masked (default 6 characters), and an
+  `autoMode.environment` line for the auto-mode classifier, written to `~/.claude/settings.json` when you click Save.
 
 ## What the agent sees
 
@@ -59,8 +60,8 @@ curl -sS -w '\nHTTP %{http_code}\n' \
   http://localhost:8080/v1/whoami
 ```
 
-A card for the `deploy` entry pops out in the sidebar. **Once** hands the token to this call; **Session** also allows
-the entry for the rest of the session, so its next asks get it with no card. The API sends the token back in its
+A card for the `deploy` entry pops out in the sidebar. **Allow once** hands the token to this call; **Allow for
+session** also allows the entry for the rest of the session, so its next asks get it with no card. The API sends the token back in its
 reply; what reaches the agent is:
 
 ```

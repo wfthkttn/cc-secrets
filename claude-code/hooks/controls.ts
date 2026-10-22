@@ -1,6 +1,6 @@
-import type { ClientElements, RenderElement } from 'claude-code'
+import type { ClientElements, ClientKeyEvent, RenderElement } from 'claude-code'
 
-import { cells, clip, pad } from './display'
+import { cells, clip, displayed, pad } from './display'
 
 /**
  * The views' controls. A line is a list of segments, each with its text, its look and the control a click on it
@@ -141,9 +141,146 @@ export function fieldRoom(width: number, tail?: Seg): number {
   return Math.max(1, width - 4 - (tail === undefined ? 0 : cells(tail.text)))
 }
 
+/** A drawn piece of an edited text: a character, the caret, or a `…` for what is cut off; `index` is where a click puts the caret. */
+export type Piece = { text: string; index: number; isCaret?: true }
+
+const CARET = '▏'
+
+/** The text's characters, each as drawn, with the caret before character `caret` (none for null). */
+export function textPieces(text: string, caret: number | null): Piece[] {
+  const chars = [...text]
+  const pieces: Piece[] = chars.map((char, index) => ({ text: displayed(char), index }))
+  if (caret === null) return pieces
+  const at = Math.max(0, Math.min(chars.length, caret))
+  pieces.splice(at, 0, { text: CARET, index: at, isCaret: true })
+  return pieces
+}
+
+/**
+ * The text's characters with the caret before character `caret` (none for null), cut to `room` cells around the
+ * caret, else from the start: a `…` stands for each cut end.
+ */
+function caretPieces(text: string, caret: number | null, room: number): Piece[] {
+  const pieces = textPieces(text, caret)
+  const at = caret === null ? 0 : Math.max(0, Math.min([...text].length, caret))
+  const width = (from: number, to: number) => pieces.slice(from, to).reduce((sum, p) => sum + cells(p.text), 0)
+  if (width(0, pieces.length) <= room) return pieces
+  const cost = (start: number, end: number) => (start > 0 ? 1 : 0) + width(start, end) + (end < pieces.length ? 1 : 0)
+  let start = 0
+  while (start < at && cost(start, at + 1) > room) start++
+  let end = Math.min(at + 1, pieces.length)
+  while (end < pieces.length && cost(start, end + 1) <= room) end++
+  return [
+    ...(start > 0 ? [{ text: '…', index: pieces[start]!.index }] : []),
+    ...pieces.slice(start, end),
+    ...(end < pieces.length ? [{ text: '…', index: pieces[end]!.index }] : []),
+  ]
+}
+
+/** What a one-line text shows in `room` cells: with the caret before character `caret` and around it, or from the start for null. */
+export function caretText(text: string, caret: number | null, room: number): string {
+  return caretPieces(text, caret, room)
+    .map(p => p.text)
+    .join('')
+}
+
+/** Where a click at `column` of what `caretText` shows puts the caret: before the character there, past the text at its end. */
+export function caretAt(text: string, caret: number | null, room: number, column: number): number {
+  let start = 0
+  for (const piece of caretPieces(text, caret, room)) {
+    const end = start + cells(piece.text)
+    if (column >= start && column < end) return piece.index
+    start = end
+  }
+  return [...text].length
+}
+
+/**
+ * An edited one-line field, `width` cells: focused, it shows the caret before character `caret` and keeps it in view.
+ * A click on a character reaches `<hit>@<index>`, the caret's place before it, and past the text `<hit>@<length>`;
+ * the brackets reach `hit`, the tail (a Show button) its own. `placeholder` shows dim while the text is empty.
+ */
+export function textField(text: string, caret: number, width: number, hit: string, focused: boolean, opts: { placeholder?: string; tail?: Seg } = {}): Line {
+  const back = { backgroundColor: FIELD_BACKGROUND }
+  const frame: Look = focused ? { ...back, ...FOCUSED } : back
+  const look: Look = { ...back, ...(focused ? { bold: true } : {}) }
+  const tail = opts.tail === undefined ? [] : [{ ...opts.tail, look: { ...back, ...opts.tail.look } }]
+  const room = fieldRoom(width, tail[0])
+  const length = [...text].length
+  const pieces = caretPieces(text, focused ? caret : null, room)
+  const segs = pieces.map(p => seg(p.text, look, `${hit}@${p.index}`))
+  let used = pieces.reduce((sum, p) => sum + cells(p.text), 0)
+  if (length === 0 && opts.placeholder !== undefined && opts.placeholder !== '') {
+    const shown = clip(opts.placeholder, room - used)
+    segs.push(seg(shown, { ...look, dimColor: true }, `${hit}@0`))
+    used += cells(shown)
+  }
+  return [seg('[ ', frame, hit), ...segs, seg(' '.repeat(Math.max(0, room - used)), look, `${hit}@${length}`), ...tail, seg(' ]', frame, hit)]
+}
+
+/** A change to a text at a character index: `back` deletes the character before `at`, `del` the one at it. */
+export type TextEdit = { kind: 'insert'; at: number; text: string } | { kind: 'back' | 'del'; at: number } | { kind: 'clear' }
+
+/** A caret past any text: at its end, wherever that is when the caret is used. */
+export const END_CARET = Number.MAX_SAFE_INTEGER
+
+/** A paste the hooks made into a text they hold, at the view's caret: numbered, so the view moves its caret past it once. */
+export type PasteMark = { seq: number; at: number; length: number }
+
+/** Names a `Client` gets for special keys; any other `key` is typed text, a burst arriving whole. */
+const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
+
+/**
+ * What a key does to a text `length` characters long with its caret at `caret`: an edit, or a caret move (`move`,
+ * also for Backspace at the start and Delete at the end); null for a key that is neither.
+ */
+export function textKey(k: ClientKeyEvent, caret: number, length: number): TextEdit | { kind: 'move'; caret: number } | null {
+  const at = Math.max(0, Math.min(caret, length))
+  if (k.ctrl === true && k.key === 'u') return { kind: 'clear' }
+  if (k.ctrl === true || k.meta === true) return null
+  if (k.key === 'left') return { kind: 'move', caret: Math.max(0, at - 1) }
+  if (k.key === 'right') return { kind: 'move', caret: Math.min(length, at + 1) }
+  if (k.key === 'home') return { kind: 'move', caret: 0 }
+  if (k.key === 'end') return { kind: 'move', caret: length }
+  if (k.key === 'backspace') return at === 0 ? { kind: 'move', caret: 0 } : { kind: 'back', at }
+  if (k.key === 'delete') return at === length ? { kind: 'move', caret: at } : { kind: 'del', at }
+  if (k.key === 'space') return { kind: 'insert', at, text: ' ' }
+  if (SPECIAL_KEYS.has(k.key) || /[\x00-\x1f\x7f]/.test(k.key)) return null
+  return { kind: 'insert', at, text: k.key }
+}
+
+/** The text after the edit; an index past the end counts as the end. */
+export function editText(text: string, edit: TextEdit): string {
+  if (edit.kind === 'clear') return ''
+  const chars = [...text]
+  const at = Math.max(0, Math.min(edit.at, chars.length))
+  if (edit.kind === 'insert') return [...chars.slice(0, at), edit.text, ...chars.slice(at)].join('')
+  if (edit.kind === 'back') return at === 0 ? text : [...chars.slice(0, at - 1), ...chars.slice(at)].join('')
+  return [...chars.slice(0, at), ...chars.slice(at + 1)].join('')
+}
+
+/** The caret after an edit made at the caret: past an insert, back one for a `back`. */
+export function caretAfter(edit: TextEdit): number {
+  if (edit.kind === 'clear') return 0
+  if (edit.kind === 'insert') return edit.at + [...edit.text].length
+  return edit.kind === 'back' ? Math.max(0, edit.at - 1) : edit.at
+}
+
+/** The length of a text after the edit, for a text known only by its length. */
+export function lengthAfter(length: number, edit: TextEdit): number {
+  return [...editText('x'.repeat(length), edit)].length
+}
+
+const DROPDOWN_MARK = ' ▾'
+
 /** A dropdown: a field whose ▾ and text both open its list. */
 export function dropdown(text: string, width: number, hit: string, focused: boolean, opts: { dim?: boolean; look?: Look } = {}): Line {
-  return field(text, width, hit, focused, { ...opts, tail: seg(' ▾', focused ? FOCUSED : { color: 'claude' }, hit) })
+  return field(text, width, hit, focused, { ...opts, tail: seg(DROPDOWN_MARK, focused ? FOCUSED : { color: 'claude' }, hit) })
+}
+
+/** The cells a dropdown `width` wide leaves its text. */
+export function dropdownRoom(width: number): number {
+  return fieldRoom(width, seg(DROPDOWN_MARK))
 }
 
 /**

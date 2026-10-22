@@ -19,7 +19,9 @@ import {
   shownText,
   TYPE_OPTION,
   view,
+  withPastes,
 } from '../hooks/requests'
+import { END_CARET } from '../hooks/controls'
 import type { RequestEntry } from '../hooks/requests-props'
 
 const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, text: null, offer: null, chosen: null })
@@ -39,8 +41,8 @@ function type(state: ListState, ...keys: string[]) {
 test('typing becomes numbered edits for the first request', async () => {
   const state = type(START, 'h', 'hunter2')
   expect(state.pending).toEqual([
-    { seq: 1, id: 'a', kind: 'append', text: 'h' },
-    { seq: 2, id: 'a', kind: 'append', text: 'hunter2' },
+    { seq: 1, id: 'a', kind: 'insert', at: 0, text: 'h' },
+    { seq: 2, id: 'a', kind: 'insert', at: 1, text: 'hunter2' },
   ])
   expect(shownLength(ENTRIES[0]!, state.pending)).toBe(8)
 })
@@ -62,14 +64,14 @@ test('confirmed edits drop out; the shown length comes from the hooks then', asy
 })
 
 test('space arrives named; special keys and control sequences type nothing', async () => {
-  expect(type(START, 'space').pending).toEqual([{ seq: 1, id: 'a', kind: 'append', text: ' ' }])
+  expect(type(START, 'space').pending).toEqual([{ seq: 1, id: 'a', kind: 'insert', at: 0, text: ' ' }])
   expect(type(START, 'tab', 'left', '\x1bOP').pending).toEqual([])
 })
 
 test('backspace, ctrl+u and Enter are edits too, in order', async () => {
   const state = onKey(type(START, 'x', 'backspace'), ENTRIES, FRAME, { key: 'u', ctrl: true }).state
   const { post } = onKey(state, ENTRIES, FRAME, { key: 'return' })
-  expect(post?.edits.map(e => e.kind)).toEqual(['append', 'back', 'clear', 'submit'])
+  expect(post?.edits.map(e => e.kind)).toEqual(['insert', 'back', 'clear', 'submit'])
   expect(shownLength(entry('a', 'p', 5), state.pending)).toBe(0)
 })
 
@@ -82,13 +84,42 @@ test('Ctrl+R or a click on Show asks to see the typed value; a card holding a va
   expect(onClick(START, ENTRIES, FRAME, fieldRow, show + 5).post?.edits).toEqual([])
   const offered = [{ ...entry('a', 'db'), offer: [{ id: 'e1', label: 'Prod DB · db' }], chosen: 'e1' }]
   expect(onClick(START, offered, FRAME, fieldRow, 4 + fieldRoom(FRAME.columns, true)).state.isMenuOpen).toBe(true)
-  expect(shownText('abc', entry('a', 'p'), [{ seq: 1, id: 'a', kind: 'append', text: 'd' }, { seq: 2, id: 'b', kind: 'clear' }])).toBe('abcd')
+  expect(shownText('abc', entry('a', 'p'), [{ seq: 1, id: 'a', kind: 'insert', at: 1, text: 'd' }, { seq: 2, id: 'b', kind: 'clear' }])).toBe('adbc')
 })
 
 test('down switches requests and tells the hooks; typing then goes to the new one', async () => {
-  expect(onKey(START, ENTRIES, FRAME, { key: 'down' }).post).toEqual({ instance: 'i1', selected: 'b', edits: [] })
+  expect(onKey(START, ENTRIES, FRAME, { key: 'down' }).post).toEqual({ instance: 'i1', selected: 'b', edits: [], caret: END_CARET })
   const state = type(START, 'down', 'y')
-  expect(state.pending).toEqual([{ seq: 1, id: 'b', kind: 'append', text: 'y' }])
+  expect(state.pending).toEqual([{ seq: 1, id: 'b', kind: 'insert', at: 0, text: 'y' }])
+})
+
+test("a card's value edits at a caret: ←/→, Home/End, Backspace before it, Delete after it; the post says where it is", async () => {
+  const typed = entry('a', 'p', 6)
+  const list = [typed, ENTRIES[1]!]
+  const keys = (state: ListState, ...names: string[]) => names.reduce((s, key) => onKey(s, list, FRAME, { key }).state, state)
+  const moved = keys(START, 'left', 'left')
+  expect([moved.caret, moved.pending]).toEqual([4, []])
+  const edited = keys(moved, 'x', 'backspace', 'delete', 'home', 'delete')
+  expect(edited.pending.map(e => ('at' in e ? `${e.kind}@${e.at}` : e.kind))).toEqual(['insert@4', 'back@5', 'del@4', 'del@0'])
+  expect(shownLength(typed, edited.pending)).toBe(4)
+  expect(edited.caret).toBe(0)
+  expect(onKey(edited, list, FRAME, { key: 'end' }).state.caret).toBe(4)
+  expect(onKey(edited, list, FRAME, { key: 'end' }).state.selected).toBe('a')
+  expect(onKey(moved, list, FRAME, { key: 'q' }).post?.caret).toBe(5)
+})
+
+test('a click on a typing card\'s value puts the caret there; the hooks\' paste moves it past what was pasted', async () => {
+  const typed = { ...entry('a', 'p', 6), text: 'abcdef' }
+  const field = layout([typed], 60, null).findIndex(r => r.kind === 'field')
+  const focused = { ...START, isFocused: true, selected: 'a' }
+  const placed = onClick(focused, [typed], FRAME, field, 4 + 2)
+  expect([placed.state.caret, placed.post?.caret]).toEqual([2, 2])
+  expect(onClick(START, [typed], FRAME, field, 4 + 30).state.caret).toBe(6)
+  const pastes = [{ seq: 9, id: 'a', at: 2, length: 3 }]
+  const taken = withPastes(placed.state, { pastes, entries: [typed] })
+  expect([taken.caret, taken.pasted]).toEqual([5, 9])
+  expect(withPastes(taken, { pastes, entries: [typed] })).toBe(taken)
+  expect(withPastes(placed.state, { pastes: [{ ...pastes[0]!, id: 'b' }], entries: [typed] }).caret).toBe(2)
 })
 
 test('every request is a card: what, where from, then its field and Cancel', async () => {
@@ -129,24 +160,24 @@ test('a click on a card selects it and tells the hooks; on its Cancel button, ca
   const bWhat = rows.findIndex(r => r.id === 'b' && r.kind === 'what')
   expect(onClick(START, ENTRIES, FRAME, bWhat, 3)).toEqual({
     state: { ...START, selected: 'b', isFocused: true },
-    post: { instance: 'i1', selected: 'b', edits: [] },
+    post: { instance: 'i1', selected: 'b', edits: [], caret: END_CARET },
   })
   const bField = rows.findIndex(r => r.id === 'b' && r.kind === 'field')
   const { buttonStart } = geometry(60)
   expect(onClick(START, ENTRIES, FRAME, bField, buttonStart + 1).post?.edits).toEqual([{ seq: 1, id: 'b', kind: 'cancel' }])
   expect(onClick(START, ENTRIES, FRAME, bField - 1, buttonStart).post?.edits).toEqual([{ seq: 1, id: 'b', kind: 'cancel' }])
-  expect(onClick(START, ENTRIES, FRAME, bField, buttonStart - 2).post).toEqual({ instance: 'i1', selected: 'b', edits: [] })
+  expect(onClick(START, ENTRIES, FRAME, bField, buttonStart - 2).post).toEqual({ instance: 'i1', selected: 'b', edits: [], caret: END_CARET })
   const gap = rows.findIndex(r => r.kind === 'gap')
-  expect(onClick(START, ENTRIES, FRAME, gap, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [] })
+  expect(onClick(START, ENTRIES, FRAME, gap, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [], caret: END_CARET })
 })
 
 test("a click on the message's ✕ dismisses it; elsewhere on it, only focuses", async () => {
   const { buttonStart } = geometry(60)
   for (const y of [1, 2, 3]) {
-    expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, y, buttonStart + 2).post).toEqual({ instance: 'i1', selected: 'a', edits: [{ seq: 1, kind: 'dismiss' }] })
+    expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, y, buttonStart + 2).post).toEqual({ instance: 'i1', selected: 'a', edits: [{ seq: 1, kind: 'dismiss' }], caret: END_CARET })
   }
-  expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, 2, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [] })
-  expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, 0, buttonStart + 2).post).toEqual({ instance: 'i1', selected: 'a', edits: [] })
+  expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, 2, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [], caret: END_CARET })
+  expect(onClick(START, ENTRIES, { ...FRAME, message: 'Short.' }, 0, buttonStart + 2).post).toEqual({ instance: 'i1', selected: 'a', edits: [], caret: END_CARET })
 })
 
 test('cards past the room scroll in a window between markers counting the cards cut off', async () => {
@@ -170,8 +201,12 @@ test('the arrows move the selection and the window follows to show the selected 
   press('up')
   expect([state.selected, state.scroll]).toEqual(['b', 8])
   press('end')
+  expect([state.selected, state.scroll]).toEqual(['b', 8])
+  // Home and End move a typing card's caret; on cards that take no typing they jump to the first and last.
+  const signs = MANY.map(e => ({ ...e, kind: 'sign' as const }))
+  state = onKey(state, signs, SHORT, { key: 'end' }).state
   expect([state.selected, state.scroll]).toEqual(['e', 24])
-  press('home')
+  state = onKey(state, signs, SHORT, { key: 'home' }).state
   expect([state.selected, state.scroll]).toEqual(['a', 0])
 })
 
@@ -179,10 +214,10 @@ test('a click on a marker selects the next card cut off that way and scrolls to 
   const at = { ...START, selected: 'c', scroll: 8 }
   expect(onClick(at, MANY, SHORT, 0, 3)).toEqual({
     state: { ...at, selected: 'a', isFocused: true, scroll: 0 },
-    post: { instance: 'i1', selected: 'a', edits: [] },
+    post: { instance: 'i1', selected: 'a', edits: [], caret: END_CARET },
   })
   expect(onClick(at, MANY, SHORT, 16, 3).state).toEqual({ ...at, selected: 'd', isFocused: true, scroll: 16 })
-  expect(onClick(START, MANY, SHORT, 0, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [] })
+  expect(onClick(START, MANY, SHORT, 0, 3).post).toEqual({ instance: 'i1', selected: 'a', edits: [], caret: END_CARET })
 })
 
 test('the list stays its tallest card and gap short of the room; a list that fits keeps its height', async () => {
@@ -240,7 +275,7 @@ test('a request naming no key is a bare field that takes typing; a click on it o
   const entries: RequestEntry[] = [{ ...entry('a', 'deploy token'), offer: OFFER }]
   const rows = layout(entries, 60, null)
   expect(rows.map(r => r.kind)).toEqual(['cardTop', 'what', 'from', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
-  expect(onKey(START, entries, FRAME, { key: 'x' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'append', text: 'x' }])
+  expect(onKey(START, entries, FRAME, { key: 'x' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'insert', at: 0, text: 'x' }])
   const field = rows.findIndex(r => r.kind === 'field')
   const opened = onClick(START, entries, FRAME, field, 6).state
   expect(opened).toMatchObject({ isMenuOpen: true, cursor: null, selected: 'a' })

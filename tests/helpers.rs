@@ -476,6 +476,33 @@ fn a_key_file_that_cannot_be_read_is_named_without_the_value() {
 }
 
 #[test]
+fn a_moved_entry_keeps_its_place_in_the_vault_file() {
+    let data = data_dir("move");
+    let mut relay = Relay::start_in("move", &data);
+    relay.create_vault("pass phrase");
+    let first = relay.add("First", "first", "password", "first-pw-1");
+    relay.add("Second", "second", "password", "second-pw-1");
+    let third = relay.add("Third", "third", "token", "third-tok-1");
+    let names = |relay: &Relay| -> Vec<String> {
+        relay.get("/vault").1["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_owned()).collect()
+    };
+    assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "move", "id": third, "to": 0 })), "200");
+    assert_eq!(relay.next_event(), serde_json::json!({ "vault": "open" }));
+    assert_eq!(names(&relay), ["Third", "First", "Second"]);
+    assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "move", "id": first, "to": 9 })), "200", "past the end goes to the end");
+    assert_eq!(names(&relay), ["Third", "Second", "First"]);
+    assert_eq!(post(&relay.socket, "/vault", &serde_json::json!({ "op": "move", "id": "nothing", "to": 0 })), "400");
+    drop(relay);
+
+    let mut reopened = Relay::start_in("move-reopened", &data);
+    assert_eq!(post(&reopened.socket, "/unlock", &serde_json::json!({ "passphrase": "pass phrase" })), "204");
+    assert_eq!(reopened.next_event(), serde_json::json!({ "vault": "open" }));
+    assert_eq!(names(&reopened), ["Third", "Second", "First"]);
+    drop(reopened);
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
 fn a_short_value_is_masked_in_its_own_call_and_in_others_only_past_the_minimum() {
     let mut relay = Relay::start("short");
     let both = |relay: &mut Relay| {

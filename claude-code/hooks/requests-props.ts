@@ -1,5 +1,9 @@
+import type { PasteMark, TextEdit } from './controls'
 import type { ListState } from './requests'
 import type { Tab, Tabs } from './tabs'
+
+/** A paste the hooks made into a request's value at the list's caret. */
+export type RequestPaste = PasteMark & { id: string }
 
 /** The list's state less its pending edits, which hold typed characters: what a new instance starts from. */
 export type ListResume = Omit<ListState, 'pending'>
@@ -32,8 +36,8 @@ export type RequestEntry = {
  * entry), its menu choice (`choose`, null for typing), and the list's own clicks (`dismiss` the message, `tab`).
  */
 export type Edit =
-  | { seq: number; id: string; kind: 'append'; text: string }
-  | { seq: number; id: string; kind: 'back' | 'clear' | 'submit' | 'cancel' | 'peek' }
+  | ({ seq: number; id: string } & TextEdit)
+  | { seq: number; id: string; kind: 'submit' | 'cancel' | 'peek' }
   | { seq: number; id: string; kind: 'session' | 'once'; entry: string | null }
   | { seq: number; id: string; kind: 'choose'; entry: string | null }
   | { seq: number; kind: 'dismiss' }
@@ -55,6 +59,8 @@ export type RequestsProps = {
   columns: number
   /** The list's height; cards past it scroll. */
   rows: number
+  /** Pastes into the shown requests' values that a list may not have taken in yet (`ListResume.pasted`). */
+  pastes: RequestPaste[]
   /** The state the last instance posted; a new instance (each new transcript row makes one) goes on from here. */
   resume: ListResume | null
 }
@@ -68,6 +74,8 @@ export type RequestsMessage = {
   instance: string
   selected: string | null
   edits: Edit[]
+  /** The caret in the selected request's value, where a paste goes; past the end counts as the end. */
+  caret: number
   /** The list's state for the next instance; every post from a drawn list carries it. */
   ui?: ListResume
 }

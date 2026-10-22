@@ -2,9 +2,9 @@ import type { ClientKeyEvent } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
 import { SUGGESTED } from '../hooks/auto-mode'
-import ConfigView, { type ConfigState, confirm, drawPage, initialState, onClick, onKey, shownText, status, wrap } from '../hooks/config-view'
+import ConfigView, { type ConfigState, confirm, drawPage, initialState, onClick, onKey, shownText, status, withPastes, wrap } from '../hooks/config-view'
 import type { ConfigProps, TextEdit } from '../hooks/config-view-props'
-import { hitAt } from '../hooks/controls'
+import { hitAt, type Line, textPieces } from '../hooks/controls'
 import { TAB_ROWS, tabSpans } from '../hooks/tabs'
 
 const isTab = (e: TextEdit): e is Extract<TextEdit, { kind: 'tab' }> => e.kind === 'tab'
@@ -17,6 +17,7 @@ const PROPS: ConfigProps = {
   draft: 'mine',
   applied: null,
   confirmed: {},
+  pastes: [],
   unlockAtStart: true,
   maskMinLength: 6,
   error: null,
@@ -56,35 +57,36 @@ function draw(props: ConfigProps, state?: ConfigState) {
   return view(props, surface).children.map(text)
 }
 
-test('two sections: Vault with a checkbox and a stepper, then Auto mode with its status, the text box, Apply and Suggested', async () => {
+test('two sections: Vault with a checkbox and a stepper, then Auto mode with its status, the text box, Save and Reset to default', async () => {
   const rows = draw(PROPS, START)
   for (const row of rows) expect([...row].length).toBe(PROPS.columns)
+  expect(rows[0]).toContain(' Settings ')
   const under = rows.slice(TAB_ROWS)
   expect(under[0]).toMatch(/^ Vault +$/)
-  expect(under[1]).toMatch(/^ \[x\] Unlock the vault at session start +$/)
+  expect(under[1]).toMatch(/^ \[x\] Ask to unlock at session start +$/)
   expect(under[2]).toMatch(/^ Mask values of at least \[ - \] {2}6 {2}\[ \+ \] characters +$/)
-  expect(under[4]).toMatch(/^ Auto mode · Secrets management +not in settings $/)
+  expect(under[4]).toMatch(/^ Auto mode rule +not set $/)
   expect(under[5]).toMatch(/^┌─+┐$/)
   expect(under[6]).toMatch(/^│ mine▏ +│$/)
   expect(under[7]).toMatch(/^└─+┘$/)
-  expect(under[9]).toMatch(/^ │ Apply │ │ Suggested │ +$/)
-  expect(draw({ ...PROPS, unlockAtStart: false }, START)[TAB_ROWS + 1]).toMatch(/^ \[ \] Unlock/)
+  expect(under[9]).toMatch(/^ │ Save │ │ Reset to default │ +$/)
+  expect(draw({ ...PROPS, unlockAtStart: false }, START)[TAB_ROWS + 1]).toMatch(/^ \[ \] Ask to unlock/)
 })
 
 test('the status compares the shown text with the line in the settings', async () => {
-  expect(status('mine', null)).toBe('not in settings')
-  expect(status('mine', 'mine')).toBe('applied')
-  expect(status('mine!', 'mine')).toBe('changed, not applied')
+  expect(status('mine', null)).toBe('not set')
+  expect(status('mine', 'mine')).toBe('saved')
+  expect(status('mine!', 'mine')).toBe('unsaved changes')
 })
 
 test("typing shows at once as unconfirmed edits; the hooks' confirmation drops them", async () => {
   const typed = onKey(START, PROPS, key('!'))
-  expect(typed.post).toEqual({ instance: 'c1', edits: [{ kind: 'append', text: '!', seq: 1 }], textFocused: true })
+  expect(typed.post).toEqual({ instance: 'c1', edits: [{ kind: 'insert', at: 4, text: '!', seq: 1 }], textFocused: true, caret: 5 })
   const back = onKey(typed.state, PROPS, key('backspace'))
   expect(shownText(PROPS.draft, back.state.pending)).toBe('mine')
   expect(shownText(PROPS.draft, onKey(back.state, PROPS, key('u', { ctrl: true })).state.pending)).toBe('')
-  expect(onKey(START, PROPS, key('space')).post?.edits).toEqual([{ kind: 'append', text: ' ', seq: 1 }])
-  expect(confirm(back.state, 1)?.pending).toEqual([{ kind: 'back', seq: 2 }])
+  expect(onKey(START, PROPS, key('space')).post?.edits).toEqual([{ kind: 'insert', at: 4, text: ' ', seq: 1 }])
+  expect(confirm(back.state, 1)?.pending).toEqual([{ kind: 'back', at: 5, seq: 2 }])
   expect(confirm(back.state, 2)?.pending).toEqual([])
   expect(confirm(START, 3)).toBe(null)
 })
@@ -131,21 +133,37 @@ test('clicks: the checkbox toggles, the stepper buttons step, the text around th
   expect(onClick(START, PROPS, 0, config.start).post).toBe(undefined)
 })
 
-test('a text longer than the room shows its end, where typing goes', async () => {
-  const lines = drawPage({ ...PROPS, rows: TAB_ROWS + 11 + 2, draft: 'a'.repeat(56 * 5) }, { focus: 'apply', pending: [] })
-  const text = lines.filter(l => l.some(s => s.hit === 'text') && l.length === 3)
-  expect(text.length).toBe(2)
-  expect(text.at(-1)![1]!.text).toBe('a'.repeat(56))
+/** The text box's rows as drawn: each row's text, the caret included. */
+const boxRows = (lines: Line[]) => lines.filter(l => l.some(s => s.hit?.startsWith('text@'))).map(l => l.slice(1, -2).map(s => s.text).join(''))
+
+test('a text longer than the room shows its end, or from the caret when it is above that', async () => {
+  const props = { ...PROPS, rows: TAB_ROWS + 11 + 2, draft: 'a'.repeat(56 * 4) + 'b'.repeat(56) }
+  expect(boxRows(drawPage(props, { focus: 'apply', pending: [], caret: 0 }))).toEqual(['a'.repeat(56), 'b'.repeat(56)])
+  expect(boxRows(drawPage(props, { focus: 'text', pending: [], caret: 0 }))).toEqual(['▏' + 'a'.repeat(55), 'a'.repeat(56)])
+  expect(boxRows(drawPage(props, { focus: 'text', pending: [], caret: 56 * 5 })).at(-1)).toBe('▏')
 })
 
-test('rows break after a space; a word longer than a row is cut; a full last row puts the cursor on the next', async () => {
-  expect(wrap('aaa bbb ccc', 9, false)).toEqual(['aaa bbb ', 'ccc'])
-  expect(wrap('aaa bbbbbbbbbbb', 6, false)).toEqual(['aaa ', 'bbbbbb', 'bbbbb'])
-  expect(wrap('aaa bbbbb ccc', 9, false)).toEqual(['aaa bbbbb', ' ccc'])
-  expect(wrap('aaaaaa', 6, true)).toEqual(['aaaaaa', ''])
-  expect(wrap('aaaaaa', 6, false)).toEqual(['aaaaaa'])
-  expect(wrap('', 6, false)).toEqual([''])
-  expect(wrap(SUGGESTED, 56, true).join('')).toBe(SUGGESTED)
+test('rows break after a space; a word longer than a row is cut; a caret past a full row takes the next', async () => {
+  const rows = (text: string, width: number, caret: number | null = null) => wrap(textPieces(text, caret), width).map(r => r.map(p => p.text).join(''))
+  expect(rows('aaa bbb ccc', 9)).toEqual(['aaa bbb ', 'ccc'])
+  expect(rows('aaa bbbbbbbbbbb', 6)).toEqual(['aaa ', 'bbbbbb', 'bbbbb'])
+  expect(rows('aaa bbbbb ccc', 9)).toEqual(['aaa bbbbb', ' ccc'])
+  expect(rows('aaaaaa', 6, 6)).toEqual(['aaaaaa', '▏'])
+  expect(rows('aaaaaa', 6)).toEqual(['aaaaaa'])
+  expect(rows('', 6)).toEqual([''])
+  expect(rows(SUGGESTED, 56).join('')).toBe(SUGGESTED)
+})
+
+test("the text edits at a caret: a click on a character places it, the keys move it, the hooks' paste moves it past", async () => {
+  const placed = click(START, 'text@2')
+  expect([placed.state.focus, placed.state.caret, placed.post?.caret]).toEqual(['text', 2, 2])
+  expect(onKey(placed.state, PROPS, key('X')).post?.edits).toEqual([{ kind: 'insert', at: 2, text: 'X', seq: 1 }])
+  expect(onKey(placed.state, PROPS, key('delete')).post?.edits).toEqual([{ kind: 'del', at: 2, seq: 1 }])
+  expect(onKey(placed.state, PROPS, key('home')).state.caret).toBe(0)
+  expect(boxRows(drawPage(PROPS, placed.state))).toEqual(['mi▏ne'])
+  const pasted = withPastes(placed.state, { pastes: [{ seq: 5, at: 2, length: 4 }] })
+  expect([pasted.caret, pasted.pasted]).toEqual([6, 5])
+  expect(withPastes({ ...placed.state, focus: 'apply' }, { pastes: [{ seq: 5, at: 2, length: 4 }] }).caret).toBe(2)
 })
 
 test('every drawn row is as wide as the view, the suggested text and an error included', async () => {

@@ -1,3 +1,4 @@
+import type { TextEdit } from './controls'
 import type { Tab, Tabs } from './tabs'
 import type { ViewState } from './vault-view'
 
@@ -24,14 +25,23 @@ export type Form = { id: string | null; suggestion: string | null; name: string;
 /** The fields whose text the hooks hold: an entry's value, the passphrase and its repeat. */
 export type SecretField = 'value' | 'passphrase' | 'again'
 
+/** The form's fields whose text the view holds. */
+export type TextField = 'name' | 'tag'
+
+/**
+ * A paste the hooks took, numbered so the view takes each in once: for Name or Tag its text; for a held field, which
+ * the hooks pasted into at the view's caret, only where and how long, so the caret moves past it.
+ */
+export type VaultPaste = { seq: number; field: TextField; text: string } | { seq: number; field: SecretField; at: number; length: number }
+
 /**
  * One change, numbered per view instance and carried in every post until the hooks confirm it: a held field's edit,
  * an action (a button, Enter, an entry's access) or a click on another tab.
  */
 export type ValueEdit =
-  | { seq: number; field: SecretField; kind: 'append'; text: string }
+  | ({ seq: number; field: SecretField } & TextEdit)
   /** `peek` shows the field's text, or hides it again. */
-  | { seq: number; field: SecretField; kind: 'back' | 'clear' | 'peek' }
+  | { seq: number; field: SecretField; kind: 'peek' }
   | { seq: number; kind: 'action'; action: VaultAction }
   | { seq: number; kind: 'tab'; tab: Tab }
 
@@ -47,6 +57,8 @@ export type VaultAction =
   | { kind: 'delete'; id: string }
   | { kind: 'dismiss'; id: string }
   | { kind: 'access'; id: string; access: Access }
+  /** The entry goes to place `to` in the list. */
+  | { kind: 'move'; id: string; to: number }
   /** Unlocks the vault, or creates it when there is none. */
   | { kind: 'open' }
   /** Seals the open vault under the passphrase typed twice. */
@@ -75,6 +87,8 @@ export type VaultProps = {
   lengths: Record<SecretField, number>
   /** The text of each held field the person asked to see; the rest the view knows only by length. */
   peeked: Partial<Record<SecretField, string>>
+  /** Pastes the view hasn't confirmed yet (`VaultResume.pasted`). */
+  pastes: VaultPaste[]
   /** A change closes the form: the hooks saved or deleted what it showed, or changed the passphrase. */
   formEpoch: number
   /** Why the last save, delete or unlock failed. */
@@ -89,8 +103,10 @@ export type VaultProps = {
 export type VaultMessage = {
   instance: string
   edits: ValueEdit[]
-  /** The held field with the keyboard, where a paste belongs; null for none. */
-  focused: SecretField | null
+  /** The text field with the keyboard, where a paste belongs; null for none. */
+  focused: SecretField | TextField | null
+  /** The caret in that field, a character index; past the end counts as the end. */
+  caret: number
   /** A form is open, which a turn to the Requests tab would drop. */
   formOpen: boolean
   /** The view's state for the next instance; every post from a drawn view carries it. */

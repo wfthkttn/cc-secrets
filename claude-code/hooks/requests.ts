@@ -1,5 +1,6 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
+import { caretAfter, caretAt, caretText, editText, END_CARET, lengthAfter, type TextEdit, textKey } from './controls'
 import { cells, clip, displayed, pad, rowsOf } from './display'
 import type { Edit, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
@@ -20,6 +21,10 @@ export type ListState = {
   isMenuOpen: boolean
   /** The menu's highlighted option: an entry's id, null for Type; it stays on its entry when the vault changes. */
   cursor: string | null
+  /** Where typing goes in the selected card's value: a character index, past the end counting as the end. */
+  caret: number
+  /** The last of the hooks' pastes (`RequestsProps.pastes`) this list took in. */
+  pasted: number
 }
 
 /** One screen row of the list: a message row, a request card's row, a gap, or the empty note. */
@@ -59,12 +64,12 @@ const MESSAGE_MAX_ROWS = 6
 /** The options a menu shows at once; it scrolls past them. */
 export const MENU_ROWS = 6
 /** The menu's first option: the field takes typing. */
-export const TYPE_OPTION = 'Type'
+export const TYPE_OPTION = 'Type a value'
 const BUTTON_ROW_TEXT = [edge('top', BUTTON_COLUMNS), '│' + CANCEL_LABEL + '│', edge('bottom', BUTTON_COLUMNS)] as const
 /** A grant card's answers, left to right; ✕ refuses. */
 const GRANT_BUTTONS = [
-  { kind: 'session', label: ' Session ' },
-  { kind: 'once', label: ' Once ' },
+  { kind: 'session', label: ' Allow for session ' },
+  { kind: 'once', label: ' Allow once ' },
   { kind: 'cancel', label: CANCEL_LABEL },
 ] as const
 const FIELD_BACKGROUND = '#1f2a3a'
@@ -72,8 +77,6 @@ const FIELD_BACKGROUND = '#1f2a3a'
 const SHOW_COLUMNS = 5
 /** Where a field's text starts: the card's edge, then the field's own. */
 const FIELD_TEXT_START = CARD_EDGE + 2
-/** Names a `Client` gets for special keys; any other `key` is typed text, a burst arriving whole. */
-const SPECIAL_KEYS = new Set(['up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'return', 'tab', 'backspace', 'delete'])
 
 function edge(side: 'top' | 'bottom', width: number): string {
   const [left, right] = side === 'top' ? ['╭', '╮'] : ['╰', '╯']
@@ -81,7 +84,7 @@ function edge(side: 'top' | 'bottom', width: number): string {
 }
 
 export function initialState(focusEpoch: number, instance: string): ListState {
-  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0, isMenuOpen: false, cursor: null }
+  return { instance, seq: 0, pending: [], selected: null, isFocused: false, epoch: focusEpoch, scroll: 0, isMenuOpen: false, cursor: null, caret: END_CARET, pasted: 0 }
 }
 
 /** The vault entries a card may be answered with; none for a sign card or a closed vault. */
@@ -101,20 +104,13 @@ export function choiceOf(entry: RequestEntry, pending: Edit[]): Offered | null {
   return offerOf(entry).find(o => o.id === id) ?? null
 }
 
-function typedText(k: ClientKeyEvent): string | null {
-  if (k.ctrl || k.meta) return null
-  if (k.key === 'space') return ' '
-  if (SPECIAL_KEYS.has(k.key) || /[\x00-\x1f\x7f]/.test(k.key)) return null
-  return k.key
-}
-
 function selectedOf(state: ListState, entries: RequestEntry[]): string | null {
   if (state.selected === null) return entries[0]?.id ?? null
   return entries.some(e => e.id === state.selected) ? state.selected : null
 }
 
 function postOf(state: ListState, selected: string | null, edits = state.pending): RequestsMessage {
-  return { instance: state.instance, selected, edits }
+  return { instance: state.instance, selected, edits, caret: state.caret }
 }
 
 /** Drops the edits the hooks confirmed; null when none were. */
@@ -123,27 +119,39 @@ export function confirm(state: ListState, applied: number | undefined): ListStat
   return { ...state, pending: state.pending.filter(e => e.seq > applied) }
 }
 
+/** This instance's unconfirmed edits of the card's value. */
+function editsOf(entry: RequestEntry, pending: Edit[]): TextEdit[] {
+  return pending.flatMap(edit =>
+    'id' in edit && edit.id === entry.id && (edit.kind === 'insert' || edit.kind === 'back' || edit.kind === 'del' || edit.kind === 'clear') ? [edit] : [],
+  )
+}
+
 /** The value's length as shown: what the hooks hold, with this instance's unconfirmed edits on top. */
 export function shownLength(entry: RequestEntry, pending: Edit[]): number {
-  let length = entry.length
-  for (const edit of pending) {
-    if (!('id' in edit) || edit.id !== entry.id) continue
-    if (edit.kind === 'append') length += [...edit.text].length
-    else if (edit.kind === 'back') length = Math.max(0, length - 1)
-    else if (edit.kind === 'clear') length = 0
-  }
-  return length
+  return editsOf(entry, pending).reduce(lengthAfter, entry.length)
 }
 
 /** A peeked value as shown: what the hooks hold, with this instance's unconfirmed edits on top. */
 export function shownText(text: string, entry: RequestEntry, pending: Edit[]): string {
-  for (const edit of pending) {
-    if (!('id' in edit) || edit.id !== entry.id) continue
-    if (edit.kind === 'append') text += edit.text
-    else if (edit.kind === 'back') text = [...text].slice(0, -1).join('')
-    else if (edit.kind === 'clear') text = ''
+  return editsOf(entry, pending).reduce(editText, text)
+}
+
+/** The card's value as its field draws it, unclipped: dots, or its text while peeked. */
+function valueOf(entry: RequestEntry, pending: Edit[]): string {
+  return entry.text === null ? '•'.repeat(shownLength(entry, pending)) : shownText(entry.text, entry, pending)
+}
+
+/**
+ * Takes in the hooks' pastes this instance hasn't: the hooks made each at this list's caret, so on the selected card
+ * the caret moves past it.
+ */
+export function withPastes(state: ListState, props: Pick<RequestsProps, 'pastes' | 'entries'>): ListState {
+  let next = state
+  for (const paste of props.pastes) {
+    if (paste.seq <= next.pasted) continue
+    next = { ...next, pasted: paste.seq, ...(paste.id === selectedOf(next, props.entries) ? { caret: paste.at + paste.length } : {}) }
   }
-  return text
+  return next
 }
 
 /** The columns of a card's field text: short of its Show button and its menu mark. */
@@ -303,9 +311,10 @@ function reveal(entries: RequestEntry[], frame: Frame, state: ListState, id: str
 
 /** Selects the card and scrolls to it; tells the hooks when the selection changed, or always when `tell`. */
 function selectCard(state: ListState, entries: RequestEntry[], frame: Frame, id: string, tell = false): Result {
-  const moved = { ...state, selected: id, isFocused: true, isMenuOpen: false }
+  const isNew = id !== selectedOf(state, entries)
+  const moved = { ...state, selected: id, isFocused: true, isMenuOpen: false, caret: isNew ? END_CARET : state.caret }
   const shown = { ...moved, scroll: reveal(entries, frame, moved, id) }
-  return tell || id !== selectedOf(state, entries) ? { state: shown, post: postOf(state, id) } : { state: shown }
+  return tell || isNew ? { state: shown, post: postOf(shown, id) } : { state: shown }
 }
 
 /** Opens the card's menu on what its field holds now, the card scrolled into view. */
@@ -354,7 +363,9 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   }
   // Escape never reaches a Client and ↑/↓ move between cards, so Tab opens the menu.
   if (k.key === 'tab' && offer.length > 0) return openMenu(state, entries, frame, entry)
-  const jumps: Record<string, number> = { up: at - 1, down: at + 1, home: 0, end: entries.length - 1 }
+  // Home and End go to the first and last card, unless the card takes typing: there they move the caret.
+  const typing = takesTyping(entry, state.pending, frame)
+  const jumps: Record<string, number> = typing ? { up: at - 1, down: at + 1 } : { up: at - 1, down: at + 1, home: 0, end: entries.length - 1 }
   const to = jumps[k.key]
   if (to !== undefined) return selectCard(state, entries, frame, entries[Math.max(0, Math.min(entries.length - 1, to))]!.id)
   if (entry.kind === 'sign') return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: null }) : { state }
@@ -362,11 +373,11 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   if (chosen !== null) return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: chosen.id }) : { state }
   if (frame.typingOff !== null) return { state }
   if (isEnter) return withEdit(state, selected, { id: selected, kind: 'submit' })
-  if (k.key === 'backspace' || k.key === 'delete') return withEdit(state, selected, { id: selected, kind: 'back' })
-  if (k.ctrl && k.key === 'u') return withEdit(state, selected, { id: selected, kind: 'clear' })
   if (k.ctrl && k.key === 'r') return withEdit(state, selected, { id: selected, kind: 'peek' })
-  const text = typedText(k)
-  return text === null ? { state } : withEdit(state, selected, { id: selected, kind: 'append', text })
+  const change = textKey(k, state.caret, shownLength(entry, state.pending))
+  if (change === null) return { state }
+  if (change.kind === 'move') return { state: { ...state, caret: change.caret, isFocused: true } }
+  return withEdit({ ...state, caret: caretAfter(change) }, selected, { id: selected, ...change })
 }
 
 /** Another tab was clicked: a numbered edit, so a later post in the same frame keeps it. */
@@ -409,6 +420,12 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   }
   // A click on the field, whatever it holds, opens its menu.
   if (isField && offerOf(entry).length > 0) return openMenu(state, entries, frame, entry)
+  if (row.kind === 'field' && x >= FIELD_TEXT_START && x < showStart && takesTyping(entry, state.pending, frame)) {
+    const drawnCaret = row.id === current && state.isFocused ? state.caret : null
+    const caret = caretAt(valueOf(entry, state.pending), drawnCaret, fieldRoom(frame.columns, false), x - FIELD_TEXT_START)
+    const placed = { ...focused, selected: row.id, caret }
+    return { state: placed, post: postOf(placed, row.id) }
+  }
   if (row.kind === 'grantTop' || row.kind === 'grant' || row.kind === 'grantBottom') {
     const button = grantButtons(frame.columns).find(b => x >= b.start && x < b.start + b.width)
     if (button?.kind === 'cancel') return withEdit(state, current, { id: row.id, kind: 'cancel' })
@@ -419,7 +436,8 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
     const button = grantButtons(frame.columns, false).find(b => x >= b.start && x < b.start + b.width)
     if (button !== undefined && button.kind !== 'cancel') return withEdit(state, current, { id: row.id, kind: button.kind, entry: chosen.id })
   }
-  return { state: { ...focused, selected: row.id }, post: postOf(state, row.id) }
+  const selecting = { ...focused, selected: row.id, caret: row.id === current ? state.caret : END_CARET }
+  return { state: selecting, post: postOf(selecting, row.id) }
 }
 
 /** Every change posts, with the state the next instance resumes from. */
@@ -456,7 +474,11 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.epoch !== props.focusEpoch) state = { ...state, isFocused: false, isMenuOpen: false, epoch: props.focusEpoch }
-  if (state !== surface.state) surface.setState(state)
+  const pasted = withPastes(state, props)
+  if (state !== surface.state || pasted !== state) surface.setState(pasted)
+  // The hooks drop a paste once a post says it was taken in.
+  if (pasted !== state) surface.post(sent({ state: pasted }, props.entries))
+  state = pasted
 
   const selected = selectedOf(state, props.entries)
   const entriesById = new Map(props.entries.map(e => [e.id, e]))
@@ -514,20 +536,14 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
         const count = shownLength(entry, state.pending)
         const isOff = chosen === null && props.typingOff !== null
         const typing = active(row.id) && chosen === null && !isOff
-        const value = entry.text === null ? '•'.repeat(count) : displayed(shownText(entry.text, entry, state.pending))
-        // the end stays in view, where typing goes on; the cursor takes a column
-        const textRoom = room - (typing ? 1 : 0)
-        const fitted = cells(value) <= textRoom ? value : '…' + [...value].slice(-(textRoom - 1)).join('')
         const shown =
           chosen !== null
             ? clip(displayed(chosen.label), room)
             : isOff
               ? clip(displayed(props.typingOff!), room)
-              : typing
-                ? fitted + '▏'
-                : count > 0
-                  ? fitted
-                  : 'password'
+              : typing || count > 0
+                ? caretText(valueOf(entry, state.pending), typing ? state.caret : null, room)
+                : 'type or paste'
         const isDim = chosen === null && !typing && (count === 0 || isOff)
         const show = takesTyping(entry, state.pending, frame) ? (entry.text === null ? ' Show' : ' Hide') : ' '.repeat(SHOW_COLUMNS)
         return line(row.id, [

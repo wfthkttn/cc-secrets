@@ -251,6 +251,8 @@ enum Change {
     Add { name: String, #[serde(default)] tag: String, kind: Kind, value: String },
     Edit { id: String, name: Option<String>, tag: Option<String>, kind: Option<Kind>, value: Option<String> },
     Delete { id: String },
+    /// The entry goes to place `to` in the list; past the end, to the end.
+    Move { id: String, to: usize },
     /// The session's grant of the entry, not the vault's.
     Access { id: String, access: Grant },
     /// A suggestion becomes an entry under the name, tag and kind given.
@@ -353,6 +355,12 @@ fn change(open: &mut Opened, change: Change) -> Result<String, String> {
         Change::Delete { id } => {
             let at = vault.entries.iter().position(|e| e.id == id).ok_or("no such entry")?;
             vault.entries.remove(at);
+            id
+        }
+        Change::Move { id, to } => {
+            let at = vault.entries.iter().position(|e| e.id == id).ok_or("no such entry")?;
+            let entry = vault.entries.remove(at);
+            vault.entries.insert(to.min(vault.entries.len()), entry);
             id
         }
         Change::Forward { .. } | Change::Access { .. } => return Err("not an entry change".to_owned()),

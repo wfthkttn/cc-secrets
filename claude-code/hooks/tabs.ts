@@ -11,7 +11,7 @@ export const TAB_ROWS = 2
 const LABELS: Record<Tab, (tabs: Tabs) => string> = {
   requests: tabs => ` Requests${tabs.requests > 0 ? ' ' + tabs.requests : ''} `,
   vault: tabs => ` Vault${tabs.vaultMark ? ' •' : ''} `,
-  config: () => ' Config ',
+  config: () => ' Settings ',
 }
 
 /** Each tab's label and the columns it takes, left to right, a `│` between them. */

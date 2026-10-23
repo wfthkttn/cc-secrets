@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { askDecision, pasteTarget, requestSource, runsIn, signDecision, sourceOf } from '../hooks/source'
+import { askDecision, pasteTarget, requestSource, runsIn, signDecision, sourceOf, taggedEntry } from '../hooks/source'
 
 const WRAPPER = (command: string, quote = `'"'"'`) =>
   `/run/current-system/sw/bin/zsh -c source /home/alex/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval '${command.split("'").join(quote)}' < /dev/null && pwd -P >| /tmp/claude-cwd`
@@ -75,6 +75,17 @@ test("an ask: a main-loop call's allowed session entry comes without a card; a s
   expect(askDecision(ask, [{ command, agentId: 'a-1' }])).toBe('refuse')
   expect(askDecision({ ...ask, entry: null }, [{ command, agentId: 'a-1' }])).toBe('refuse')
   expect(askDecision(ask, [])).toBe('card')
+})
+
+test("an ask's tag names the first entry with it that is not an SSH key, as the daemon picks it", async () => {
+  const entries = [
+    { id: 'k', tag: 'sudo', kind: 'ssh-key' },
+    { id: 'p', tag: 'sudo', kind: 'password' },
+    { id: 'q', tag: 'sudo', kind: 'password' },
+  ]
+  expect(taggedEntry('sudo', entries)?.id).toBe('p')
+  expect(taggedEntry('db', entries)).toBe(undefined)
+  expect(taggedEntry(null, entries)).toBe(undefined)
 })
 
 test('a requester outside the session is never matched to a call: its own argv could name any command', async () => {

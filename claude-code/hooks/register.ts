@@ -13,7 +13,7 @@ import type { ListResume, Offered, RequestEntry, RequestPaste, RequestsMessage, 
 import { failureKind } from './relay-failure'
 import { pathWith } from './session-path'
 import { fillSlot, hasSlot } from './slot'
-import { askDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
+import { askDecision, pasteTarget, requestSource, runsIn, signDecision, taggedEntry } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
 import { drawPage as configLines } from './config-view'
 import { contentRows } from './vault-view'
@@ -173,6 +173,8 @@ let configPastes: readonly PasteMark[] = []
 let focusEpoch = 0
 /** The value typed or pasted for each request; the lists only learn its length. */
 const held = new Map<string, string>()
+/** The asks shown as cards, by request id: decided again when the vault opens, since a closed one names no entry. */
+const carded = new Map<string, Asked>()
 /** The caret in the selected request's value, from the list that last had the keyboard; where a paste goes. */
 let listCaret = 0
 /** Pastes into requests' values, kept until a list's post says it took them in. */
@@ -768,7 +770,11 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
       } else if ('ask' in event) await onAsk($, event.ask)
       else if ('gone' in event) dropRequest(event.gone)
       else if ('sign' in event) await onSign($, event.sign)
-      else if ('vault' in event) await refreshVault($)
+      else if ('vault' in event) {
+        const wasOpen = vault.state === 'open'
+        await refreshVault($)
+        if (!wasOpen && vault.state === 'open') await giveCarded($)
+      }
       else if ('masking' in event) masking = event.masking
       else if ('masked' in event) {
         hasMasked = true
@@ -831,7 +837,20 @@ async function onAsk($: EngineInterface, ask: Asked) {
   // A give that fails leaves the program waiting: it gets the card instead.
   if (decision === 'give' && ask.entry !== null && (await answerRequest($, request, { entry: ask.entry.id, session: false }))) return
   await addRequest($, request)
+  carded.set(request.id, ask)
   await $.ui.notify(`Password needed: ${ask.prompt}`, { title: 'secrets' })
+}
+
+/** Answers the cards whose tag names an entry the session allows, as an ask made with the vault open would have been. */
+async function giveCarded($: EngineInterface) {
+  for (const request of requests) {
+    const ask = carded.get(request.id)
+    const entry = ask === undefined ? undefined : taggedEntry(ask.tag, vault.entries)
+    if (ask === undefined || entry === undefined) continue
+    if (askDecision({ ...ask, entry: { access: entry.access } }, callsBy(ask)) === 'give') {
+      await answerRequest($, request, { entry: entry.id, session: false })
+    }
+  }
 }
 
 /** Why a request was refused: the session refuses its entry, else it is, or may be, a subagent's. */
@@ -1163,6 +1182,7 @@ async function decideRequest($: EngineInterface, id: string, decision: Decision)
 function dropRequest(id: string) {
   requests = requests.filter(r => r.id !== id)
   held.delete(id)
+  carded.delete(id)
   requestPeek.delete(id)
   choices.delete(id)
   if (listSelected === id) listSelected = null

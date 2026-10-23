@@ -16,7 +16,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::access::Grant;
 use crate::session::Id;
-use crate::{COSTS, Context, Shared, State, emit, lock, now, respond};
+use crate::{COSTS, Context, Shared, State, emit, lock, note, now, respond};
 
 pub enum Locker {
     Absent,
@@ -135,7 +135,7 @@ fn opened(state: &mut State, vault: Vault) {
 }
 
 /// `POST /lock`: the open vault closes for every session, its suggestions gone; 204, 409 when it isn't open.
-pub async fn close(stream: &mut UnixStream, ctx: &Context) {
+pub async fn close(stream: &mut UnixStream, ctx: &Context, by: &str) {
     let shown = {
         let mut state = lock(ctx);
         let shown = state.vault.shown();
@@ -146,6 +146,7 @@ pub async fn close(stream: &mut UnixStream, ctx: &Context) {
         shown
     };
     if shown == "open" {
+        note(&format!("vault locked by {by}"));
         respond(stream, "204 No Content", b"").await;
     } else {
         respond(stream, "409 Conflict", format!("the vault is {shown}").as_bytes()).await;
@@ -159,7 +160,7 @@ struct Passphrase {
 
 /// `/unlock` or, with `create`, `/create`: 204 once open, 403 for a wrong passphrase, 409 when the vault isn't in
 /// a state to do it, 500 with the reason when the file can't be read or written.
-pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bool) {
+pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bool, by: &str) {
     let Ok(Passphrase { passphrase }) = serde_json::from_slice::<Passphrase>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let passphrase = Zeroizing::new(passphrase);
     let expected = if create { "absent" } else { "locked" };
@@ -190,16 +191,23 @@ pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bo
         Ok(())
     })
     .await;
+    let done = if create { "created" } else { "unlocked" };
     match result {
-        Ok(Ok(())) => respond(stream, "204 No Content", b"").await,
-        Ok(Err((status, reason))) => respond(stream, status, reason.as_bytes()).await,
+        Ok(Ok(())) => {
+            note(&format!("vault {done} by {by}"));
+            respond(stream, "204 No Content", b"").await;
+        }
+        Ok(Err((status, reason))) => {
+            note(&format!("vault not {done} for {by}: {reason}"));
+            respond(stream, status, reason.as_bytes()).await;
+        }
         Err(error) => respond(stream, "500 Internal Server Error", format!("unlocking stopped: {error}").as_bytes()).await,
     }
 }
 
 /// `POST /passphrase {passphrase}`: the open vault sealed under a new passphrase, its entries kept; 204 once saved,
 /// 409 when it isn't open, 400 for an empty passphrase, 500 with the reason when it can't be saved.
-pub async fn rekey(stream: &mut UnixStream, ctx: &Shared, body: &[u8]) {
+pub async fn rekey(stream: &mut UnixStream, ctx: &Shared, body: &[u8], by: &str) {
     let Ok(Passphrase { passphrase }) = serde_json::from_slice::<Passphrase>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let passphrase = Zeroizing::new(passphrase);
     if passphrase.is_empty() {
@@ -218,7 +226,10 @@ pub async fn rekey(stream: &mut UnixStream, ctx: &Shared, body: &[u8]) {
     })
     .await;
     match result {
-        Ok(Ok(())) => respond(stream, "204 No Content", b"").await,
+        Ok(Ok(())) => {
+            note(&format!("vault passphrase changed by {by}"));
+            respond(stream, "204 No Content", b"").await;
+        }
         Ok(Err((status, reason))) => respond(stream, status, reason.as_bytes()).await,
         Err(error) => respond(stream, "500 Internal Server Error", format!("changing the passphrase stopped: {error}").as_bytes()).await,
     }

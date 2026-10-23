@@ -281,6 +281,12 @@ async fn json_reply(stream: &mut UnixStream, reply: Option<serde_json::Value>) {
     }
 }
 
+/// The session a vault change came from, as the daemon's log names it.
+fn requester(ctx: &Context, session: Id, claude_code: i32) -> String {
+    let named = lock(ctx).sessions.get(&session).and_then(|s| s.named.clone());
+    format!("Claude Code pid {claude_code}, session {}", named.as_deref().unwrap_or("not named yet"))
+}
+
 /// Serves the session's socket until the session ends.
 async fn accept(listener: UnixListener, ctx: Shared, session: Id) {
     while let Ok((stream, _)) = listener.accept().await {
@@ -308,10 +314,10 @@ async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
         ("POST", "/ask") => pass::ask(&mut stream, &ctx, session, body).await,
         ("POST", "/filter") => filter::serve(&mut stream, &ctx, session).await,
         ("POST", "/answer") => pass::answer(&mut stream, &ctx, session, body).await,
-        ("POST", "/unlock") => locker::open(&mut stream, &ctx, body, false).await,
-        ("POST", "/create") => locker::open(&mut stream, &ctx, body, true).await,
-        ("POST", "/lock") => locker::close(&mut stream, &ctx).await,
-        ("POST", "/passphrase") => locker::rekey(&mut stream, &ctx, body).await,
+        ("POST", "/unlock") => locker::open(&mut stream, &ctx, body, false, &requester(&ctx, session, claude_code)).await,
+        ("POST", "/create") => locker::open(&mut stream, &ctx, body, true, &requester(&ctx, session, claude_code)).await,
+        ("POST", "/lock") => locker::close(&mut stream, &ctx, &requester(&ctx, session, claude_code)).await,
+        ("POST", "/passphrase") => locker::rekey(&mut stream, &ctx, body, &requester(&ctx, session, claude_code)).await,
         ("POST", "/session") => session_named(&mut stream, &ctx, session, body).await,
         ("POST", "/decide") => decided(&mut stream, &ctx, session, body).await,
         ("GET", "/vault") => {

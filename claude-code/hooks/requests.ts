@@ -451,34 +451,41 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   const { columns } = props
   const frame: Frame = { columns, rows: props.rows, message: props.message, typingOff: props.typingOff }
   const tabRows = props.tabs === null ? 0 : TAB_ROWS
+  // A copy over a held instance keeps no state of its own and posts nothing until a click or a key claims it.
+  const isCopy = props.mirror && surface.state === undefined
+  const begin = () =>
+    surface.state ?? (props.resume === null ? initialState(props.focusEpoch, Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
+  const post = (result: Result) => surface.post(isCopy ? { ...sent(result, props.entries), claimed: true } : sent(result, props.entries))
   surface.onPointer(p => {
     if (p.type !== 'down') return
     if (p.y < tabRows) {
       const tab = p.y === 0 && props.tabs !== null ? tabAt(props.tabs, p.x) : null
       if (tab === null || tab === 'requests') return
-      const result = onTab(surface.state as ListState, props.entries, tab)
+      const result = onTab(begin(), props.entries, tab)
       surface.setState(result.state)
-      surface.post(sent(result, props.entries))
+      post(result)
       return
     }
-    const result = onClick(surface.state as ListState, props.entries, frame, p.y - tabRows, p.x)
+    const result = onClick(begin(), props.entries, frame, p.y - tabRows, p.x)
     surface.setState(result.state)
-    surface.post(sent(result, props.entries))
+    post(result)
   })
   surface.onKey(k => {
-    const result = onKey(surface.state as ListState, props.entries, frame, k)
+    const result = onKey(begin(), props.entries, frame, k)
     surface.setState(result.state)
-    surface.post(sent(result, props.entries))
+    post(result)
   })
-  let state = surface.state ?? (props.resume === null ? initialState(props.focusEpoch, Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
+  let state = begin()
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.epoch !== props.focusEpoch) state = { ...state, isFocused: false, isMenuOpen: false, epoch: props.focusEpoch }
-  const pasted = withPastes(state, props)
-  if (state !== surface.state || pasted !== state) surface.setState(pasted)
-  // The hooks drop a paste once a post says it was taken in.
-  if (pasted !== state) surface.post(sent({ state: pasted }, props.entries))
-  state = pasted
+  if (!isCopy) {
+    const pasted = withPastes(state, props)
+    if (state !== surface.state || pasted !== state) surface.setState(pasted)
+    // The hooks drop a paste once a post says it was taken in.
+    if (pasted !== state) surface.post(sent({ state: pasted }, props.entries))
+    state = pasted
+  }
 
   const selected = selectedOf(state, props.entries)
   const entriesById = new Map(props.entries.map(e => [e.id, e]))

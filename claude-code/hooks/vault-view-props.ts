@@ -99,6 +99,8 @@ export type VaultProps = {
    * makes a new instance; it goes on from here.
    */
   resume: VaultResume | null
+  /** This instance is the sidebar's copy over a held one: it draws `resume` until it gets a click or a key. */
+  mirror: boolean
 }
 
 export type VaultMessage = {
@@ -112,4 +114,6 @@ export type VaultMessage = {
   formOpen: boolean
   /** The view's state for the next instance; every post from a drawn view carries it. */
   ui?: VaultResume
+  /** Posted by a copy that got a click or a key: the keyboard is with it now. */
+  claimed?: true
 }

@@ -47,6 +47,7 @@ const PROPS: VaultProps = {
   formEpoch: 0,
   error: null,
   resume: null,
+  mirror: false,
 }
 const LOCKED: VaultProps = { ...PROPS, state: 'locked', entries: [], suggestions: [] }
 const START = initialState(0, 'v1')
@@ -150,6 +151,26 @@ test('a new instance, as each new transcript row makes, goes on from the state t
   next.key('return')
   expect(next.posts.at(-1)!.ui!.form?.tag).toBe('sudo')
   expect(instance({ ...PROPS, resume: { ...ui, isClosed: false } }).draw({ ...PROPS, state: 'locked', resume: ui })[TAB_ROWS]).toMatch(/^ Vault locked/)
+})
+
+test("the sidebar's copy over a held instance draws what the held one posts, posts nothing, and a key claims it", async () => {
+  const held = instance(PROPS)
+  held.click('add')
+  held.key('G')
+  const shown = () => ({ ...PROPS, mirror: true, resume: held.posts.at(-1)!.ui! })
+  const copy = instance(shown())
+  held.key('o')
+  const rows = copy.draw(shown())
+  expect(rows[TAB_ROWS]).toMatch(/^ New entry/)
+  expect(rows.some(r => r.startsWith(' Name') && r.includes('Go'))).toBe(true)
+  expect(copy.posts).toEqual([])
+  copy.key('x')
+  expect(copy.posts.at(-1)!.claimed).toBe(true)
+  expect(copy.posts.at(-1)!.ui!.form?.name).toBe('Gox')
+  copy.draw({ ...shown(), mirror: false })
+  copy.key('!')
+  expect(copy.posts.at(-1)!.claimed).toBe(undefined)
+  expect(copy.posts.at(-1)!.ui!.form?.name).toBe('Gox!')
 })
 
 test('a locked vault: one passphrase field with Show, and Unlock; typing fills it, Enter or Unlock opens', async () => {

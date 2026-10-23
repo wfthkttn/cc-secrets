@@ -687,30 +687,37 @@ function sent(result: Result): VaultMessage {
 
 const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const { columns } = props
+  // A copy over a held instance keeps no state of its own and posts nothing until a click or a key claims it.
+  const isCopy = props.mirror && surface.state === undefined
+  const begin = () => surface.state ?? startState(props, Math.random().toString(36).slice(2))
+  const posted = (result: Result, claimed: boolean): VaultMessage => (claimed ? { ...sent(result), claimed: true } : sent(result))
   surface.onPointer(p => {
-    const current = surface.state as ViewState
+    if (isCopy && p.type !== 'down') return
+    const current = begin()
     const result =
       p.type === 'down' ? onPress(current, props, p.y, p.x) : p.type === 'move' ? onDrag(current, props, p.y) : p.type === 'up' ? onRelease(current, props) : null
     if (result === null) return
     surface.setState(result.state)
-    surface.post(sent(result))
+    surface.post(posted(result, isCopy))
   })
   surface.onKey(k => {
-    const result = onKey(surface.state as ViewState, props, k)
+    const result = onKey(begin(), props, k)
     surface.setState(result.state)
-    surface.post(sent(result))
+    surface.post(posted(result, isCopy))
   })
   const isClosed = props.state !== 'open'
-  let state = surface.state ?? startState(props, Math.random().toString(36).slice(2))
+  let state = begin()
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, rekeying: false, open: null, formEpoch: props.formEpoch }
   if (state.isClosed !== isClosed) state = { ...state, isClosed, focus: isClosed ? 'passphrase' : 'add', confirming: null, open: null }
-  const pasted = withPastes(state, props)
-  if (state !== surface.state || pasted !== state) surface.setState(pasted)
-  // The hooks drop a paste once a post says it was taken in.
-  if (pasted !== state) surface.post(sent({ state: pasted }))
-  state = pasted
+  if (!isCopy) {
+    const pasted = withPastes(state, props)
+    if (state !== surface.state || pasted !== state) surface.setState(pasted)
+    // The hooks drop a paste once a post says it was taken in.
+    if (pasted !== state) surface.post(sent({ state: pasted }))
+    state = pasted
+  }
 
   const lines = shownPage(props, state).lines
   // Blank lines to the view's height, so nothing a longer page drew stays.

@@ -22,6 +22,7 @@ const PROPS: ConfigProps = {
   maskMinLength: 6,
   error: null,
   resume: null,
+  mirror: false,
 }
 const START = initialState('c1')
 const key = (k: string, mods: { ctrl?: true; shift?: true } = {}): ClientKeyEvent => ({ key: k, ...mods })

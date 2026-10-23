@@ -182,6 +182,15 @@ let requestPastes: readonly RequestPaste[] = []
 /** The requests whose typed value the person asked to see in plain text. */
 const requestPeek = new Set<string>()
 
+/**
+ * Keeps the views that have the keyboard on their row while new rows come, so the keys stay with them; a copy that
+ * got a click or a key (`claimed`) has the keyboard now, and the hold moves to its row.
+ */
+async function holdKeys($: EngineInterface, claimed: boolean) {
+  if (claimed) await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: false })
+  await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: true })
+}
+
 function togglePeek<T>(peeking: Set<T>, key: T) {
   if (peeking.has(key)) peeking.delete(key)
   else peeking.add(key)
@@ -405,6 +414,7 @@ export function register(on: On) {
       keyboardOn = e.element === VAULT_KEY ? 'vault' : 'config'
       if (e.element === VAULT_KEY) {
         const message = e.data as VaultMessage
+        await holdKeys($, message.claimed === true)
         if (message.ui !== undefined) {
           vaultResume = message.ui
           const taken = message.ui.pasted
@@ -413,6 +423,7 @@ export function register(on: On) {
         await onVaultMessage($, message)
       } else {
         const message = e.data as ConfigMessage
+        await holdKeys($, message.claimed === true)
         if (message.ui !== undefined) {
           configResume = message.ui
           const taken = message.ui.pasted
@@ -425,6 +436,7 @@ export function register(on: On) {
     }
     if (e.element !== LIST_KEY && e.element !== POPOUT_KEY) return next(e)
     const message = e.data as RequestsMessage
+    await holdKeys($, message.claimed === true)
     if (message.ui !== undefined) {
       listResume = { ...listResume, [e.element]: message.ui }
       const taken = message.ui.pasted
@@ -492,6 +504,8 @@ export function register(on: On) {
       if (listFocused && e.text !== draftAtFocus) say($, UNSEEN_PASTE, false)
       listFocused = false
       draftAtFocus = null
+      // A key reaches the prompt only once no view has the keyboard: nothing is left to hold.
+      await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: false })
       livePopouts().blur()
       if (requests.length > 0) {
         focusEpoch += 1
@@ -599,6 +613,7 @@ export function register(on: On) {
     if (!inDrawer && !inPopout) return tree
     const room = await $.sidebar.room({})
     if (room === null) return tree
+    const mirror = await $.sidebar.mirrored({ component: e.component, requestId: e.requestId })
     const { Client } = $.ui.resolve(e)
     const list = (key: string, shown: readonly Request[], columns: number, rows: number, tabs: Tabs | null) => {
       const entries: RequestEntry[] = shown.map(request => {
@@ -617,7 +632,7 @@ export function register(on: On) {
       const tabRows = tabs === null ? 0 : TAB_ROWS
       const height = listHeight(entries, columns, message, rows - tabRows)
       const pastes = requestPastes.filter(p => shown.some(r => r.id === p.id))
-      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height, pastes, resume: listResume[key] ?? null }
+      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height, pastes, resume: listResume[key] ?? null, mirror }
       return Client({ key, module: './requests.ts', props, width: columns, height: height + tabRows })
     }
     // The vault and config views get the whole room to lay out in, and are as tall as what they show.
@@ -640,6 +655,7 @@ export function register(on: On) {
         formEpoch,
         error: vaultError,
         resume: vaultResume,
+        mirror,
       }
       const height = Math.min(room, TAB_ROWS + contentRows(props))
       return Client({ key: VAULT_KEY, module: './vault-view.ts', props, width: columns, height })
@@ -658,6 +674,7 @@ export function register(on: On) {
         maskMinLength,
         error: configError,
         resume: configResume,
+        mirror,
       }
       const height = Math.min(room, TAB_ROWS + configLines(props, { focus: 'text', pending: [], caret: END_CARET }).length)
       return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })

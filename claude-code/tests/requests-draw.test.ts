@@ -72,7 +72,7 @@ test('a new instance, as each new transcript row makes, goes on from the state t
     { id: 'a', kind: 'secret' as const, prompt: 'first', source: '', since: '04:00:00', length: 0, text: null, offer: null, chosen: null },
     { id: 'b', kind: 'secret' as const, prompt: 'second', source: '', since: '04:00:01', length: 0, text: null, offer, chosen: null },
   ]
-  const props: RequestsProps = { focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 40, message: null, typingOff: null, pastes: [], resume: null, entries }
+  const props: RequestsProps = { focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 40, message: null, typingOff: null, pastes: [], resume: null, mirror: false, entries }
   const first = instance(props)
   first.key('down')
   first.key('s3cr3t')
@@ -96,7 +96,7 @@ test('a typed value shows as dots with Show, or as text with Hide while the hook
     columns: 60,
     rows: 20,
     message: null,
-    typingOff: null, pastes: [], resume: null,
+    typingOff: null, pastes: [], resume: null, mirror: false,
     entries: [{ id: 'a', kind: 'secret', prompt: 'token', source: '', since: '04:00:00', length: 4, text, offer: null, chosen: null }],
   })
   const hidden = draw(props(null))
@@ -111,7 +111,7 @@ test('a typed value shows as dots with Show, or as text with Hide while the hook
 
 test("a paste the hooks made is taken in once and posted, so the hooks drop it", async () => {
   const entries = [{ id: 'a', kind: 'secret' as const, prompt: 'token', source: '', since: '04:00:00', length: 4, text: null, offer: null, chosen: null }]
-  const props: RequestsProps = { focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 20, message: null, typingOff: null, pastes: [], resume: null, entries }
+  const props: RequestsProps = { focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 20, message: null, typingOff: null, pastes: [], resume: null, mirror: false, entries }
   const list = instance(props)
   list.key('left')
   const pasted = { ...props, entries: [{ ...entries[0]!, length: 9 }], pastes: [{ seq: 3, id: 'a', at: 3, length: 5 }] }
@@ -129,7 +129,7 @@ test('every row is exactly as wide as the list, before the surface has laid out 
     columns: 60,
     rows: 40,
     message: 'A paste of 3+ lines or 800+ characters went into the prompt, not the request.',
-    typingOff: null, pastes: [], resume: null,
+    typingOff: null, pastes: [], resume: null, mirror: false,
     entries: [
       { id: 'a', kind: 'secret', prompt: '[sudo] password for alex', source: 'sudo -A systemctl restart foo', since: '04:00:00', length: 0, text: null, offer: null, chosen: null },
       {
@@ -156,7 +156,7 @@ test('a sign card draws its three buttons and a named key its row, each row as w
     applied: {},
     columns: 60,
     rows: 40,
-    message: null, typingOff: null, pastes: [], resume: null,
+    message: null, typingOff: null, pastes: [], resume: null, mirror: false,
     entries: [
       { id: 'g', kind: 'sign', prompt: 'Deploy key · deploy', source: 'git push', since: '04:00:00', length: 0, text: null, offer: null, chosen: null },
       { id: 'u', kind: 'secret', prompt: 'DB password', source: '', since: '04:00:01', length: 0, text: null, offer: LONG, chosen: 'e1' },
@@ -170,14 +170,14 @@ test('a sign card draws its three buttons and a named key its row, each row as w
 
 test('the rows fill the whole room, blank under the cards, so a shut menu leaves nothing behind', async () => {
   const entries = [{ id: 'u', kind: 'secret' as const, prompt: 'deploy token', source: '', since: '04:00:01', length: 0, text: null, offer: LONG, chosen: null }]
-  const rows = draw({ focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 40, message: null, typingOff: null, pastes: [], resume: null, entries })
+  const rows = draw({ focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 40, message: null, typingOff: null, pastes: [], resume: null, mirror: false, entries })
   expect(rows.length).toBe(40)
   expect(rows.slice(6).every(r => r.trim() === '')).toBe(true)
 })
 
 test('an open menu is a window over the rows under the field: Type, the entries, the cursor and where it is', async () => {
   const entries = [{ id: 'u', kind: 'secret' as const, prompt: 'deploy token', source: '', since: '04:00:01', length: 0, text: null, offer: LONG, chosen: null }]
-  const all = nodes({ focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 40, message: null, typingOff: null, pastes: [], resume: null, entries }, {
+  const all = nodes({ focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 40, message: null, typingOff: null, pastes: [], resume: null, mirror: false, entries }, {
     ...initialState(0, 'i'),
     selected: 'u',
     isFocused: true,
@@ -195,7 +195,7 @@ test('an open menu is a window over the rows under the field: Type, the entries,
 
 test('an overflowing list draws exactly its rows, the markers included', async () => {
   const entries = ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, kind: 'secret' as const, prompt: 'token ' + id, source: 'echo', since: '04:00:00', length: 0, text: null, offer: null, chosen: null }))
-  const rows = draw({ focusEpoch: 0, tabs: null, applied: {}, message: null, typingOff: null, pastes: [], resume: null, columns: 60, rows: 17, entries })
+  const rows = draw({ focusEpoch: 0, tabs: null, applied: {}, message: null, typingOff: null, pastes: [], resume: null, mirror: false, columns: 60, rows: 17, entries })
   expect(rows.length).toBe(17)
   expect(rows[16]!.trim()).toBe('▼ 3 more')
   for (const row of rows) expect([...row].length).toBe(60)

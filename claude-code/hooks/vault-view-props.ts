@@ -48,8 +48,9 @@ export type ValueEdit =
 /**
  * A plugin loaded after this one whose hooks see the calls that carry secrets (`carriers`): while one is not
  * allowed, nothing that would carry a secret through them runs. `refused`: it is refused from the next start.
+ * `changed`: it was allowed before, with other code.
  */
-export type Collision = { name: string; carriers: string[]; refused: boolean }
+export type Collision = { name: string; carriers: string[]; refused: boolean; changed: boolean }
 
 export type VaultAction =
   | { kind: 'collision'; name: string; decision: 'allow' | 'refuse' }
@@ -98,6 +99,8 @@ export type VaultProps = {
    * makes a new instance; it goes on from here.
    */
   resume: VaultResume | null
+  /** This instance is the sidebar's copy over a held one: it draws `resume` until it gets a click or a key. */
+  mirror: boolean
 }
 
 export type VaultMessage = {
@@ -111,4 +114,6 @@ export type VaultMessage = {
   formOpen: boolean
   /** The view's state for the next instance; every post from a drawn view carries it. */
   ui?: VaultResume
+  /** Posted by a copy that got a click or a key: the keyboard is with it now. */
+  claimed?: true
 }

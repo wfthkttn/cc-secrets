@@ -631,6 +631,19 @@ fn helpers_in_a_tree_that_can_change_are_copies_removed_when_the_relay_ends() {
 }
 
 #[test]
+fn a_second_daemon_on_the_socket_refuses_and_leaves_the_running_ones_helpers() {
+    let mut relay = Relay::start("second");
+    let other = data_dir("second-other");
+    let second = Command::new(RELAY).args(["daemon", "--socket"]).arg(&relay.daemon_socket).env("XDG_DATA_HOME", &other).output().unwrap();
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("another daemon answers"), "{}", String::from_utf8_lossy(&second.stderr));
+    assert!(relay.bin.join("secrets-mask-run").exists());
+    assert_eq!(stdout(&run(relay.mask_run("echo still pinned"))), "still pinned\n");
+    relay.stop();
+    assert!(!other.exists());
+}
+
+#[test]
 fn an_ask_names_the_calls_running_through_the_relay() {
     let mut relay = Relay::start("live");
     let other = relay.mask_run("sleep 1").spawn().unwrap();

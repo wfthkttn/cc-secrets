@@ -253,11 +253,13 @@ test('a card with no source command has no source row', async () => {
   expect(layout(entries, 60, null).map(r => r.kind)).toEqual(['cardTop', 'what', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
 })
 
+/** The ▾ at the end of a field offering vault entries, past its text and Show. */
+const ARROW = 4 + fieldRoom(FRAME.columns, true) + 5
 const OFFER = ['Prod DB · db', 'Deploy · deploy', 'S3 · s3', 'SMTP · smtp', 'Sentry · sentry', 'Grafana · grafana', 'GitHub · gh', 'Stage DB · db2'].map(
   (label, i) => ({ id: `e${i}`, label }),
 )
 
-test('a request naming its key holds that entry in its field: Session, Once, or Enter gives it; typing does nothing', async () => {
+test('a request naming its key holds that entry in its field: Session, Once, or Enter gives it; typing replaces it', async () => {
   const entries: RequestEntry[] = [{ ...entry('a', 'DB password'), offer: OFFER, chosen: 'e0' }]
   const rows = layout(entries, 60, null)
   expect(rows.map(r => r.kind).slice(-4)).toEqual(['pickTop', 'pick', 'pickBottom', 'cardBottom'])
@@ -267,17 +269,25 @@ test('a request naming its key holds that entry in its field: Session, Once, or 
   expect(onClick(START, entries, FRAME, at, session!.start + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'session', entry: 'e0' }])
   expect(onClick(START, entries, FRAME, at, once!.start + 1).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e0' }])
   expect(onKey(START, entries, FRAME, { key: 'return' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'once', entry: 'e0' }])
-  expect(onKey(START, entries, FRAME, { key: 'x' }).post).toBe(undefined)
-  expect(onKey(START, entries, FRAME, { key: 'backspace' }).post).toBe(undefined)
+  expect(onKey(START, entries, FRAME, { key: 'x' }).post?.edits).toEqual([
+    { seq: 1, id: 'a', kind: 'choose', entry: null },
+    { seq: 2, id: 'a', kind: 'insert', at: 0, text: 'x' },
+  ])
+  expect(onKey(START, entries, { ...FRAME, typingOff: 'off' }, { key: 'x' }).post).toBe(undefined)
 })
 
-test('a request naming no key is a bare field that takes typing; a click on it opens the menu: Type, then the entries', async () => {
+test('a request naming no key is a bare field that takes typing; a click in it types, its ▾ opens the menu: Type, then the entries', async () => {
   const entries: RequestEntry[] = [{ ...entry('a', 'deploy token'), offer: OFFER }]
   const rows = layout(entries, 60, null)
   expect(rows.map(r => r.kind)).toEqual(['cardTop', 'what', 'from', 'fieldTop', 'field', 'fieldBottom', 'cardBottom'])
   expect(onKey(START, entries, FRAME, { key: 'x' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'insert', at: 0, text: 'x' }])
   const field = rows.findIndex(r => r.kind === 'field')
-  const opened = onClick(START, entries, FRAME, field, 6).state
+  for (const y of [field - 1, field, field + 1]) {
+    const placed = onClick(START, entries, FRAME, y, 6).state
+    expect(placed).toMatchObject({ isMenuOpen: false, isFocused: true, selected: 'a' })
+    expect(onKey(placed, entries, FRAME, { key: 'x' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'insert', at: 0, text: 'x' }])
+  }
+  const opened = onClick(START, entries, FRAME, field, ARROW).state
   expect(opened).toMatchObject({ isMenuOpen: true, cursor: null, selected: 'a' })
   const menu = menuOf(entries, FRAME, opened)!
   expect(menu).toMatchObject({ id: 'a', top: field + 2, first: 0, shown: MENU_ROWS })
@@ -288,7 +298,7 @@ test('a request naming no key is a bare field that takes typing; a click on it o
 test('in the menu ↑/↓ move, Enter or a click chooses, Tab or a click outside shuts it', async () => {
   const entries: RequestEntry[] = [{ ...entry('a', 'deploy token'), offer: OFFER }]
   const field = layout(entries, 60, null).findIndex(r => r.kind === 'field')
-  const opened = onClick(START, entries, FRAME, field, 6).state
+  const opened = onClick(START, entries, FRAME, field, ARROW).state
   let state = opened
   for (let i = 0; i < 7; i++) state = onKey(state, entries, FRAME, { key: 'down' }).state
   expect(state.cursor).toBe('e6')
@@ -306,7 +316,9 @@ test('in the menu ↑/↓ move, Enter or a click chooses, Tab or a click outside
   expect(onClick(opened, entries, FRAME, 1, 3).state).toMatchObject({ isMenuOpen: false, pending: [] })
   expect(onKey(opened, entries, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(false)
   expect(onKey(START, entries, FRAME, { key: 'tab' }).state.isMenuOpen).toBe(true)
-  expect(onKey(opened, entries, FRAME, { key: 'x' }).post).toBe(undefined)
+  const typedOver = onKey(opened, entries, FRAME, { key: 'x' })
+  expect([typedOver.state.isMenuOpen, typedOver.post?.edits]).toEqual([true, [{ seq: 1, id: 'a', kind: 'insert', at: 0, text: 'x' }]])
+  expect(onKey(opened, entries, FRAME, { key: 'space' }).post?.edits).toEqual([{ seq: 1, id: 'a', kind: 'insert', at: 0, text: ' ' }])
 })
 
 test('Type in the menu turns a chosen entry back into a field that takes typing; the menu opens on what the field holds', async () => {
@@ -324,7 +336,7 @@ test('Type in the menu turns a chosen entry back into a field that takes typing;
 test('the menu cursor stays on its entry when the vault changes; with its entry gone, Enter chooses nothing', async () => {
   const entries: RequestEntry[] = [{ ...entry('a', 'deploy token'), offer: OFFER }]
   const field = layout(entries, 60, null).findIndex(r => r.kind === 'field')
-  let state = onClick(START, entries, FRAME, field, 6).state
+  let state = onClick(START, entries, FRAME, field, ARROW).state
   for (let i = 0; i < 3; i++) state = onKey(state, entries, FRAME, { key: 'down' }).state
   expect(state.cursor).toBe('e2')
   const shifted: RequestEntry[] = [{ ...entries[0]!, offer: OFFER.filter(o => o.id !== 'e0') }]
@@ -345,7 +357,7 @@ test("a choice comes from the hooks, so another instance's card (pop-out or draw
 test('a selected card that leaves the list leaves nothing selected: keys wait, an open menu shuts', async () => {
   const entries: RequestEntry[] = [entry('a', 'one'), { ...entry('b', 'two'), offer: OFFER }]
   const field = layout(entries, 60, null).findIndex(r => r.id === 'b' && r.kind === 'field')
-  const opened = onClick(START, entries, FRAME, field, 6).state
+  const opened = onClick(START, entries, FRAME, field, ARROW).state
   const left = [entries[0]!]
   for (const key of ['return', 'x', 'down']) {
     const result = onKey(opened, left, FRAME, { key })
@@ -387,7 +399,7 @@ test('the menu opens above its field when the room under it is short', async () 
   const entries: RequestEntry[] = [entry('a', 'p'), { ...entry('b', 'deploy token'), offer: OFFER }]
   const frame: Frame = { columns: 60, rows: 18, message: null, typingOff: null }
   const fieldTop = layout(entries, 60, null).findIndex(r => r.id === 'b' && r.kind === 'fieldTop')
-  const opened = onClick(START, entries, frame, fieldTop + 1, 6).state
+  const opened = onClick(START, entries, frame, fieldTop + 1, ARROW).state
   expect(menuOf(entries, frame, opened)!.top).toBe(fieldTop - 9)
 })
 

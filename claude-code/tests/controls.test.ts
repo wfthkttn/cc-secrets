@@ -12,6 +12,7 @@ import {
   hitAt,
   lengthAfter,
   type Line,
+  listKey,
   listRows,
   moveFocus,
   radios,
@@ -151,4 +152,18 @@ test('the keyboard moves in reading order: Tab through all, ↑/↓ by line keep
   expect(moveFocus(groups, 'gone', 'up')).toBe('f')
   expect(moveFocus(groups, 'gone', 'left')).toBe(null)
   expect(moveFocus(groups, 'a', 'x')).toBe(null)
+})
+
+test('an open list: ↑/↓ move within it, Enter picks, Tab shuts; over text every other key is the text, a pick-only list takes Space', async () => {
+  const text = { cursor: 1, count: 3, takesText: true }
+  expect(listKey({ key: 'up' }, text)).toEqual({ kind: 'cursor', cursor: 0 })
+  expect(listKey({ key: 'down' }, { ...text, cursor: 2 })).toEqual({ kind: 'cursor', cursor: 2 })
+  expect(listKey({ key: 'down' }, { ...text, cursor: -1 })).toEqual({ kind: 'cursor', cursor: 0 })
+  expect(listKey({ key: 'return' }, text)).toEqual({ kind: 'pick', index: 1 })
+  expect(listKey({ key: 'return' }, { ...text, cursor: -1 })).toBe(null)
+  expect(listKey({ key: 'tab' }, text)).toEqual({ kind: 'shut' })
+  for (const key of ['g', 'space', 'backspace', 'left', 'delete']) expect(listKey({ key }, text)).toEqual({ kind: 'text' })
+  const pickOnly = { ...text, takesText: false }
+  expect(listKey({ key: 'space' }, pickOnly)).toEqual({ kind: 'pick', index: 1 })
+  expect(listKey({ key: 'g' }, pickOnly)).toBe(null)
 })

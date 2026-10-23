@@ -295,6 +295,12 @@ async fn json_reply(stream: &mut Stream, reply: Option<serde_json::Value>) {
     }
 }
 
+/// The session a vault change came from, as the daemon's log names it.
+fn requester(ctx: &Context, session: Id, claude_code: i32) -> String {
+    let named = lock(ctx).sessions.get(&session).and_then(|s| s.named.clone());
+    format!("Claude Code pid {claude_code}, session {}", named.as_deref().unwrap_or("not named yet"))
+}
+
 /// Serves the session's socket until the session ends.
 async fn accept(mut listener: Listener, ctx: Shared, session: Id) {
     while let Ok(stream) = listener.accept().await {
@@ -322,10 +328,10 @@ async fn serve(mut stream: Stream, ctx: Shared, session: Id) {
         ("POST", "/ask") => pass::ask(&mut stream, &ctx, session, body).await,
         ("POST", "/filter") => filter::serve(&mut stream, &ctx, session, body).await,
         ("POST", "/answer") => pass::answer(&mut stream, &ctx, session, body).await,
-        ("POST", "/unlock") => locker::open(&mut stream, &ctx, body, false).await,
-        ("POST", "/create") => locker::open(&mut stream, &ctx, body, true).await,
-        ("POST", "/lock") => locker::close(&mut stream, &ctx).await,
-        ("POST", "/passphrase") => locker::rekey(&mut stream, &ctx, body).await,
+        ("POST", "/unlock") => locker::open(&mut stream, &ctx, body, false, &requester(&ctx, session, claude_code)).await,
+        ("POST", "/create") => locker::open(&mut stream, &ctx, body, true, &requester(&ctx, session, claude_code)).await,
+        ("POST", "/lock") => locker::close(&mut stream, &ctx, &requester(&ctx, session, claude_code)).await,
+        ("POST", "/passphrase") => locker::rekey(&mut stream, &ctx, body, &requester(&ctx, session, claude_code)).await,
         ("POST", "/session") => session_named(&mut stream, &ctx, session, body).await,
         ("POST", "/decide") => decided(&mut stream, &ctx, session, body).await,
         ("GET", "/vault") => {
@@ -469,6 +475,17 @@ fn pinned(mask_run: &Path, copies: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(copies.join(executable_name("secrets-mask-run")))
 }
 
+/// A socket file this daemon bound, removed when it ends.
+struct Bound(Option<PathBuf>);
+
+impl Drop for Bound {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Where this daemon copies its helpers.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps, reason = "the same signature as on Windows")]
@@ -588,12 +605,11 @@ fn passed_listener() -> Result<Option<std::os::unix::net::UnixListener>, String>
     }
 }
 
-/// The socket the service manager passed, else a fresh bind of `path` (mode 0600 on Unix); true when bound here, so the file
-/// is ours to remove.
-fn listener(path: &Path) -> Result<(Listener, bool), String> {
+/// The socket the service manager passed, else a fresh bind of `path` (mode 0600 on Unix). Inside the tokio runtime.
+fn listener(path: &Path) -> Result<(Listener, Bound), String> {
     #[cfg(unix)]
     if let Some(listener) = passed_listener()? {
-        return Listener::from_std(listener).map(|l| (l, false)).map_err(|e| e.to_string());
+        return Listener::from_std(listener).map(|l| (l, Bound(None))).map_err(|e| e.to_string());
     }
     if secrets::local::connect_blocking(path).is_ok() {
         return Err(format!("another daemon answers on {}", path.display()));
@@ -604,7 +620,7 @@ fn listener(path: &Path) -> Result<(Listener, bool), String> {
     let bound = Listener::bind(path).map_err(|error| format!("can't listen on {}: {error}", path.display()));
     #[cfg(unix)]
     rustix::process::umask(old);
-    bound.map(|l| (l, true))
+    bound.map(|l| (l, Bound(Some(path.to_owned()))))
 }
 
 /// No other process of the user, nor a core dump, can read this one's memory.
@@ -688,6 +704,25 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
         note(&format!("can't serve sessions beside {}: {error}", socket.display()));
         return ExitCode::FAILURE;
     }
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            note(&format!("can't start: {error}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    // first: until this daemon holds the socket, the helpers beside it may be a running daemon's
+    let bound = {
+        let _entered = runtime.enter();
+        listener(&socket)
+    };
+    let (mut listener, _bound) = match bound {
+        Ok(bound) => bound,
+        Err(error) => {
+            note(&error);
+            return ExitCode::FAILURE;
+        }
+    };
     let copies = match copies_dir(&socket, &exe) {
         Ok(dir) => dir,
         Err(error) => {
@@ -714,21 +749,7 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
         }
     };
     let vault = if vault_path.exists() { locker::Locker::Locked } else { locker::Locker::Absent };
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            note(&format!("can't start: {error}"));
-            return ExitCode::FAILURE;
-        }
-    };
     runtime.block_on(async move {
-        let (mut listener, is_ours) = match listener(&socket) {
-            Ok(bound) => bound,
-            Err(error) => {
-                note(&error);
-                return ExitCode::FAILURE;
-            }
-        };
         #[cfg(windows)]
         sweep_leftovers(&socket, &copies);
         let mut ending = match asked_to_end() {
@@ -755,9 +776,6 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
             }
         }
         lock(&ctx).sessions.clear();
-        if is_ours {
-            let _ = std::fs::remove_file(&socket);
-        }
         ExitCode::SUCCESS
     })
 }

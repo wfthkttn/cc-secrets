@@ -224,25 +224,31 @@ function sent(result: Result): ConfigMessage {
 
 const ConfigView: ClientModule<ConfigProps, ConfigState> = (props, surface) => {
   const { columns } = props
+  // A copy over a held instance keeps no state of its own and posts nothing until a click or a key claims it.
+  const isCopy = props.mirror && surface.state === undefined
+  const begin = () => surface.state ?? (props.resume === null ? initialState(Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
+  const post = (result: Result) => surface.post(isCopy ? { ...sent(result), claimed: true } : sent(result))
   surface.onPointer(p => {
     if (p.type !== 'down') return
-    const result = onClick(surface.state as ConfigState, props, p.y, p.x)
+    const result = onClick(begin(), props, p.y, p.x)
     surface.setState(result.state)
-    surface.post(sent(result))
+    post(result)
   })
   surface.onKey(k => {
-    const result = onKey(surface.state as ConfigState, props, k)
+    const result = onKey(begin(), props, k)
     surface.setState(result.state)
-    surface.post(sent(result))
+    post(result)
   })
-  let state = surface.state ?? (props.resume === null ? initialState(Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
+  let state = begin()
   const confirmed = confirm(state, props.confirmed[state.instance])
   if (confirmed !== null) state = confirmed
-  const pasted = withPastes(state, props)
-  if (state !== surface.state || pasted !== state) surface.setState(pasted)
-  // The hooks drop a paste once a post says it was taken in.
-  if (pasted !== state) surface.post(sent({ state: pasted }))
-  state = pasted
+  if (!isCopy) {
+    const pasted = withPastes(state, props)
+    if (state !== surface.state || pasted !== state) surface.setState(pasted)
+    // The hooks drop a paste once a post says it was taken in.
+    if (pasted !== state) surface.post(sent({ state: pasted }))
+    state = pasted
+  }
 
   const lines = drawPage(props, state).map(line => drawLine(surface.elements, fit(line, columns)))
   return surface.elements.Box({ flexDirection: 'column', width: columns, children: [...drawTabs(surface.elements, props.tabs, columns), ...lines] })

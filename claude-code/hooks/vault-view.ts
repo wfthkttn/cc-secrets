@@ -22,6 +22,7 @@ import {
   type Look,
   moveFocus,
   type Option,
+  listKey,
   radios,
   seg,
   showButton,
@@ -199,6 +200,7 @@ function collisionPage(collisions: readonly Collision[]): Drawn {
   const lines: Line[] = []
   for (const c of collisions) {
     lines.push(textLine(` ⚠ ${displayed(c.name)} sees secrets in ${c.carriers.join(', ')}`, { color: 'error' }))
+    if (c.changed && !c.refused) lines.push(textLine('   Its code changed since you allowed it.', { bold: true }))
     const notes = c.refused ? ['Blocked from the next session start.', 'The vault and typing stay off until then.'] : ['The vault and typing are off until you decide.']
     lines.push(...notes.map(note => textLine('   ' + note, { dimColor: true })))
     if (!c.refused) {
@@ -298,7 +300,7 @@ function listPage(props: VaultProps, state: ViewState): Drawn {
     { hit: 'rekey', label: 'Change passphrase' },
     { hit: 'lock', label: 'Lock vault', tone: 'danger' },
   ]
-  const lines: Line[] = [...buttonRows(buttons, state.focus), [], heading('Entries')]
+  const lines: Line[] = [...buttonRows(buttons, state.focus)]
   const groups: string[][] = [buttons.map(b => b.hit)]
   const nameColumns = Math.max(6, columns - 34)
   const columnsOf = (name: string, tag: string, kind: string) =>
@@ -573,10 +575,14 @@ export function onKey(state: ViewState, props: VaultProps, k: ClientKeyEvent): R
   if (page === 'collision') return { state }
   const isEnter = k.key === 'return' || k.key === '\n'
   if (state.open !== null) {
-    const count = listCount(props, state)
-    if (k.key === 'up' || k.key === 'down') return { state: { ...state, cursor: Math.max(0, Math.min(count - 1, state.cursor + (k.key === 'up' ? -1 : 1))) } }
-    if (isEnter || k.key === 'space') return choose(state, props, state.cursor)
-    if (k.key === 'tab') return { state: { ...state, open: null } }
+    const key = listKey(k, { cursor: state.cursor, count: listCount(props, state), takesText: state.open === 'tag' && state.focus === 'tag' })
+    if (key?.kind === 'cursor') return { state: { ...state, cursor: key.cursor } }
+    if (key?.kind === 'pick') return choose(state, props, key.index)
+    if (key?.kind === 'shut') return { state: { ...state, open: null } }
+    if (key?.kind === 'text') {
+      const typed = onKey({ ...state, open: null }, props, k)
+      return { ...typed, state: { ...typed.state, open: state.open } }
+    }
     return { state }
   }
   const form = state.form
@@ -686,30 +692,37 @@ function sent(result: Result): VaultMessage {
 
 const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const { columns } = props
+  // A copy over a held instance keeps no state of its own and posts nothing until a click or a key claims it.
+  const isCopy = props.mirror && surface.state === undefined
+  const begin = () => surface.state ?? startState(props, Math.random().toString(36).slice(2))
+  const posted = (result: Result, claimed: boolean): VaultMessage => (claimed ? { ...sent(result), claimed: true } : sent(result))
   surface.onPointer(p => {
-    const current = surface.state as ViewState
+    if (isCopy && p.type !== 'down') return
+    const current = begin()
     const result =
       p.type === 'down' ? onPress(current, props, p.y, p.x) : p.type === 'move' ? onDrag(current, props, p.y) : p.type === 'up' ? onRelease(current, props) : null
     if (result === null) return
     surface.setState(result.state)
-    surface.post(sent(result))
+    surface.post(posted(result, isCopy))
   })
   surface.onKey(k => {
-    const result = onKey(surface.state as ViewState, props, k)
+    const result = onKey(begin(), props, k)
     surface.setState(result.state)
-    surface.post(sent(result))
+    surface.post(posted(result, isCopy))
   })
   const isClosed = props.state !== 'open'
-  let state = surface.state ?? startState(props, Math.random().toString(36).slice(2))
+  let state = begin()
   const confirmed = confirm(state, props.applied[state.instance])
   if (confirmed !== null) state = confirmed
   if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, rekeying: false, open: null, formEpoch: props.formEpoch }
   if (state.isClosed !== isClosed) state = { ...state, isClosed, focus: isClosed ? 'passphrase' : 'add', confirming: null, open: null }
-  const pasted = withPastes(state, props)
-  if (state !== surface.state || pasted !== state) surface.setState(pasted)
-  // The hooks drop a paste once a post says it was taken in.
-  if (pasted !== state) surface.post(sent({ state: pasted }))
-  state = pasted
+  if (!isCopy) {
+    const pasted = withPastes(state, props)
+    if (state !== surface.state || pasted !== state) surface.setState(pasted)
+    // The hooks drop a paste once a post says it was taken in.
+    if (pasted !== state) surface.post(sent({ state: pasted }))
+    state = pasted
+  }
 
   const lines = shownPage(props, state).lines
   // Blank lines to the view's height, so nothing a longer page drew stays.

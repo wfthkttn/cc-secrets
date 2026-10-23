@@ -47,6 +47,7 @@ const PROPS: VaultProps = {
   formEpoch: 0,
   error: null,
   resume: null,
+  mirror: false,
 }
 const LOCKED: VaultProps = { ...PROPS, state: 'locked', entries: [], suggestions: [] }
 const START = initialState(0, 'v1')
@@ -152,6 +153,26 @@ test('a new instance, as each new transcript row makes, goes on from the state t
   expect(instance({ ...PROPS, resume: { ...ui, isClosed: false } }).draw({ ...PROPS, state: 'locked', resume: ui })[TAB_ROWS]).toMatch(/^ Vault locked/)
 })
 
+test("the sidebar's copy over a held instance draws what the held one posts, posts nothing, and a key claims it", async () => {
+  const held = instance(PROPS)
+  held.click('add')
+  held.key('G')
+  const shown = () => ({ ...PROPS, mirror: true, resume: held.posts.at(-1)!.ui! })
+  const copy = instance(shown())
+  held.key('o')
+  const rows = copy.draw(shown())
+  expect(rows[TAB_ROWS]).toMatch(/^ New entry/)
+  expect(rows.some(r => r.startsWith(' Name') && r.includes('Go'))).toBe(true)
+  expect(copy.posts).toEqual([])
+  copy.key('x')
+  expect(copy.posts.at(-1)!.claimed).toBe(true)
+  expect(copy.posts.at(-1)!.ui!.form?.name).toBe('Gox')
+  copy.draw({ ...shown(), mirror: false })
+  copy.key('!')
+  expect(copy.posts.at(-1)!.claimed).toBe(undefined)
+  expect(copy.posts.at(-1)!.ui!.form?.name).toBe('Gox!')
+})
+
 test('a locked vault: one passphrase field with Show, and Unlock; typing fills it, Enter or Unlock opens', async () => {
   const rows = draw(LOCKED, CLOSED)
   expectWidths(rows)
@@ -210,12 +231,11 @@ test('a held field edits at a caret too: the edits name where, a click places it
   expect(withPastes(clicked.state, { ...props, pastes: [{ seq: 4, field: 'again', at: 0, length: 6 }] }).caret).toBe(1)
 })
 
-test('the open vault: buttons, then the entries under a header, with each access a dropdown at the row end', async () => {
+test('the open vault: buttons, then the entries right under their column names, with each access a dropdown at the row end', async () => {
   const rows = draw(PROPS)
   expectWidths(rows)
   expect(rows[TAB_ROWS + 1]).toMatch(/^ │ \+ Add entry │ │ Change passphrase │ │ Lock vault │ +$/)
-  expect(rows).toContain(' Entries' + ' '.repeat(52))
-  expect(rows.find(r => r.startsWith(' Name'))).toMatch(/^ Name +Tag +Type +Access *$/)
+  expect(rows[TAB_ROWS + 3]).toMatch(/^ Name +Tag +Type +Access *$/)
   expect(rows.find(r => r.startsWith(' Prod DB'))).toMatch(/^ Prod DB +db +Password +\[ Allow   ▾ \] $/)
   expect(rows.find(r => r.startsWith(' Deploy'))).toMatch(/^ Deploy +deploy +Token +\[ Ask     ▾ \] $/)
   expect(rows.some(r => r.startsWith('   Drag a row or press Shift+↑/↓ to reorder'))).toBe(true)
@@ -303,6 +323,9 @@ test("the tag dropdown lists what agents ask for, each with what asks, then the 
   expectWidths(rows)
   expect(rows.some(r => r.includes('sudo') && r.includes('sudo -A asks for your password'))).toBe(true)
   expect(rows.some(r => r.includes('▸ Custom tag…'))).toBe(true)
+  const typedInto = keys(opened.state, ['g', 'i', 't'])
+  expect([typedInto.open, typedInto.form?.tag]).toEqual(['tag', 'git'])
+  expect(draw(PROPS, typedInto).some(r => r.includes('▸ Custom tag…'))).toBe(true)
   const picked = click(opened.state, 'pick:0').state
   expect(picked.form?.tag).toBe('sudo')
   expect(draw(PROPS, picked).some(r => r.startsWith(' Tag     [ sudo · sudo -A asks for your password'))).toBe(true)
@@ -436,10 +459,14 @@ test('a page taller than the view scrolls to keep the focus in view', async () =
 })
 
 test('a colliding plugin replaces the vault with what it hooks and Allow / Block; keys do nothing there', async () => {
-  const props = { ...PROPS, collisions: [{ name: 'tracer', carriers: ['http.fetch'], refused: false }] }
+  const props = { ...PROPS, collisions: [{ name: 'tracer', carriers: ['http.fetch'], refused: false, changed: false }] }
   const rows = draw(props)
   expectWidths(rows)
   expect(rows[TAB_ROWS]).toContain('⚠ tracer sees secrets in http.fetch')
+  expect(rows.some(r => r.includes('code changed'))).toBe(false)
+  const changed = draw({ ...props, collisions: [{ ...props.collisions[0]!, changed: true }] })
+  expect(changed[TAB_ROWS + 1]).toContain('Its code changed since you allowed it.')
+  expectWidths(changed)
   expect(rows.some(r => r.includes('│ Block │'))).toBe(true)
   expect(rows.some(r => r.includes('+ Add entry'))).toBe(false)
   expect(actionOf(click(START, 'allow:tracer', props))).toEqual({ kind: 'collision', name: 'tracer', decision: 'allow' })

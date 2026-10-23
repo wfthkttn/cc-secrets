@@ -73,6 +73,11 @@ export function askDecision(ask: Requester & { entry: Granted | null }, calls: C
   return call !== undefined && ask.entry !== null && ask.entry.access === 'allowed' ? 'give' : 'card'
 }
 
+/** The entry an ask's tag names, as the daemon picks it: the first with that tag that is not an SSH key. */
+export function taggedEntry<E extends { tag: string; kind: string }>(tag: string | null, entries: readonly E[]): E | undefined {
+  return tag === null ? undefined : entries.find(e => e.tag === tag && e.kind !== 'ssh-key')
+}
+
 /**
  * Where a paste into the list goes: the selected card's typed value, else the prompt, when no card is selected or the
  * card takes no typing (a sign card, a vault entry in its field, typing off).

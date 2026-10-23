@@ -4,7 +4,8 @@ import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from '
 import { appliedText, SUGGESTED, withText } from './auto-mode'
 import type { ConfigAction, ConfigMessage, ConfigProps, ConfigResume } from './config-view-props'
 import { editText, END_CARET, type PasteMark } from './controls'
-import { allowKey, carriersSeen } from './guard'
+import { codeIdentity } from './code-id'
+import { allowedName, allowKey, carriersSeen } from './guard'
 import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
@@ -12,7 +13,7 @@ import type { ListResume, Offered, RequestEntry, RequestPaste, RequestsMessage, 
 import { failureKind } from './relay-failure'
 import { pathWith } from './session-path'
 import { fillSlot, hasSlot } from './slot'
-import { askDecision, pasteTarget, requestSource, runsIn, signDecision } from './source'
+import { askDecision, pasteTarget, requestSource, runsIn, signDecision, taggedEntry } from './source'
 import { type Tab, TAB_ROWS, type Tabs } from './tabs'
 import { drawPage as configLines } from './config-view'
 import { contentRows } from './vault-view'
@@ -176,12 +177,24 @@ let configPastes: readonly PasteMark[] = []
 let focusEpoch = 0
 /** The value typed or pasted for each request; the lists only learn its length. */
 const held = new Map<string, string>()
+/** The asks shown as cards, by request id: decided again when the vault opens, since a closed one names no entry. */
+const carded = new Map<string, Asked>()
 /** The caret in the selected request's value, from the list that last had the keyboard; where a paste goes. */
 let listCaret = 0
 /** Pastes into requests' values, kept until a list's post says it took them in. */
 let requestPastes: readonly RequestPaste[] = []
 /** The requests whose typed value the person asked to see in plain text. */
 const requestPeek = new Set<string>()
+
+/**
+ * Keeps the views that have the keyboard on their row while new rows come, so the keys stay with them; a copy that
+ * got a click or a key (`claimed`) has the keyboard now, and the hold moves to its row.
+ */
+async function holdKeys($: EngineInterface, claimed: boolean) {
+  if (claimed) await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: false })
+  await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: true })
+  trace($, `held${claimed ? ' (moved to a claimed copy)' : ''}`)
+}
 
 function togglePeek<T>(peeking: Set<T>, key: T) {
   if (peeking.has(key)) peeking.delete(key)
@@ -209,8 +222,8 @@ let listFocused = false
 /** The prompt's draft while the list holds the keyboard; a different draft at the prompt's next key or submit means a paste landed there unseen. */
 let draftAtFocus: string | null = null
 let listSelected: string | null = null
-/** Plugins loaded after this one that hook a call carrying secrets, until allowed; `events` are their hook patterns. */
-let collisions: readonly (Collision & { events: readonly string[] })[] = []
+/** Plugins loaded after this one that hook a call carrying secrets, until allowed; `code` is their code identity. */
+let collisions: readonly (Collision & { code: string })[] = []
 /** Made at session start, where the hooks first have `$` for its timers. */
 let popouts: Popouts | null = null
 /** Shown above the cards; a sticky one stays until its ✕, any other also goes on the next action or after `NOTICE_MS`. */
@@ -225,6 +238,13 @@ function randomId(): string {
 function clockTime(): string {
   return new Date().toTimeString().slice(0, 8)
 }
+
+/** A line in the debug log (`claude --debug-file`): kinds, ids and timing only, never typed text or a key's character. */
+function trace($: EngineInterface, line: string) {
+  $.ui.log(`trace ${new Date().toISOString().slice(11, 23)} ${line}`, { to: 'debug' })
+}
+/** The last slot fill traced, so a redraw of the same one adds no line. */
+let tracedFill = ''
 
 function livePopouts(): Popouts {
   if (popouts === null) throw new Error('secrets: pop-outs used before session start')
@@ -286,17 +306,29 @@ export function register(on: On) {
   // Judges the plugins loaded after this one (those before it are out of reach): one whose hooks see a call that
   // carries secrets loads, but shows as a collision until allowed, and is refused from the next start once refused.
   on('plugin.register', async ($, e, next) => {
-    collisions = collisions.filter(c => c.name !== e.name)
-    const carriers = carriersSeen(e.uses.events)
-    if (carriers.length === 0) return next(e)
-    if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
-      return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (blocked in the Vault tab)` }
+    try {
+      collisions = collisions.filter(c => c.name !== e.name)
+      const carriers = carriersSeen(e.uses.events)
+      if (carriers.length === 0) return next(e)
+      if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
+        return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (blocked in the Vault tab)` }
+      }
+      const code = await codeIdentity(e.root, {
+        list: dir => $.fs.list(dir),
+        stat: path => $.fs.stat(path, { resolve: true }),
+        bytes: async path => (await $.fs.read(path, { as: 'bytes' })).base64,
+      })
+      const allowed = await storedList($, 'allowedPlugins')
+      const isAllowed = allowed.includes(allowKey(e.name, code))
+      const changed = allowed.some(key => allowedName(key) === e.name)
+      const decided = await next(e)
+      // A judge beneath may still refuse it: only a plugin that loads collides.
+      if (decided.allow === true && !isAllowed) collisions = [...collisions, { name: e.name, carriers, refused: false, changed, code }]
+      return decided
+    } finally {
+      // At startup the vault's tab is not registered yet; session.start sets the badge then.
+      if (popouts !== null) await setBadge($)
     }
-    const isAllowed = (await storedList($, 'allowedPlugins')).includes(allowKey(e.name, e.uses.events))
-    const decided = await next(e)
-    // A judge beneath may still refuse it: only a plugin that loads collides.
-    if (decided.allow === true && !isAllowed) collisions = [...collisions, { name: e.name, carriers, refused: false, events: e.uses.events }]
-    return decided
   }).catch(($, e, next) => (next.called ? next(e) : { refuse: "secrets couldn't check what it hooks" }))
 
   on('session.start', async ($, e, next) => {
@@ -308,7 +340,7 @@ export function register(on: On) {
     if (tool !== VAULT_TOOL) throw new Error(`secrets: the vault tool registered as ${tool}, not ${VAULT_TOOL}`)
     // A reload starts with no requests until the daemon sends the waiting ones again; the host still shows what the
     // old module set.
-    await $.sidebar.badge({ id: SIDEBAR_ID, count: 0, level: 'urgent' })
+    await setBadge($)
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
     maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
     unlockAtStart = await option($, 'unlockAtStart', true)
@@ -397,6 +429,10 @@ export function register(on: On) {
   }).catch(() => ({ deny: 'secrets: masking this tool call failed, so its result is withheld' }))
 
   on('ui.message', async ($, e, next) => {
+    if (e.element === VAULT_KEY || e.element === CONFIG_KEY || e.element === LIST_KEY || e.element === POPOUT_KEY) {
+      const posted = e.data as { instance?: string; edits?: { kind: string }[]; claimed?: true }
+      trace($, `message ${e.element} instance=${posted.instance} edits=${(posted.edits ?? []).map(x => x.kind).join(',') || '-'}${posted.claimed ? ' claimed' : ''}`)
+    }
     if (e.element === VAULT_KEY || e.element === CONFIG_KEY) {
       if (!listFocused) draftAtFocus = (await $.prompt.read()).text
       listFocused = true
@@ -405,6 +441,7 @@ export function register(on: On) {
       keyboardOn = e.element === VAULT_KEY ? 'vault' : 'config'
       if (e.element === VAULT_KEY) {
         const message = e.data as VaultMessage
+        await holdKeys($, message.claimed === true)
         if (message.ui !== undefined) {
           vaultResume = message.ui
           const taken = message.ui.pasted
@@ -413,6 +450,7 @@ export function register(on: On) {
         await onVaultMessage($, message)
       } else {
         const message = e.data as ConfigMessage
+        await holdKeys($, message.claimed === true)
         if (message.ui !== undefined) {
           configResume = message.ui
           const taken = message.ui.pasted
@@ -425,6 +463,7 @@ export function register(on: On) {
     }
     if (e.element !== LIST_KEY && e.element !== POPOUT_KEY) return next(e)
     const message = e.data as RequestsMessage
+    await holdKeys($, message.claimed === true)
     if (message.ui !== undefined) {
       listResume = { ...listResume, [e.element]: message.ui }
       const taken = message.ui.pasted
@@ -489,9 +528,12 @@ export function register(on: On) {
 
   on('prompt.edit', async ($, e, next) => {
     if (e.key !== undefined) {
+      trace($, `key at the prompt (a view had it: ${listFocused})`)
       if (listFocused && e.text !== draftAtFocus) say($, UNSEEN_PASTE, false)
       listFocused = false
       draftAtFocus = null
+      // A key reaches the prompt only once no view has the keyboard: nothing is left to hold.
+      await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: false })
       livePopouts().blur()
       if (requests.length > 0) {
         focusEpoch += 1
@@ -599,6 +641,7 @@ export function register(on: On) {
     if (!inDrawer && !inPopout) return tree
     const room = await $.sidebar.room({})
     if (room === null) return tree
+    const mirror = await $.sidebar.mirrored({ component: e.component, requestId: e.requestId })
     const { Client } = $.ui.resolve(e)
     const list = (key: string, shown: readonly Request[], columns: number, rows: number, tabs: Tabs | null) => {
       const entries: RequestEntry[] = shown.map(request => {
@@ -617,7 +660,7 @@ export function register(on: On) {
       const tabRows = tabs === null ? 0 : TAB_ROWS
       const height = listHeight(entries, columns, message, rows - tabRows)
       const pastes = requestPastes.filter(p => shown.some(r => r.id === p.id))
-      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height, pastes, resume: listResume[key] ?? null }
+      const props: RequestsProps = { entries, tabs, focusEpoch, applied, message, typingOff: typingOff(), columns, rows: height, pastes, resume: listResume[key] ?? null, mirror }
       return Client({ key, module: './requests.ts', props, width: columns, height: height + tabRows })
     }
     // The vault and config views get the whole room to lay out in, and are as tall as what they show.
@@ -625,7 +668,7 @@ export function register(on: On) {
       const room = rows - VAULT_SPARE_ROWS
       const props: VaultProps = {
         state: vault.state,
-        collisions: collisions.map(({ name, carriers, refused }) => ({ name, carriers, refused })),
+        collisions: collisions.map(({ name, carriers, refused, changed }) => ({ name, carriers, refused, changed })),
         entries: vault.entries.map(({ created: _created, ...entry }) => entry),
         suggestions: [...vault.suggestions],
         tagChoices: tagChoices(),
@@ -640,6 +683,7 @@ export function register(on: On) {
         formEpoch,
         error: vaultError,
         resume: vaultResume,
+        mirror,
       }
       const height = Math.min(room, TAB_ROWS + contentRows(props))
       return Client({ key: VAULT_KEY, module: './vault-view.ts', props, width: columns, height })
@@ -658,9 +702,15 @@ export function register(on: On) {
         maskMinLength,
         error: configError,
         resume: configResume,
+        mirror,
       }
       const height = Math.min(room, TAB_ROWS + configLines(props, { focus: 'text', pending: [], caret: END_CARET }).length)
       return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })
+    }
+    const fill = `fill ${e.component}:${e.requestId} drawer=${inDrawer} popout=${inPopout} mirror=${mirror} tab=${drawerTab} cards=${requests.length}`
+    if (fill !== tracedFill) {
+      tracedFill = fill
+      trace($, fill)
     }
     let filled = tree
     if (inDrawer) {
@@ -768,19 +818,25 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
       const event = JSON.parse(buffered.slice(0, newline)) as RelayEvent
       buffered = buffered.slice(newline + 1)
       newline = buffered.indexOf('\n')
+      trace($, `relay ${Object.keys(event)[0]}${'ask' in event ? ' ' + event.ask.id : 'gone' in event ? ' ' + event.gone : ''}`)
       if ('ready' in event) {
         if (typeof event.bin !== 'string') throw new Error("secrets: the daemon's ready event has no bin, the directory of the helpers it serves")
         ready({ state: event.vault, socket: event.ready, agent: event.agent, bin: event.bin })
       } else if ('ask' in event) await onAsk($, event.ask)
       else if ('gone' in event) dropRequest(event.gone)
       else if ('sign' in event) await onSign($, event.sign)
-      else if ('vault' in event) await refreshVault($)
+      else if ('vault' in event) {
+        const wasOpen = vault.state === 'open'
+        await refreshVault($)
+        if (!wasOpen && vault.state === 'open') await giveCarded($)
+      }
       else if ('masking' in event) masking = event.masking
       else if ('masked' in event) {
         hasMasked = true
         await $.state.set({ plugin: 'secrets', key: 'hasMasked' }, true)
       } else say($, event.trouble, true)
       await syncBadge($)
+      trace($, `relay event handled, ${requests.length} waiting`)
     }
   }
   throw new Error('the attach to the secrets daemon ended')
@@ -816,6 +872,7 @@ async function onAsk($: EngineInterface, ask: Asked) {
   if (ask.tag !== null && ask.entry === null && !askedTags.includes(ask.tag)) askedTags = [...askedTags, ask.tag]
   const calls = callsBy(ask)
   const decision = askDecision(ask, calls)
+  trace($, `ask ${ask.id}: ${decision}`)
   if (decision === 'refuse') {
     const source = requestSource(ask, calls.map(r => r.command))
     // Refused, the asking program fails at once; one already gone needs no answer.
@@ -837,7 +894,22 @@ async function onAsk($: EngineInterface, ask: Asked) {
   // A give that fails leaves the program waiting: it gets the card instead.
   if (decision === 'give' && ask.entry !== null && (await answerRequest($, request, { entry: ask.entry.id, session: false }))) return
   await addRequest($, request)
+  carded.set(request.id, ask)
+  trace($, `ask ${ask.id}: card listed`)
   await $.ui.notify(`Password needed: ${ask.prompt}`, { title: 'secrets' })
+  trace($, `ask ${ask.id}: notified`)
+}
+
+/** Answers the cards whose tag names an entry the session allows, as an ask made with the vault open would have been. */
+async function giveCarded($: EngineInterface) {
+  for (const request of requests) {
+    const ask = carded.get(request.id)
+    const entry = ask === undefined ? undefined : taggedEntry(ask.tag, vault.entries)
+    if (ask === undefined || entry === undefined) continue
+    if (askDecision({ ...ask, entry: { access: entry.access } }, callsBy(ask)) === 'give') {
+      await answerRequest($, request, { entry: entry.id, session: false })
+    }
+  }
 }
 
 /** Why a request was refused: the session refuses its entry, else it is, or may be, a subagent's. */
@@ -933,6 +1005,7 @@ type Answer = { secret: string } | { cancel: true } | { entry: string; session: 
 /** True once the relay took the answer, or the asking program had gone; otherwise the reason shows. */
 async function answerRequest($: EngineInterface, request: Request, answer: Answer): Promise<boolean> {
   const reply = await callRelay($, 'POST', '/answer', { id: request.id, ...answer })
+  trace($, `answer ${request.id} (${'cancel' in answer ? 'cancel' : 'entry' in answer ? 'entry' : `typed, ${[...answer.secret].length} chars`}): ${reply?.status ?? 'not sent'}`)
   if (reply === null) return false
   // 410: the asking program went away first.
   if (reply.status !== 204 && reply.status !== 410) {
@@ -1017,20 +1090,23 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
 }
 
 /**
- * Allow keeps the plugin with exactly the hooks it has now, so a change to them asks again; Refuse keeps its name,
- * and it is refused when it loads from the next start on (it stays a collision until then).
+ * Allow keeps the plugin with exactly the code it has now, in place of any it was allowed with before, so a change
+ * to it asks again; Refuse keeps its name, and it is refused when it loads from the next start on (it stays a
+ * collision until then).
  */
 async function decideCollision($: EngineInterface, name: string, decision: 'allow' | 'refuse') {
   const collision = collisions.find(c => c.name === name)
   if (collision === undefined) return
   if (decision === 'allow') {
-    await $.store.set('allowedPlugins', [...(await storedList($, 'allowedPlugins')), allowKey(name, collision.events)])
+    const others = (await storedList($, 'allowedPlugins')).filter(key => allowedName(key) !== name)
+    await $.store.set('allowedPlugins', [...others, allowKey(name, collision.code)])
     collisions = collisions.filter(c => c.name !== name)
   } else {
     const refused = await storedList($, 'refusedPlugins')
     if (!refused.includes(name)) await $.store.set('refusedPlugins', [...refused, name])
     collisions = collisions.map(c => (c.name === name ? { ...c, refused: true } : c))
   }
+  await setBadge($)
 }
 
 /** Unlocks the vault with the typed passphrase, or creates it when there is none; the passphrase fields empty either way. */
@@ -1167,15 +1243,21 @@ async function decideRequest($: EngineInterface, id: string, decision: Decision)
 function dropRequest(id: string) {
   requests = requests.filter(r => r.id !== id)
   held.delete(id)
+  carded.delete(id)
   requestPeek.delete(id)
   choices.delete(id)
   if (listSelected === id) listSelected = null
   livePopouts().remove(id)
 }
 
-/** The badge shows the waiting requests; with none left, an open list closes, the vault view stays. */
+/** What waits on the person: requests, and plugins to Allow or Refuse while they keep tools off. */
+async function setBadge($: EngineInterface) {
+  await $.sidebar.badge({ id: SIDEBAR_ID, count: requests.length + collisions.filter(c => !c.refused).length, level: 'urgent' })
+}
+
+/** The badge follows the waiting requests; with none left, an open list closes, the vault view stays. */
 async function syncBadge($: EngineInterface) {
   $.ui.invalidate('ui.render')
-  await $.sidebar.badge({ id: SIDEBAR_ID, count: requests.length, level: 'urgent' })
+  await setBadge($)
   if (requests.length === 0 && drawerTab === 'requests' && (await $.sidebar.selected({})) === SIDEBAR_ID) await $.sidebar.select({ id: null })
 }

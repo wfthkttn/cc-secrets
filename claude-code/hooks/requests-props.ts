@@ -63,6 +63,8 @@ export type RequestsProps = {
   pastes: RequestPaste[]
   /** The state the last instance posted; a new instance (each new transcript row makes one) goes on from here. */
   resume: ListResume | null
+  /** This instance is the sidebar's copy over a held one: it draws `resume` until it gets a click or a key. */
+  mirror: boolean
 }
 
 /**
@@ -78,4 +80,6 @@ export type RequestsMessage = {
   caret: number
   /** The list's state for the next instance; every post from a drawn list carries it. */
   ui?: ListResume
+  /** Posted by a copy that got a click or a key: the keyboard is with it now. */
+  claimed?: true
 }

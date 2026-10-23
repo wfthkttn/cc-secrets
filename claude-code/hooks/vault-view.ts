@@ -300,7 +300,7 @@ function listPage(props: VaultProps, state: ViewState): Drawn {
     { hit: 'rekey', label: 'Change passphrase' },
     { hit: 'lock', label: 'Lock vault', tone: 'danger' },
   ]
-  const lines: Line[] = [...buttonRows(buttons, state.focus), [], heading('Entries')]
+  const lines: Line[] = [...buttonRows(buttons, state.focus)]
   const groups: string[][] = [buttons.map(b => b.hit)]
   const nameColumns = Math.max(6, columns - 34)
   const columnsOf = (name: string, tag: string, kind: string) =>

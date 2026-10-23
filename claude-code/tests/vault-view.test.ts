@@ -231,12 +231,11 @@ test('a held field edits at a caret too: the edits name where, a click places it
   expect(withPastes(clicked.state, { ...props, pastes: [{ seq: 4, field: 'again', at: 0, length: 6 }] }).caret).toBe(1)
 })
 
-test('the open vault: buttons, then the entries under a header, with each access a dropdown at the row end', async () => {
+test('the open vault: buttons, then the entries right under their column names, with each access a dropdown at the row end', async () => {
   const rows = draw(PROPS)
   expectWidths(rows)
   expect(rows[TAB_ROWS + 1]).toMatch(/^ │ \+ Add entry │ │ Change passphrase │ │ Lock vault │ +$/)
-  expect(rows).toContain(' Entries' + ' '.repeat(52))
-  expect(rows.find(r => r.startsWith(' Name'))).toMatch(/^ Name +Tag +Type +Access *$/)
+  expect(rows[TAB_ROWS + 3]).toMatch(/^ Name +Tag +Type +Access *$/)
   expect(rows.find(r => r.startsWith(' Prod DB'))).toMatch(/^ Prod DB +db +Password +\[ Allow   ▾ \] $/)
   expect(rows.find(r => r.startsWith(' Deploy'))).toMatch(/^ Deploy +deploy +Token +\[ Ask     ▾ \] $/)
   expect(rows.some(r => r.startsWith('   Drag a row or press Shift+↑/↓ to reorder'))).toBe(true)

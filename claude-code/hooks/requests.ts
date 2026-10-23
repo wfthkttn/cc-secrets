@@ -1,6 +1,6 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
-import { caretAfter, caretAt, caretText, editText, END_CARET, lengthAfter, type TextEdit, textKey } from './controls'
+import { caretAfter, caretAt, caretText, editText, END_CARET, lengthAfter, listKey, type TextEdit, textKey } from './controls'
 import { cells, clip, displayed, pad, rowsOf } from './display'
 import type { Edit, Offered, RequestEntry, RequestsMessage, RequestsProps } from './requests-props'
 import { drawTabs, type Tab, TAB_ROWS, tabAt } from './tabs'
@@ -340,6 +340,12 @@ function choose(state: ListState, entry: RequestEntry, index: number): Result {
   return withEdit({ ...state, isMenuOpen: false }, entry.id, { id: entry.id, kind: 'choose', entry: chosen })
 }
 
+/** A typed key on a card: a vault entry in its field gives way to typing first, as Type in the menu would. */
+function typeInto(state: ListState, entries: RequestEntry[], frame: Frame, entry: RequestEntry, k: ClientKeyEvent): Result {
+  const typing = choiceOf(entry, state.pending) === null ? state : choose(state, entry, 0).state
+  return onKey({ ...typing, isMenuOpen: false }, entries, frame, k)
+}
+
 export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k: ClientKeyEvent): Result {
   const selected = selectedOf(state, entries)
   if (selected === null) {
@@ -357,11 +363,15 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
     // A menu no longer drawn takes the key that finds it gone, rather than let it act on a card unseen.
     if (menu === null) return { state: { ...state, isMenuOpen: false } }
     const ids = optionIds(entry)
-    // With the highlighted entry gone, an arrow starts again from Type.
-    if (k.key === 'up') return { state: { ...state, cursor: ids[Math.max(0, menu.cursor - 1)]! } }
-    if (k.key === 'down') return { state: { ...state, cursor: ids[menu.cursor < 0 ? 0 : Math.min(offer.length, menu.cursor + 1)]! } }
-    if (isEnter) return menu.cursor < 0 ? { state } : choose(state, entry, menu.cursor)
-    if (k.key === 'tab') return { state: { ...state, isMenuOpen: false } }
+    // With the highlighted entry gone (cursor -1), an arrow starts again from Type.
+    const key = listKey(k, { cursor: menu.cursor, count: ids.length, takesText: entry.kind === 'secret' && frame.typingOff === null })
+    if (key?.kind === 'cursor') return { state: { ...state, cursor: ids[key.cursor]! } }
+    if (key?.kind === 'pick') return choose(state, entry, key.index)
+    if (key?.kind === 'shut') return { state: { ...state, isMenuOpen: false } }
+    if (key?.kind === 'text') {
+      const typed = typeInto(state, entries, frame, entry, k)
+      return { ...typed, state: { ...typed.state, isMenuOpen: true, cursor: null } }
+    }
     return { state }
   }
   // Escape never reaches a Client and ↑/↓ move between cards, so Tab opens the menu.
@@ -373,8 +383,9 @@ export function onKey(state: ListState, entries: RequestEntry[], frame: Frame, k
   if (to !== undefined) return selectCard(state, entries, frame, entries[Math.max(0, Math.min(entries.length - 1, to))]!.id)
   if (entry.kind === 'sign') return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: null }) : { state }
   const chosen = choiceOf(entry, state.pending)
-  if (chosen !== null) return isEnter ? withEdit(state, selected, { id: selected, kind: 'once', entry: chosen.id }) : { state }
+  if (chosen !== null && isEnter) return withEdit(state, selected, { id: selected, kind: 'once', entry: chosen.id })
   if (frame.typingOff !== null) return { state }
+  if (chosen !== null) return textKey(k, 0, 0) === null ? { state } : typeInto(state, entries, frame, entry, k)
   if (isEnter) return withEdit(state, selected, { id: selected, kind: 'submit' })
   if (k.ctrl && k.key === 'r') return withEdit(state, selected, { id: selected, kind: 'peek' })
   const change = textKey(k, state.caret, shownLength(entry, state.pending))

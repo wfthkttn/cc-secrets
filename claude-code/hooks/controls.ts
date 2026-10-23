@@ -249,6 +249,24 @@ export function textKey(k: ClientKeyEvent, caret: number, length: number): TextE
   return { kind: 'insert', at, text: k.key }
 }
 
+/** What a key does to an open list: moves its highlight, picks, shuts it, or goes to the field's text (`text`). */
+export type ListKey = { kind: 'cursor'; cursor: number } | { kind: 'pick'; index: number } | { kind: 'shut' } | { kind: 'text' } | null
+
+/**
+ * The one behaviour of every open list, over a field that takes text (`takesText`: a tag, a request's value) or none
+ * (a pick-only one): ↑/↓ move the highlight within `count` options, Enter picks it, Tab shuts the list; on a text
+ * field every other key is the text's, the list left open, while a pick-only list takes Space as a pick and drops the
+ * rest. A `cursor` of -1 is no option highlighted. Null: the key does nothing.
+ */
+export function listKey(k: ClientKeyEvent, list: { cursor: number; count: number; takesText: boolean }): ListKey {
+  if (k.key === 'up' || k.key === 'down') {
+    return { kind: 'cursor', cursor: Math.max(0, Math.min(list.count - 1, list.cursor + (k.key === 'up' ? -1 : 1))) }
+  }
+  if (k.key === 'return' || k.key === '\n' || (!list.takesText && k.key === 'space')) return list.cursor < 0 ? null : { kind: 'pick', index: list.cursor }
+  if (k.key === 'tab') return { kind: 'shut' }
+  return list.takesText && textKey(k, 0, 0) !== null ? { kind: 'text' } : null
+}
+
 /** The text after the edit; an index past the end counts as the end. */
 export function editText(text: string, edit: TextEdit): string {
   if (edit.kind === 'clear') return ''

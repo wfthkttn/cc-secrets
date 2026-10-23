@@ -22,6 +22,7 @@ import {
   type Look,
   moveFocus,
   type Option,
+  listKey,
   radios,
   seg,
   showButton,
@@ -574,14 +575,13 @@ export function onKey(state: ViewState, props: VaultProps, k: ClientKeyEvent): R
   if (page === 'collision') return { state }
   const isEnter = k.key === 'return' || k.key === '\n'
   if (state.open !== null) {
-    const count = listCount(props, state)
-    if (k.key === 'up' || k.key === 'down') return { state: { ...state, cursor: Math.max(0, Math.min(count - 1, state.cursor + (k.key === 'up' ? -1 : 1))) } }
-    if (isEnter || k.key === 'space') return choose(state, props, state.cursor)
-    if (k.key === 'tab') return { state: { ...state, open: null } }
-    // Typing over the open tag list writes the person's own tag, as on the shut field, and the list stays open.
-    if (state.open === 'tag' && state.focus === 'tag' && textKey(k, state.caret, 0) !== null) {
+    const key = listKey(k, { cursor: state.cursor, count: listCount(props, state), takesText: state.open === 'tag' && state.focus === 'tag' })
+    if (key?.kind === 'cursor') return { state: { ...state, cursor: key.cursor } }
+    if (key?.kind === 'pick') return choose(state, props, key.index)
+    if (key?.kind === 'shut') return { state: { ...state, open: null } }
+    if (key?.kind === 'text') {
       const typed = onKey({ ...state, open: null }, props, k)
-      return { ...typed, state: { ...typed.state, open: 'tag' } }
+      return { ...typed, state: { ...typed.state, open: state.open } }
     }
     return { state }
   }

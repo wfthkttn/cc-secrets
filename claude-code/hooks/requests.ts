@@ -418,9 +418,10 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   if (row.kind === 'field' && x >= showStart && x < showStart + SHOW_COLUMNS && takesTyping(entry, state.pending, frame)) {
     return withEdit(state, row.id, { id: row.id, kind: 'peek' })
   }
-  // A click on the field, whatever it holds, opens its menu.
-  if (isField && offerOf(entry).length > 0) return openMenu(state, entries, frame, entry)
-  if (row.kind === 'field' && x >= FIELD_TEXT_START && x < showStart && takesTyping(entry, state.pending, frame)) {
+  const typing = takesTyping(entry, state.pending, frame)
+  // The ▾ opens the menu, and so does a field holding a chosen entry; a field that takes typing gets the caret.
+  if (isField && offerOf(entry).length > 0 && (x >= showStart + SHOW_COLUMNS || !typing)) return openMenu(state, entries, frame, entry)
+  if (isField && x >= FIELD_TEXT_START && x < showStart && typing) {
     const drawnCaret = row.id === current && state.isFocused ? state.caret : null
     const caret = caretAt(valueOf(entry, state.pending), drawnCaret, fieldRoom(frame.columns, false), x - FIELD_TEXT_START)
     const placed = { ...focused, selected: row.id, caret }

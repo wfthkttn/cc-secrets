@@ -189,6 +189,7 @@ const requestPeek = new Set<string>()
 async function holdKeys($: EngineInterface, claimed: boolean) {
   if (claimed) await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: false })
   await $.sidebar.hold({ id: SIDEBAR_ID, isHeld: true })
+  trace($, `held${claimed ? ' (moved to a claimed copy)' : ''}`)
 }
 
 function togglePeek<T>(peeking: Set<T>, key: T) {
@@ -233,6 +234,13 @@ function randomId(): string {
 function clockTime(): string {
   return new Date().toTimeString().slice(0, 8)
 }
+
+/** A line in the debug log (`claude --debug-file`): kinds, ids and timing only, never typed text or a key's character. */
+function trace($: EngineInterface, line: string) {
+  $.ui.log(`trace ${new Date().toISOString().slice(11, 23)} ${line}`, { to: 'debug' })
+}
+/** The last slot fill traced, so a redraw of the same one adds no line. */
+let tracedFill = ''
 
 function livePopouts(): Popouts {
   if (popouts === null) throw new Error('secrets: pop-outs used before session start')
@@ -406,6 +414,10 @@ export function register(on: On) {
   }).catch(() => ({ deny: 'secrets: masking this tool call failed, so its result is withheld' }))
 
   on('ui.message', async ($, e, next) => {
+    if (e.element === VAULT_KEY || e.element === CONFIG_KEY || e.element === LIST_KEY || e.element === POPOUT_KEY) {
+      const posted = e.data as { instance?: string; edits?: { kind: string }[]; claimed?: true }
+      trace($, `message ${e.element} instance=${posted.instance} edits=${(posted.edits ?? []).map(x => x.kind).join(',') || '-'}${posted.claimed ? ' claimed' : ''}`)
+    }
     if (e.element === VAULT_KEY || e.element === CONFIG_KEY) {
       if (!listFocused) draftAtFocus = (await $.prompt.read()).text
       listFocused = true
@@ -501,6 +513,7 @@ export function register(on: On) {
 
   on('prompt.edit', async ($, e, next) => {
     if (e.key !== undefined) {
+      trace($, `key at the prompt (a view had it: ${listFocused})`)
       if (listFocused && e.text !== draftAtFocus) say($, UNSEEN_PASTE, false)
       listFocused = false
       draftAtFocus = null
@@ -679,6 +692,11 @@ export function register(on: On) {
       const height = Math.min(room, TAB_ROWS + configLines(props, { focus: 'text', pending: [], caret: END_CARET }).length)
       return Client({ key: CONFIG_KEY, module: './config-view.ts', props, width: columns, height })
     }
+    const fill = `fill ${e.component}:${e.requestId} drawer=${inDrawer} popout=${inPopout} mirror=${mirror} tab=${drawerTab} cards=${requests.length}`
+    if (fill !== tracedFill) {
+      tracedFill = fill
+      trace($, fill)
+    }
     let filled = tree
     if (inDrawer) {
       const columns = DRAWER_COLUMNS - room.drawerFrameColumns
@@ -781,6 +799,7 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
       const event = JSON.parse(buffered.slice(0, newline)) as RelayEvent
       buffered = buffered.slice(newline + 1)
       newline = buffered.indexOf('\n')
+      trace($, `relay ${Object.keys(event)[0]}${'ask' in event ? ' ' + event.ask.id : 'gone' in event ? ' ' + event.gone : ''}`)
       if ('ready' in event) {
         if (typeof event.bin !== 'string') throw new Error("secrets: the daemon's ready event has no bin, the directory of the helpers it serves")
         ready({ state: event.vault, socket: event.ready, agent: event.agent, bin: event.bin })
@@ -798,6 +817,7 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
         await $.state.set({ plugin: 'secrets', key: 'hasMasked' }, true)
       } else say($, event.trouble, true)
       await syncBadge($)
+      trace($, `relay event handled, ${requests.length} waiting`)
     }
   }
   throw new Error('the attach to the secrets daemon ended')
@@ -833,6 +853,7 @@ async function onAsk($: EngineInterface, ask: Asked) {
   if (ask.tag !== null && ask.entry === null && !askedTags.includes(ask.tag)) askedTags = [...askedTags, ask.tag]
   const calls = callsBy(ask)
   const decision = askDecision(ask, calls)
+  trace($, `ask ${ask.id}: ${decision}`)
   if (decision === 'refuse') {
     const source = requestSource(ask, calls.map(r => r.command))
     // Refused, the asking program fails at once; one already gone needs no answer.
@@ -855,7 +876,9 @@ async function onAsk($: EngineInterface, ask: Asked) {
   if (decision === 'give' && ask.entry !== null && (await answerRequest($, request, { entry: ask.entry.id, session: false }))) return
   await addRequest($, request)
   carded.set(request.id, ask)
+  trace($, `ask ${ask.id}: card listed`)
   await $.ui.notify(`Password needed: ${ask.prompt}`, { title: 'secrets' })
+  trace($, `ask ${ask.id}: notified`)
 }
 
 /** Answers the cards whose tag names an entry the session allows, as an ask made with the vault open would have been. */
@@ -963,6 +986,7 @@ type Answer = { secret: string } | { cancel: true } | { entry: string; session: 
 /** True once the relay took the answer, or the asking program had gone; otherwise the reason shows. */
 async function answerRequest($: EngineInterface, request: Request, answer: Answer): Promise<boolean> {
   const reply = await callRelay($, 'POST', '/answer', { id: request.id, ...answer })
+  trace($, `answer ${request.id} (${'cancel' in answer ? 'cancel' : 'entry' in answer ? 'entry' : `typed, ${[...answer.secret].length} chars`}): ${reply?.status ?? 'not sent'}`)
   if (reply === null) return false
   // 410: the asking program went away first.
   if (reply.status !== 204 && reply.status !== 410) {

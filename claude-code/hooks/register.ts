@@ -302,24 +302,29 @@ export function register(on: On) {
   // Judges the plugins loaded after this one (those before it are out of reach): one whose hooks see a call that
   // carries secrets loads, but shows as a collision until allowed, and is refused from the next start once refused.
   on('plugin.register', async ($, e, next) => {
-    collisions = collisions.filter(c => c.name !== e.name)
-    const carriers = carriersSeen(e.uses.events)
-    if (carriers.length === 0) return next(e)
-    if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
-      return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (blocked in the Vault tab)` }
+    try {
+      collisions = collisions.filter(c => c.name !== e.name)
+      const carriers = carriersSeen(e.uses.events)
+      if (carriers.length === 0) return next(e)
+      if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
+        return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (blocked in the Vault tab)` }
+      }
+      const code = await codeIdentity(e.root, {
+        list: dir => $.fs.list(dir),
+        stat: path => $.fs.stat(path, { resolve: true }),
+        bytes: async path => (await $.fs.read(path, { as: 'bytes' })).base64,
+      })
+      const allowed = await storedList($, 'allowedPlugins')
+      const isAllowed = allowed.includes(allowKey(e.name, code))
+      const changed = allowed.some(key => allowedName(key) === e.name)
+      const decided = await next(e)
+      // A judge beneath may still refuse it: only a plugin that loads collides.
+      if (decided.allow === true && !isAllowed) collisions = [...collisions, { name: e.name, carriers, refused: false, changed, code }]
+      return decided
+    } finally {
+      // At startup the vault's tab is not registered yet; session.start sets the badge then.
+      if (popouts !== null) await setBadge($)
     }
-    const code = await codeIdentity(e.root, {
-      list: dir => $.fs.list(dir),
-      stat: path => $.fs.stat(path, { resolve: true }),
-      bytes: async path => (await $.fs.read(path, { as: 'bytes' })).base64,
-    })
-    const allowed = await storedList($, 'allowedPlugins')
-    const isAllowed = allowed.includes(allowKey(e.name, code))
-    const changed = allowed.some(key => allowedName(key) === e.name)
-    const decided = await next(e)
-    // A judge beneath may still refuse it: only a plugin that loads collides.
-    if (decided.allow === true && !isAllowed) collisions = [...collisions, { name: e.name, carriers, refused: false, changed, code }]
-    return decided
   }).catch(($, e, next) => (next.called ? next(e) : { refuse: "secrets couldn't check what it hooks" }))
 
   on('session.start', async ($, e, next) => {
@@ -331,7 +336,7 @@ export function register(on: On) {
     if (tool !== VAULT_TOOL) throw new Error(`secrets: the vault tool registered as ${tool}, not ${VAULT_TOOL}`)
     // A reload starts with no requests until the daemon sends the waiting ones again; the host still shows what the
     // old module set.
-    await $.sidebar.badge({ id: SIDEBAR_ID, count: 0, level: 'urgent' })
+    await setBadge($)
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
     maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
     unlockAtStart = await option($, 'unlockAtStart', true)
@@ -1087,6 +1092,7 @@ async function decideCollision($: EngineInterface, name: string, decision: 'allo
     if (!refused.includes(name)) await $.store.set('refusedPlugins', [...refused, name])
     collisions = collisions.map(c => (c.name === name ? { ...c, refused: true } : c))
   }
+  await setBadge($)
 }
 
 /** Unlocks the vault with the typed passphrase, or creates it when there is none; the passphrase fields empty either way. */
@@ -1230,9 +1236,14 @@ function dropRequest(id: string) {
   livePopouts().remove(id)
 }
 
-/** The badge shows the waiting requests; with none left, an open list closes, the vault view stays. */
+/** What waits on the person: requests, and plugins to Allow or Refuse while they keep tools off. */
+async function setBadge($: EngineInterface) {
+  await $.sidebar.badge({ id: SIDEBAR_ID, count: requests.length + collisions.filter(c => !c.refused).length, level: 'urgent' })
+}
+
+/** The badge follows the waiting requests; with none left, an open list closes, the vault view stays. */
 async function syncBadge($: EngineInterface) {
   $.ui.invalidate('ui.render')
-  await $.sidebar.badge({ id: SIDEBAR_ID, count: requests.length, level: 'urgent' })
+  await setBadge($)
   if (requests.length === 0 && drawerTab === 'requests' && (await $.sidebar.selected({})) === SIDEBAR_ID) await $.sidebar.select({ id: null })
 }

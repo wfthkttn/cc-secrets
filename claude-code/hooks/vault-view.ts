@@ -578,8 +578,11 @@ export function onKey(state: ViewState, props: VaultProps, k: ClientKeyEvent): R
     if (k.key === 'up' || k.key === 'down') return { state: { ...state, cursor: Math.max(0, Math.min(count - 1, state.cursor + (k.key === 'up' ? -1 : 1))) } }
     if (isEnter || k.key === 'space') return choose(state, props, state.cursor)
     if (k.key === 'tab') return { state: { ...state, open: null } }
-    // Typing over the open tag list shuts it and writes the person's own tag, as on the shut field.
-    if (state.open === 'tag' && state.focus === 'tag' && textKey(k, state.caret, 0) !== null) return onKey({ ...state, open: null }, props, k)
+    // Typing over the open tag list writes the person's own tag, as on the shut field, and the list stays open.
+    if (state.open === 'tag' && state.focus === 'tag' && textKey(k, state.caret, 0) !== null) {
+      const typed = onKey({ ...state, open: null }, props, k)
+      return { ...typed, state: { ...typed.state, open: 'tag' } }
+    }
     return { state }
   }
   const form = state.form

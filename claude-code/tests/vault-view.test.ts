@@ -325,7 +325,8 @@ test("the tag dropdown lists what agents ask for, each with what asks, then the 
   expect(rows.some(r => r.includes('sudo') && r.includes('sudo -A asks for your password'))).toBe(true)
   expect(rows.some(r => r.includes('▸ Custom tag…'))).toBe(true)
   const typedInto = keys(opened.state, ['g', 'i', 't'])
-  expect([typedInto.open, typedInto.form?.tag]).toEqual([null, 'git'])
+  expect([typedInto.open, typedInto.form?.tag]).toEqual(['tag', 'git'])
+  expect(draw(PROPS, typedInto).some(r => r.includes('▸ Custom tag…'))).toBe(true)
   const picked = click(opened.state, 'pick:0').state
   expect(picked.form?.tag).toBe('sudo')
   expect(draw(PROPS, picked).some(r => r.startsWith(' Tag     [ sudo · sudo -A asks for your password'))).toBe(true)

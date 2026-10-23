@@ -14,10 +14,11 @@ test('a pattern selects by name, by *, by namespace glob, and a negation selects
 
 test("a plugin's hooks name where they see secrets: the sidebar's nowhere, talking-bridge's in tool results", async () => {
   expect(carriersSeen(['tool.check', 'http.fetch'])).toEqual(['http.fetch'])
-  expect(carriersSeen(['*'])).toEqual(['http.fetch', 'process.spawn', 'env.set', 'tool.call', 'classic.PostToolUse'])
+  expect(carriersSeen(['*'])).toEqual(['http.fetch', 'process.spawn', 'env.set', 'tool.call', 'classic.PostToolUse', 'classic.PostToolBatch'])
   expect(carriersSeen(['tool.*'])).toEqual(['tool.call'])
-  expect(carriersSeen(['classic.*', 'classic.Stop'])).toEqual(['classic.PostToolUse'])
-  expect(carriersSeen(['!http.fetch'])).toEqual(['process.spawn', 'env.set', 'tool.call', 'classic.PostToolUse'])
+  expect(carriersSeen(['classic.*', 'classic.Stop'])).toEqual(['classic.PostToolUse', 'classic.PostToolBatch'])
+  expect(carriersSeen(['classic.PostToolBatch'])).toEqual(['classic.PostToolBatch'])
+  expect(carriersSeen(['!http.fetch'])).toEqual(['process.spawn', 'env.set', 'tool.call', 'classic.PostToolUse', 'classic.PostToolBatch'])
   expect(carriersSeen(['ui.render', 'ui.message', 'session.start', 'engine.create', 'command.run', 'classic.SessionStart'])).toEqual([])
   expect(carriersSeen(['session.start', 'tool.call', 'session.append', 'classic.PermissionDenied'])).toEqual(['tool.call'])
 })

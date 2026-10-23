@@ -20,7 +20,13 @@ export function carriersSeen(events: readonly string[]): string[] {
   return CARRIERS.filter(carrier => events.some(pattern => selects(pattern, carrier)))
 }
 
-/** What an Allow is kept under: the plugin and exactly the patterns it hooks, so a change to them asks again. */
-export function allowKey(name: string, events: readonly string[]): string {
-  return `${name}\n${[...events].sort().join('\n')}`
+/** What an Allow is kept under: the plugin and exactly the code it has (`codeIdentity`), so a change to it asks again. */
+export function allowKey(name: string, code: string): string {
+  return `${name}\n${code}`
+}
+
+/** The plugin an Allow was given to, whatever code it had then. */
+export function allowedName(key: string): string {
+  const cut = key.indexOf('\n')
+  return cut < 0 ? key : key.slice(0, cut)
 }

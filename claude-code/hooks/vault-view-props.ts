@@ -48,8 +48,9 @@ export type ValueEdit =
 /**
  * A plugin loaded after this one whose hooks see the calls that carry secrets (`carriers`): while one is not
  * allowed, nothing that would carry a secret through them runs. `refused`: it is refused from the next start.
+ * `changed`: it was allowed before, with other code.
  */
-export type Collision = { name: string; carriers: string[]; refused: boolean }
+export type Collision = { name: string; carriers: string[]; refused: boolean; changed: boolean }
 
 export type VaultAction =
   | { kind: 'collision'; name: string; decision: 'allow' | 'refuse' }

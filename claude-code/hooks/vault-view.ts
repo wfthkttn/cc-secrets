@@ -199,6 +199,7 @@ function collisionPage(collisions: readonly Collision[]): Drawn {
   const lines: Line[] = []
   for (const c of collisions) {
     lines.push(textLine(` ⚠ ${displayed(c.name)} sees secrets in ${c.carriers.join(', ')}`, { color: 'error' }))
+    if (c.changed && !c.refused) lines.push(textLine('   Its code changed since you allowed it.', { bold: true }))
     const notes = c.refused ? ['Blocked from the next session start.', 'The vault and typing stay off until then.'] : ['The vault and typing are off until you decide.']
     lines.push(...notes.map(note => textLine('   ' + note, { dimColor: true })))
     if (!c.refused) {

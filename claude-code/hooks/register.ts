@@ -4,7 +4,8 @@ import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from '
 import { appliedText, SUGGESTED, withText } from './auto-mode'
 import type { ConfigAction, ConfigMessage, ConfigProps, ConfigResume } from './config-view-props'
 import { editText, END_CARET, type PasteMark } from './controls'
-import { allowKey, carriersSeen } from './guard'
+import { codeIdentity } from './code-id'
+import { allowedName, allowKey, carriersSeen } from './guard'
 import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
@@ -205,8 +206,8 @@ let listFocused = false
 /** The prompt's draft while the list holds the keyboard; a different draft at the prompt's next key or submit means a paste landed there unseen. */
 let draftAtFocus: string | null = null
 let listSelected: string | null = null
-/** Plugins loaded after this one that hook a call carrying secrets, until allowed; `events` are their hook patterns. */
-let collisions: readonly (Collision & { events: readonly string[] })[] = []
+/** Plugins loaded after this one that hook a call carrying secrets, until allowed; `code` is their code identity. */
+let collisions: readonly (Collision & { code: string })[] = []
 /** Made at session start, where the hooks first have `$` for its timers. */
 let popouts: Popouts | null = null
 /** Shown above the cards; a sticky one stays until its ✕, any other also goes on the next action or after `NOTICE_MS`. */
@@ -288,10 +289,17 @@ export function register(on: On) {
     if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
       return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (blocked in the Vault tab)` }
     }
-    const isAllowed = (await storedList($, 'allowedPlugins')).includes(allowKey(e.name, e.uses.events))
+    const code = await codeIdentity(e.root, {
+      list: dir => $.fs.list(dir),
+      stat: path => $.fs.stat(path, { resolve: true }),
+      bytes: async path => (await $.fs.read(path, { as: 'bytes' })).base64,
+    })
+    const allowed = await storedList($, 'allowedPlugins')
+    const isAllowed = allowed.includes(allowKey(e.name, code))
+    const changed = allowed.some(key => allowedName(key) === e.name)
     const decided = await next(e)
     // A judge beneath may still refuse it: only a plugin that loads collides.
-    if (decided.allow === true && !isAllowed) collisions = [...collisions, { name: e.name, carriers, refused: false, events: e.uses.events }]
+    if (decided.allow === true && !isAllowed) collisions = [...collisions, { name: e.name, carriers, refused: false, changed, code }]
     return decided
   }).catch(($, e, next) => (next.called ? next(e) : { refuse: "secrets couldn't check what it hooks" }))
 
@@ -615,7 +623,7 @@ export function register(on: On) {
       const room = rows - VAULT_SPARE_ROWS
       const props: VaultProps = {
         state: vault.state,
-        collisions: collisions.map(({ name, carriers, refused }) => ({ name, carriers, refused })),
+        collisions: collisions.map(({ name, carriers, refused, changed }) => ({ name, carriers, refused, changed })),
         entries: vault.entries.map(({ created: _created, ...entry }) => entry),
         suggestions: [...vault.suggestions],
         tagChoices: tagChoices(),
@@ -1003,14 +1011,16 @@ async function onVaultAction($: EngineInterface, action: VaultAction) {
 }
 
 /**
- * Allow keeps the plugin with exactly the hooks it has now, so a change to them asks again; Refuse keeps its name,
- * and it is refused when it loads from the next start on (it stays a collision until then).
+ * Allow keeps the plugin with exactly the code it has now, in place of any it was allowed with before, so a change
+ * to it asks again; Refuse keeps its name, and it is refused when it loads from the next start on (it stays a
+ * collision until then).
  */
 async function decideCollision($: EngineInterface, name: string, decision: 'allow' | 'refuse') {
   const collision = collisions.find(c => c.name === name)
   if (collision === undefined) return
   if (decision === 'allow') {
-    await $.store.set('allowedPlugins', [...(await storedList($, 'allowedPlugins')), allowKey(name, collision.events)])
+    const others = (await storedList($, 'allowedPlugins')).filter(key => allowedName(key) !== name)
+    await $.store.set('allowedPlugins', [...others, allowKey(name, collision.code)])
     collisions = collisions.filter(c => c.name !== name)
   } else {
     const refused = await storedList($, 'refusedPlugins')

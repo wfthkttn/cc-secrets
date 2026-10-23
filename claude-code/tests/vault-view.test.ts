@@ -436,10 +436,14 @@ test('a page taller than the view scrolls to keep the focus in view', async () =
 })
 
 test('a colliding plugin replaces the vault with what it hooks and Allow / Block; keys do nothing there', async () => {
-  const props = { ...PROPS, collisions: [{ name: 'tracer', carriers: ['http.fetch'], refused: false }] }
+  const props = { ...PROPS, collisions: [{ name: 'tracer', carriers: ['http.fetch'], refused: false, changed: false }] }
   const rows = draw(props)
   expectWidths(rows)
   expect(rows[TAB_ROWS]).toContain('⚠ tracer sees secrets in http.fetch')
+  expect(rows.some(r => r.includes('code changed'))).toBe(false)
+  const changed = draw({ ...props, collisions: [{ ...props.collisions[0]!, changed: true }] })
+  expect(changed[TAB_ROWS + 1]).toContain('Its code changed since you allowed it.')
+  expectWidths(changed)
   expect(rows.some(r => r.includes('│ Block │'))).toBe(true)
   expect(rows.some(r => r.includes('+ Add entry'))).toBe(false)
   expect(actionOf(click(START, 'allow:tracer', props))).toEqual({ kind: 'collision', name: 'tracer', decision: 'allow' })

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { allowKey, carriersSeen, selects } from '../hooks/guard'
+import { allowedName, allowKey, carriersSeen, selects } from '../hooks/guard'
 
 test('a pattern selects by name, by *, by namespace glob, and a negation selects everything else', async () => {
   expect(selects('http.fetch', 'http.fetch')).toBe(true)
@@ -23,7 +23,8 @@ test("a plugin's hooks name where they see secrets: the sidebar's nowhere, talki
   expect(carriersSeen(['session.start', 'tool.call', 'session.append', 'classic.PermissionDenied'])).toEqual(['tool.call'])
 })
 
-test('an allow holds for exactly the hooks it was given, whatever their order', async () => {
-  expect(allowKey('tracer', ['http.fetch', 'tool.call'])).toBe(allowKey('tracer', ['tool.call', 'http.fetch']))
-  expect(allowKey('tracer', ['http.fetch'])).not.toBe(allowKey('tracer', ['http.fetch', 'env.set']))
+test('an allow holds for exactly the code it was given, and names its plugin, as an allow of the hooks alone did', async () => {
+  expect(allowKey('tracer', 'sha256:aa')).not.toBe(allowKey('tracer', 'sha256:bb'))
+  expect(allowedName(allowKey('tracer', 'sha256:aa'))).toBe('tracer')
+  expect(allowedName('tracer\nhttp.fetch\ntool.call')).toBe('tracer')
 })

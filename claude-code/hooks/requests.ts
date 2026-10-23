@@ -75,6 +75,9 @@ const GRANT_BUTTONS = [
 const FIELD_BACKGROUND = '#1f2a3a'
 /** The Show or Hide button after a typed value. */
 const SHOW_COLUMNS = 5
+/** The button at a field's end that opens its vault entries. */
+const MENU_LABEL = ' ▾ vault '
+const MENU_COLUMNS = MENU_LABEL.length
 /** Where a field's text starts: the card's edge, then the field's own. */
 const FIELD_TEXT_START = CARD_EDGE + 2
 
@@ -156,7 +159,7 @@ export function withPastes(state: ListState, props: Pick<RequestsProps, 'pastes'
 
 /** The columns of a card's field text: short of its Show button and its menu mark. */
 export function fieldRoom(columns: number, hasMenu: boolean): number {
-  return geometry(columns).fieldColumns - 4 - (hasMenu ? 2 : 0) - SHOW_COLUMNS
+  return geometry(columns).fieldColumns - 4 - (hasMenu ? MENU_COLUMNS : 0) - SHOW_COLUMNS
 }
 
 /** Whether a card's field takes typing now: no vault entry in it, typing not off. */
@@ -558,7 +561,7 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
           Text({ ...look(row.id), children: ['│ '] }),
           Text({ backgroundColor: FIELD_BACKGROUND, bold: active(row.id), dimColor: isDim, children: [pad(shown, room)] }),
           Text({ backgroundColor: FIELD_BACKGROUND, color: 'claude', underline: true, children: [show] }),
-          Text({ backgroundColor: FIELD_BACKGROUND, color: 'claude', children: [hasMenu ? ' ▾' : ''] }),
+          Text({ color: 'claude', inverse: true, bold: true, children: [hasMenu ? MENU_LABEL : ''] }),
           Text({ ...look(row.id), children: [' │ '] }),
           Text({ color: 'error', children: [BUTTON_ROW_TEXT[1]] }),
         ])

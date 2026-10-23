@@ -11,7 +11,7 @@ use secrets::vault::Entry;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::UnixStream;
+use secrets::local::Stream;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::session::Id;
@@ -25,6 +25,9 @@ struct Call {
     cmdline: String,
     /// The Claude Code process of the session it runs in.
     claude_code: i32,
+    /// The job its processes run in; none when mask-run couldn't make one.
+    #[cfg(windows)]
+    job: Option<secrets::job::Job>,
 }
 
 pub struct Filter {
@@ -59,6 +62,20 @@ impl Filter {
     /// The command lines of the session's calls whose output runs through here now.
     pub fn live(&self, claude_code: i32) -> Vec<String> {
         self.calls.values().filter(|call| call.claude_code == claude_code).map(|call| call.cmdline.clone()).collect()
+    }
+
+    /// The session's running call whose processes include `pid`, by its job: on Windows the line of parents can break
+    /// between a call and its processes.
+    #[cfg(windows)]
+    pub fn call_holding(&self, claude_code: i32, pid: i32) -> Option<i32> {
+        self.calls.iter().find(|(_, call)| call.claude_code == claude_code && call.job.as_ref().is_some_and(|job| job.holds(pid))).map(|(call, _)| *call)
+    }
+
+    /// On Unix the line of parents leads to every call, so no call is found otherwise.
+    #[cfg(unix)]
+    #[allow(clippy::unused_self, reason = "the same signature as on Windows")]
+    pub fn call_holding(&self, _claude_code: i32, _pid: i32) -> Option<i32> {
+        None
     }
 
     /// Whether `/mask` has values to mask, as the hooks were last told.
@@ -182,17 +199,41 @@ impl Filter {
     }
 }
 
-/// Serves one call's output stream until mask-run hangs up, then forgets what the call was handed.
-pub async fn serve(stream: &mut UnixStream, ctx: &Context, session: Id) {
-    let claude_code = lock(ctx).sessions.get(&session).map(|s| s.claude_code);
-    let Some((pid, claude_code)) = claude_code.and_then(|cc| Some((peer::mask_run_pid(stream, &ctx.mask_run, cc)?, cc))) else {
+/// What mask-run sends with `/filter` on Windows.
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct Opening {
+    /// Its handle to the job its command runs in.
+    job: usize,
+}
+
+/// Serves one call's output stream until mask-run hangs up, then forgets what the call was handed. A `secrets-mask-run`
+/// that isn't the call but runs inside one of the session's calls (a nested Claude Code's) gets 409: its output goes
+/// through that call's. On Unix it finds that call among its parents itself, so it gets 403 like any other.
+#[cfg_attr(unix, allow(unused_variables, reason = "the body carries something on Windows only"))]
+pub async fn serve(stream: &mut Stream, ctx: &Context, session: Id, body: &[u8]) {
+    let Some(claude_code) = lock(ctx).sessions.get(&session).map(|s| s.claude_code) else {
         return respond(stream, "403 Forbidden", b"").await;
     };
+    let Some(pid) = peer::mask_run_pid(stream, &ctx.mask_run, claude_code) else {
+        let inside = peer::peer_pid(stream).and_then(|peer| lock(ctx).filter.call_holding(claude_code, peer)).is_some();
+        return respond(stream, if inside { "409 Conflict" } else { "403 Forbidden" }, b"").await;
+    };
     let cmdline = peer::cmdline_of(i64::from(pid));
+    #[cfg(windows)]
+    let job = serde_json::from_slice::<Opening>(body).ok().and_then(|opening| secrets::job::Job::of(pid, opening.job));
+    #[cfg(windows)]
+    if job.is_none() && !body.is_empty() {
+        crate::note(&format!("the job of the call {pid} can't be used: what a program under another Git Bash program asks for counts as outside the session"));
+    }
     {
         let mut state = lock(ctx);
         let masker = state.filter.masker_for(Some(pid), &[]);
-        state.filter.calls.insert(pid, Call { values: Vec::new(), masker, cmdline, claude_code });
+        #[cfg(unix)]
+        let call = Call { values: Vec::new(), masker, cmdline, claude_code };
+        #[cfg(windows)]
+        let call = Call { values: Vec::new(), masker, cmdline, claude_code, job };
+        state.filter.calls.insert(pid, call);
     }
     if stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.is_ok() {
         let mut held = [Vec::new(), Vec::new()];
@@ -207,7 +248,7 @@ pub async fn serve(stream: &mut UnixStream, ctx: &Context, session: Id) {
     lock(ctx).filter.end(pid);
 }
 
-async fn read_request(stream: &mut UnixStream) -> Option<(u8, u8, Vec<u8>)> {
+async fn read_request(stream: &mut Stream) -> Option<(u8, u8, Vec<u8>)> {
     let mut head = [0u8; 6];
     stream.read_exact(&mut head).await.ok()?;
     let [kind, which, a, b, c, d] = head;

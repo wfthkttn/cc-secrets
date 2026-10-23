@@ -1,5 +1,7 @@
 //! Runs the secrets-relay daemon, its attach, secrets-mask-run, secrets and secrets-askpass together, without Claude
 //! Code: the test process stands in for Claude Code, the parent of the attach and of the calls.
+// They drive the helpers over Unix sockets, file modes and signals, which Windows lacks.
+#![cfg(unix)]
 // clippy.toml's test allowances reach #[test] functions, not this file's helpers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 

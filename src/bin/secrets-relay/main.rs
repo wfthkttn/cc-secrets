@@ -1,9 +1,11 @@
-//! Usage: secrets-relay daemon [--socket PATH] | secrets-relay attach
+//! Usage: secrets-relay daemon [--socket PATH] [--log PATH] | secrets-relay attach
 //!
 //! `daemon`: the vault and the requests of every Claude Code session, one per user. It listens on the socket systemd
-//! or launchd passes it, else on PATH (default `$XDG_RUNTIME_DIR/secrets.sock`, on macOS `$TMPDIR/secrets.sock`),
-//! where only `attach` is served (`session.rs`). The vault lives at `$XDG_DATA_HOME/secrets/vault`. It ends on
-//! SIGTERM.
+//! or launchd passes it, else on PATH (default `$XDG_RUNTIME_DIR/secrets.sock`, on macOS `$TMPDIR/secrets.sock`, on
+//! Windows `%LOCALAPPDATA%\secrets.sock`), where only `attach` is served (`session.rs`). The vault lives at
+//! `$XDG_DATA_HOME/secrets/vault`, on Windows `%LOCALAPPDATA%\secrets\vault`. It ends on SIGTERM. On Windows it has
+//! no console, so run by hand it shows nothing: `--log` (Windows only) appends its notes to PATH; it ends by being
+//! killed.
 //!
 //! `attach`: run by the hooks. Attaches its parent, Claude Code, to the daemon at `$SECRETS_DAEMON` (default as
 //! above), with `$SECRETS_UPSTREAM_AGENT` as the user's own ssh-agent, and prints the
@@ -12,14 +14,17 @@
 //! the session's socket, its ssh-agent, and the directory of the helpers the daemon pins (`pinned`), its
 //! `secrets-mask-run` the only one it serves.
 //!
-//! On a session's socket (HTTP/1.0, mode 0600), for commands; `pid` and `cmdline` in the events name the requester by
-//! its peer credentials: the `secrets-mask-run` it runs under (`inside: true`), else the requesting process itself;
-//! `live` lists the command lines of the session's calls whose output runs through the daemon then:
+//! On a session's socket (HTTP/1.0, mode 0600 on Unix), for commands; `pid` and `cmdline` in the events name the requester by
+//! its peer credentials: the `secrets-mask-run` it runs under (`inside: true`; on Windows also by the call's job),
+//! else the requesting process itself; `live` lists the command lines of the session's calls whose output runs
+//! through the daemon then:
 //! - `POST /ask {prompt, tag?}`: prints `{"ask": {id, prompt, tag, entry, pid, cmdline, inside, live}}`, `entry`
 //!   being the open vault's entry tagged `tag` (no value) or null, then holds the request until answered: 200 with
 //!   the value, 403 when cancelled. A client that hangs up first prints `{"gone": id}`.
-//! - `POST /filter`: for `secrets-mask-run` as the session's Claude Code starts it, 403 to anyone else; a call's
-//!   output stream (`secrets::filter`), masked with what that call was handed and the open vault's values.
+//! - `POST /filter`, on Windows `{job}`, mask-run's handle to the job it joined (`secrets::job`): for
+//!   `secrets-mask-run` as the session's Claude Code starts it, 409 on Windows to a process inside one of the
+//!   session's calls (that call masks its output), 403 to anyone else; a call's output stream (`secrets::filter`),
+//!   masked with what that call was handed and the open vault's values.
 //!
 //! For the session's Claude Code only (the peer must be the attach's parent), 403 to anyone else:
 //! - `POST /answer {id, secret}`, `{id, entry, session}` or `{id, cancel: true}`.
@@ -41,6 +46,10 @@
 //! `{"masked": true}` the first time anything was masked in a session, `{"masking": bool}` when `/mask` starts or
 //! stops having values to mask, and `{"trouble": text}` when the vault or the grants can't be written.
 
+// A logon task starts the daemon, and a console program would open a window there; the attach reaches the hooks
+// through the pipes they start it with all the same.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod access;
 mod filter;
 mod locker;
@@ -55,12 +64,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use rustix::fs::Mode;
 use secrets::vault::{Costs, random_hex};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{UnixListener, UnixStream};
+use secrets::local::{Listener, Stream};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
@@ -140,7 +150,7 @@ struct Head {
     started: Zeroizing<Vec<u8>>,
 }
 
-async fn read_head(stream: &mut UnixStream) -> Option<Head> {
+async fn read_head(stream: &mut Stream) -> Option<Head> {
     let mut buf = Zeroizing::new([0u8; 4096]);
     // Sized for the largest head up front: a growing Vec would leave unwiped copies behind.
     let mut raw = Zeroizing::new(Vec::with_capacity(HEAD_MAX + buf.len()));
@@ -167,7 +177,7 @@ async fn read_head(stream: &mut UnixStream) -> Option<Head> {
     Some(Head { method, path, length, started })
 }
 
-async fn read_body(stream: &mut UnixStream, head: Head) -> Option<Zeroizing<Vec<u8>>> {
+async fn read_body(stream: &mut Stream, head: Head) -> Option<Zeroizing<Vec<u8>>> {
     let mut body = Zeroizing::new(Vec::with_capacity(head.length.max(head.started.len())));
     body.extend_from_slice(&head.started);
     let mut buf = Zeroizing::new([0u8; 4096]);
@@ -180,21 +190,21 @@ async fn read_body(stream: &mut UnixStream, head: Head) -> Option<Zeroizing<Vec<
     Some(body)
 }
 
-async fn respond(stream: &mut UnixStream, status: &str, body: &[u8]) {
+async fn respond(stream: &mut Stream, status: &str, body: &[u8]) {
     let head = format!("HTTP/1.0 {status}\r\nContent-Length: {}\r\n\r\n", body.len());
     let _ = stream.write_all(head.as_bytes()).await;
     let _ = stream.write_all(body).await;
 }
 
 /// Resolves once the client hangs up (or sends anything, which none of ours does while waiting).
-async fn hung_up(stream: &mut UnixStream) {
+async fn hung_up(stream: &mut Stream) {
     let mut byte = [0u8; 1];
     let _ = stream.read(&mut byte).await;
 }
 
 /// Tells the session `event` under a new decision id and waits for its hooks' decision; None when the client hung up.
 /// Refused when the session ends first.
-async fn decide(stream: &mut UnixStream, ctx: &Context, session: Id, name: &str, mut event: serde_json::Value) -> Option<Decision> {
+async fn decide(stream: &mut Stream, ctx: &Context, session: Id, name: &str, mut event: serde_json::Value) -> Option<Decision> {
     let Ok(id) = random_hex::<16>() else { return Some(Decision::Refuse) };
     let (tx, rx) = oneshot::channel();
     if let Some(fields) = event.as_object_mut() {
@@ -225,7 +235,7 @@ struct Decide {
     decision: Decision,
 }
 
-async fn decided(stream: &mut UnixStream, ctx: &Context, session: Id, body: &[u8]) {
+async fn decided(stream: &mut Stream, ctx: &Context, session: Id, body: &[u8]) {
     let Ok(request) = serde_json::from_slice::<Decide>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let waiting = lock(ctx).sessions.get_mut(&session).and_then(|s| s.deciding.remove(&request.id));
     let Some(Deciding { tx, .. }) = waiting else { return respond(stream, "410 Gone", b"").await };
@@ -248,7 +258,7 @@ struct Named {
 
 /// `POST /session {id, projects?}`: the session's grants are now Claude Code session `id`'s, as kept in its file;
 /// 204, 400 with the reason.
-async fn session_named(stream: &mut UnixStream, ctx: &Shared, session: Id, body: &[u8]) {
+async fn session_named(stream: &mut Stream, ctx: &Shared, session: Id, body: &[u8]) {
     let Ok(Named { id, projects }) = serde_json::from_slice::<Named>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let access = match access::Access::load(&ctx.sessions_dir, &id) {
         Ok(access) => access,
@@ -278,7 +288,7 @@ async fn session_named(stream: &mut UnixStream, ctx: &Shared, session: Id, body:
     }
 }
 
-async fn json_reply(stream: &mut UnixStream, reply: Option<serde_json::Value>) {
+async fn json_reply(stream: &mut Stream, reply: Option<serde_json::Value>) {
     match reply {
         Some(reply) => respond(stream, "200 OK", reply.to_string().as_bytes()).await,
         None => respond(stream, "400 Bad Request", b"").await,
@@ -286,13 +296,13 @@ async fn json_reply(stream: &mut UnixStream, reply: Option<serde_json::Value>) {
 }
 
 /// Serves the session's socket until the session ends.
-async fn accept(listener: UnixListener, ctx: Shared, session: Id) {
-    while let Ok((stream, _)) = listener.accept().await {
+async fn accept(mut listener: Listener, ctx: Shared, session: Id) {
+    while let Ok(stream) = listener.accept().await {
         tokio::spawn(serve(stream, ctx.clone(), session));
     }
 }
 
-async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
+async fn serve(mut stream: Stream, ctx: Shared, session: Id) {
     let Ok(Some(head)) = tokio::time::timeout(REQUEST_WITHIN, read_head(&mut stream)).await else { return };
     let (method, path) = (head.method.clone(), head.path.clone());
     let route = (method.as_str(), path.as_str());
@@ -310,7 +320,7 @@ async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
     let body = body.as_slice();
     match route {
         ("POST", "/ask") => pass::ask(&mut stream, &ctx, session, body).await,
-        ("POST", "/filter") => filter::serve(&mut stream, &ctx, session).await,
+        ("POST", "/filter") => filter::serve(&mut stream, &ctx, session, body).await,
         ("POST", "/answer") => pass::answer(&mut stream, &ctx, session, body).await,
         ("POST", "/unlock") => locker::open(&mut stream, &ctx, body, false).await,
         ("POST", "/create") => locker::open(&mut stream, &ctx, body, true).await,
@@ -346,7 +356,7 @@ async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
 }
 
 /// The daemon's own socket serves only `attach`.
-async fn serve_daemon(mut stream: UnixStream, ctx: Shared) {
+async fn serve_daemon(mut stream: Stream, ctx: Shared) {
     let Ok(Some(head)) = tokio::time::timeout(REQUEST_WITHIN, read_head(&mut stream)).await else { return };
     if (head.method.as_str(), head.path.as_str()) != ("POST", "/attach") {
         return respond(&mut stream, "404 Not Found", b"").await;
@@ -358,12 +368,25 @@ async fn serve_daemon(mut stream: UnixStream, ctx: Shared) {
     session::attach(stream, ctx, &body).await;
 }
 
-fn vault_path() -> Option<PathBuf> {
+#[cfg(unix)]
+fn vault_path() -> Result<PathBuf, &'static str> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|home| PathBuf::from(home).join(".local/share")))?;
-    Some(data.join("secrets").join("vault"))
+        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|home| PathBuf::from(home).join(".local/share")))
+        .ok_or("neither XDG_DATA_HOME nor HOME is set, so the vault has nowhere to live")?;
+    Ok(data.join("secrets").join("vault"))
+}
+
+#[cfg(windows)]
+fn vault_path() -> Result<PathBuf, &'static str> {
+    let data = local_app_data().ok_or("LOCALAPPDATA is not set, so the vault has nowhere to live")?;
+    Ok(data.join("secrets").join("vault"))
+}
+
+#[cfg(windows)]
+fn local_app_data() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// `$SECRETS_DAEMON`, else `$XDG_RUNTIME_DIR/secrets.sock`.
@@ -386,13 +409,29 @@ fn daemon_socket() -> Result<PathBuf, &'static str> {
     Ok(PathBuf::from(runtime).join("secrets.sock"))
 }
 
+/// `$SECRETS_DAEMON`, else `%LOCALAPPDATA%\secrets.sock`, not in `%TEMP%`, which disk cleanup empties.
+#[cfg(windows)]
+fn daemon_socket() -> Result<PathBuf, &'static str> {
+    if let Some(path) = std::env::var_os("SECRETS_DAEMON").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(local_app_data().ok_or("neither SECRETS_DAEMON nor LOCALAPPDATA is set")?.join("secrets.sock"))
+}
+
 /// A directory removed, with what it holds, when the daemon ends.
+#[cfg(unix)]
 struct Removed(PathBuf);
 
+#[cfg(unix)]
 impl Drop for Removed {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A helper's file name: with `.exe` on Windows.
+fn executable_name(helper: &str) -> String {
+    format!("{helper}{}", std::env::consts::EXE_SUFFIX)
 }
 
 /// The helpers the sessions' commands run: those beside the daemon where nothing can change them (a read-only
@@ -400,14 +439,117 @@ impl Drop for Removed {
 /// The `secrets-mask-run` among them.
 fn pinned(mask_run: &Path, copies: &Path) -> std::io::Result<PathBuf> {
     let Some(dir) = mask_run.parent() else { return Ok(mask_run.to_owned()) };
+    #[cfg(unix)]
     if rustix::fs::statvfs(dir).is_ok_and(|fs| fs.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY)) {
         return Ok(mask_run.to_owned());
     }
+    #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700).create(copies)?;
-    for helper in HELPERS {
-        std::fs::copy(dir.join(helper), copies.join(helper))?;
+    #[cfg(windows)]
+    std::fs::create_dir_all(copies)?;
+    // Left when this build was once superseded: kept, the next build's daemon would remove the folder at once, not
+    // `LEFTOVER_AGE` later.
+    #[cfg(windows)]
+    match std::fs::remove_file(copies.join("superseded")) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
     }
-    std::fs::canonicalize(copies.join("secrets-mask-run"))
+    for helper in HELPERS.map(executable_name) {
+        #[cfg(unix)]
+        std::fs::copy(dir.join(&helper), copies.join(&helper))?;
+        // The folder is these helpers' (`copies_dir`): one there is the same file, maybe running now. Copied under
+        // another name first, so a copy cut short is never taken for one.
+        #[cfg(windows)]
+        if !copies.join(&helper).exists() {
+            let part = copies.join(format!("{helper}.part"));
+            std::fs::copy(dir.join(&helper), &part)?;
+            std::fs::rename(&part, copies.join(&helper))?;
+        }
+    }
+    std::fs::canonicalize(copies.join(executable_name("secrets-mask-run")))
+}
+
+/// Where this daemon copies its helpers.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps, reason = "the same signature as on Windows")]
+fn copies_dir(socket: &Path, _exe: &Path) -> std::io::Result<PathBuf> {
+    Ok(PathBuf::from(format!("{}.bin", socket.display())))
+}
+
+/// Where this daemon copies its helpers: a folder named for this daemon's and its helpers' files (name, size, time
+/// written), as Windows won't replace a running executable. A later start with the same files takes it as it is
+/// (`pinned`); a folder of other files goes in `sweep_leftovers`.
+#[cfg(windows)]
+fn copies_dir(socket: &Path, exe: &Path) -> std::io::Result<PathBuf> {
+    use sha2::Digest as _;
+    let dir = exe.parent().ok_or_else(|| std::io::Error::other(format!("{} has no folder", exe.display())))?;
+    let mut files = sha2::Sha256::new();
+    for path in std::iter::once(exe.to_owned()).chain(HELPERS.map(|helper| dir.join(executable_name(helper)))) {
+        let file = std::fs::metadata(&path)?;
+        let at = file.modified()?.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)?;
+        files.update(format!("{}\0{}\0{}\0", path.display(), file.len(), at.as_nanos()));
+    }
+    let digest = files.finalize();
+    let id = digest.first_chunk::<8>().map(|first| u64::from_be_bytes(*first)).ok_or_else(|| std::io::Error::other("a SHA-256 shorter than 8 bytes"))?;
+    Ok(PathBuf::from(format!("{}.bin-{id:016x}", socket.display())))
+}
+
+/// How long an earlier build's helpers stay once a later build's daemon first finds them: a session that hasn't
+/// attached to that daemon yet still runs its commands through them, unmasked, while they are there.
+#[cfg(windows)]
+const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_hours(24);
+
+/// Removes what earlier daemons left beside the socket, which a killed one doesn't remove and Windows keeps across
+/// logons: their sessions' sockets, and earlier builds' helpers `LEFTOVER_AGE` after a later build's daemon first
+/// found them, which a `superseded` file in their folder records. Only once this daemon holds the socket, so none of
+/// it is a running daemon's. A folder a command still runs a helper from stays until a later start: Windows won't
+/// move a folder while a file in it is open, so it is moved aside first and removed only then.
+#[cfg(windows)]
+fn sweep_leftovers(socket: &Path, copies: &Path) {
+    let Some(name) = socket.file_name().map(|name| name.to_string_lossy().into_owned()) else { return };
+    let Some(Ok(entries)) = socket.parent().map(std::fs::read_dir) else { return };
+    let is_hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+    for entry in entries.flatten() {
+        let (found, path) = (entry.file_name().to_string_lossy().into_owned(), entry.path());
+        let Some(rest) = found.strip_prefix(name.as_str()) else { continue };
+        if let Some(build) = rest.strip_prefix(".bin-") {
+            let (id, gone) = build.strip_suffix(".gone").map_or((build, false), |id| (id, true));
+            if id.len() != 16 || !is_hex(id) || path == copies {
+                continue;
+            }
+            if gone {
+                let _ = std::fs::remove_dir_all(&path);
+                continue;
+            }
+            let superseded = path.join("superseded");
+            let Ok(since) = std::fs::metadata(&superseded).and_then(|m| m.modified()) else {
+                let _ = std::fs::File::create(&superseded);
+                continue;
+            };
+            if since.elapsed().is_ok_and(|age| age > LEFTOVER_AGE) {
+                let aside = path.with_file_name(format!("{found}.gone"));
+                if std::fs::rename(&path, &aside).is_ok() {
+                    let _ = std::fs::remove_dir_all(&aside);
+                }
+            }
+        } else if let Some(session) = rest.strip_prefix('-') {
+            let id = session.strip_suffix(".agent").unwrap_or(session);
+            if id.len() == 16 && is_hex(id) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// A path as other programs take it. Canonical paths on Windows are verbatim (`\\?\C:\…`), which Git Bash can't run
+/// from.
+fn shown(path: &Path) -> String {
+    let shown = path.display().to_string();
+    #[cfg(windows)]
+    if let Some(rest) = shown.strip_prefix(r"\\?\").filter(|rest| rest.get(1..2) == Some(":")) {
+        return rest.to_owned();
+    }
+    shown
 }
 
 /// The socket systemd passed, if any.
@@ -446,19 +588,21 @@ fn passed_listener() -> Result<Option<std::os::unix::net::UnixListener>, String>
     }
 }
 
-/// The socket the service manager passed, else a fresh bind of `path` (mode 0600); true when bound here, so the file
+/// The socket the service manager passed, else a fresh bind of `path` (mode 0600 on Unix); true when bound here, so the file
 /// is ours to remove.
-fn listener(path: &Path) -> Result<(UnixListener, bool), String> {
+fn listener(path: &Path) -> Result<(Listener, bool), String> {
+    #[cfg(unix)]
     if let Some(listener) = passed_listener()? {
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        return UnixListener::from_std(listener).map(|l| (l, false)).map_err(|e| e.to_string());
+        return Listener::from_std(listener).map(|l| (l, false)).map_err(|e| e.to_string());
     }
-    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+    if secrets::local::connect_blocking(path).is_ok() {
         return Err(format!("another daemon answers on {}", path.display()));
     }
     let _ = std::fs::remove_file(path);
+    #[cfg(unix)]
     let old = rustix::process::umask(Mode::from_raw_mode(0o177));
-    let bound = UnixListener::bind(path).map_err(|error| format!("can't listen on {}: {error}", path.display()));
+    let bound = Listener::bind(path).map_err(|error| format!("can't listen on {}: {error}", path.display()));
+    #[cfg(unix)]
     rustix::process::umask(old);
     bound.map(|l| (l, true))
 }
@@ -494,6 +638,33 @@ fn harden() -> Result<(), String> {
     Ok(())
 }
 
+/// Windows has nothing to keep the user's other processes out of this one's memory at the same integrity level: see
+/// the README's Windows section.
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps, reason = "the same signature as on the other systems")]
+fn harden() -> Result<(), String> {
+    Ok(())
+}
+
+type Ending = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+/// Resolves once the daemon is asked to end: SIGTERM. Inside the tokio runtime.
+#[cfg(unix)]
+fn asked_to_end() -> Result<Ending, String> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| format!("can't watch for SIGTERM: {e}"))?;
+    Ok(Box::pin(async move {
+        terminate.recv().await;
+    }))
+}
+
+/// Never: the daemon has no console to be told on (`windows_subsystem`), and logoff and shutdown events reach only
+/// services. It is killed; the next start sweeps what it left (`sweep_leftovers`).
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps, reason = "the same signature as on the other systems")]
+fn asked_to_end() -> Result<Ending, String> {
+    Ok(Box::pin(std::future::pending()))
+}
+
 fn daemon(socket: Option<PathBuf>) -> ExitCode {
     if let Err(error) = harden() {
         note(&error);
@@ -513,17 +684,34 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let copies = Removed(PathBuf::from(format!("{}.bin", socket.display())));
-    let mask_run = match std::fs::canonicalize(exe.with_file_name("secrets-mask-run")).and_then(|found| pinned(&found, &copies.0)) {
-        Ok(path) => path,
+    if let Err(error) = secrets::local::usable(&session::longest_socket(&socket)) {
+        note(&format!("can't serve sessions beside {}: {error}", socket.display()));
+        return ExitCode::FAILURE;
+    }
+    let copies = match copies_dir(&socket, &exe) {
+        Ok(dir) => dir,
         Err(error) => {
-            note(&format!("can't pin the helpers beside this binary in {}: {error}", copies.0.display()));
+            note(&format!("can't name a folder for the helpers' copies: {error}"));
             return ExitCode::FAILURE;
         }
     };
-    let Some(vault_path) = vault_path() else {
-        note("neither XDG_DATA_HOME nor HOME is set, so the vault has nowhere to live");
-        return ExitCode::FAILURE;
+    // On Windows the copies outlive the daemon, which is killed, never ended in order, and one that fails to start
+    // shares its build's folder with the running daemon: `sweep_leftovers` removes them there.
+    #[cfg(unix)]
+    let _removed = Removed(copies.clone());
+    let mask_run = match std::fs::canonicalize(exe.with_file_name(executable_name("secrets-mask-run"))).and_then(|found| pinned(&found, &copies)) {
+        Ok(path) => path,
+        Err(error) => {
+            note(&format!("can't pin the helpers beside this binary in {}: {error}", copies.display()));
+            return ExitCode::FAILURE;
+        }
+    };
+    let vault_path = match vault_path() {
+        Ok(path) => path,
+        Err(error) => {
+            note(error);
+            return ExitCode::FAILURE;
+        }
     };
     let vault = if vault_path.exists() { locker::Locker::Locked } else { locker::Locker::Absent };
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -534,18 +722,23 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
         }
     };
     runtime.block_on(async move {
-        let (listener, is_ours) = match listener(&socket) {
+        let (mut listener, is_ours) = match listener(&socket) {
             Ok(bound) => bound,
             Err(error) => {
                 note(&error);
                 return ExitCode::FAILURE;
             }
         };
-        let Ok(mut terminate) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else {
-            note("can't watch for SIGTERM");
-            return ExitCode::FAILURE;
+        #[cfg(windows)]
+        sweep_leftovers(&socket, &copies);
+        let mut ending = match asked_to_end() {
+            Ok(ending) => ending,
+            Err(error) => {
+                note(&error);
+                return ExitCode::FAILURE;
+            }
         };
-        let bin = mask_run.parent().map(|dir| dir.display().to_string());
+        let bin = mask_run.parent().map(shown);
         let state = State { vault, filter: filter::Filter::new(MASK_MIN), sessions: HashMap::new(), next_session: 0, next_attach: 0 };
         let sessions_dir = vault_path.with_file_name("sessions");
         let ctx = Arc::new(Context { state: Mutex::new(state), exe, mask_run, bin, socket: socket.clone(), vault_path, sessions_dir });
@@ -553,11 +746,11 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    if let Ok((stream, _)) = accepted {
+                    if let Ok(stream) = accepted {
                         tokio::spawn(serve_daemon(stream, Arc::clone(&ctx)));
                     }
                 }
-                _ = terminate.recv() => break,
+                () = &mut ending => break,
                 _ = checks.tick() => session::end_gone(&mut lock(&ctx)),
             }
         }
@@ -580,7 +773,7 @@ fn attach() -> ExitCode {
     };
     let upstream = std::env::var("SECRETS_UPSTREAM_AGENT").unwrap_or_default();
     let body = json!({ "upstream": upstream }).to_string();
-    let mut stream = match std::os::unix::net::UnixStream::connect(&path) {
+    let mut stream = match secrets::local::connect_blocking(&path) {
         Ok(stream) => stream,
         Err(error) => return fail(&format!("no secrets daemon on {} ({error})", path.display())),
     };
@@ -621,10 +814,40 @@ fn main() -> ExitCode {
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["daemon"] => daemon(None),
         ["daemon", "--socket", path] => daemon(Some(PathBuf::from(path))),
+        #[cfg(windows)]
+        ["daemon", "--log", log] => logged(Path::new(log), None),
+        #[cfg(windows)]
+        ["daemon", "--socket", path, "--log", log] | ["daemon", "--log", log, "--socket", path] => logged(Path::new(log), Some(PathBuf::from(path))),
         ["attach"] => attach(),
         _ => {
+            #[cfg(unix)]
             note("usage: secrets-relay daemon [--socket PATH] | secrets-relay attach");
+            #[cfg(windows)]
+            note("usage: secrets-relay daemon [--socket PATH] [--log PATH] | secrets-relay attach");
             ExitCode::from(2)
         }
     }
+}
+
+/// The daemon, its notes appended to `log`: this process's stderr becomes that file.
+#[cfg(windows)]
+fn logged(log: &Path, socket: Option<PathBuf>) -> ExitCode {
+    use std::os::windows::io::IntoRawHandle as _;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+    // its folder is the vault's too, which a fresh start may have removed
+    let opened = log.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(log));
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) => {
+            note(&format!("can't open the log {}: {error}", log.display()));
+            return ExitCode::FAILURE;
+        }
+    };
+    // SAFETY: the handle is an open file, given to the process for its life; std looks the handle up at each write.
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle()) } == 0 {
+        note(&format!("can't send the notes to {}: {}", log.display(), std::io::Error::last_os_error()));
+        return ExitCode::FAILURE;
+    }
+    daemon(socket)
 }

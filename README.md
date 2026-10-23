@@ -6,7 +6,7 @@ When a command needs a secret (`sudo -A`, ssh, git, or `secrets ask` inside a co
 Claude Code sidebar. You type the value, or pick an entry from your vault, and it goes straight to the program that
 asked. The agent sees `[secret]` wherever the value would have shown.
 
-Linux and macOS, provided as is. See [Platforms](#platforms).
+Linux and macOS, and Windows with a weaker guarantee, provided as is. See [Platforms](#platforms).
 
 ## What it does
 
@@ -113,11 +113,25 @@ other systems aren't supported.
   the hardened runtime and without `get-task-allow`, which keeps every debugger out, root's included, and refuses to
   start when it isn't; core dumps are off. It runs as a launchd agent that holds its socket, `$TMPDIR/secrets.sock`,
   and starts it on the first connection.
+- **Windows, weaker.** Callers are identified with `SIO_AF_UNIX_GETPEERPID` on an AF_UNIX socket and with
+  `NtQueryInformationProcess`, `GetProcessTimes` and `QueryFullProcessImageNameW`. Windows keeps a user's processes
+  out of each other's memory only where a program guards its own, and the daemon and Claude Code don't: any of your
+  processes at the same integrity level can read and write their memory, and can start a process under any parent it
+  can open. So a command written to get the secrets gets them; what holds is the masking and the cards against
+  mistakes. Claude Code's Bash tool runs in Git Bash, through the shell prefix; its PowerShell tool doesn't, so a
+  PowerShell command's output is masked only with the open vault's values, and its `secrets ask` counts as from
+  outside the session. Each Bash call's processes run in a job object, since Git Bash's programs drop out of the line
+  of parents Windows keeps; a program inside a call that asks to start a process outside its job fails to start it.
+  Claude Code run elevated is untested; the daemon can't look into its calls' jobs, so there at least what a program
+  under another Git Bash program asks for counts as outside the session. The daemon runs from the logon task `claude-secrets`, only while you are logged on at the
+  desktop (the task runs as an interactive logon), listens on `%LOCALAPPDATA%\secrets.sock` and keeps the vault in
+  `%LOCALAPPDATA%\secrets\vault`. There is no session ssh-agent: commands reach your own ssh-agent as they would
+  without secrets, with no card and no refusal for subagents.
 
 ## Requirements
 
-- Linux with systemd (user services) and Yama `ptrace_scope` ≥ 1, or macOS with Xcode's command line tools
-  (`codesign`).
+- Linux with systemd (user services) and Yama `ptrace_scope` ≥ 1, macOS with Xcode's command line tools
+  (`codesign`), or Windows 11 with Git for Windows, whose Git Bash Claude Code runs commands in.
 - Claude Code 2.1.293 or later, in fullscreen rendering.
 - The [sidebar](https://github.com/wfthkttn/sidebar) plugin, which draws the 🔐 drawer.
 
@@ -215,12 +229,34 @@ clone's path:
 }
 ```
 
+### Windows
+
+Needs Rust 1.95 or later. In PowerShell:
+
+```powershell
+git clone https://github.com/wfthkttn/sidebar
+git clone https://github.com/wfthkttn/claude-secrets
+powershell -ExecutionPolicy Bypass -File claude-secrets\windows\install.ps1
+```
+
+It builds, installs the plugin with its binaries in `%USERPROFILE%\.local\lib\secrets\claude-code`, and registers
+the logon task `claude-secrets`, which it starts and which starts a daemon that ended again within a minute; the
+daemon's log is `%LOCALAPPDATA%\secrets\daemon.log`. Run it
+again after an update; it stops the running daemon, which locks the vault. Then in `~/.claude/settings.json`, with
+your user and the sidebar clone's path, `;`-separated:
+
+```json
+"env": {
+  "CLAUDE_CODE_PLUGIN_DIRS": "C:\\Users\\you\\.local\\lib\\secrets\\claude-code;C:\\path\\to\\sidebar"
+}
+```
+
 ## How it works
 
 - `secrets-relay daemon`: one per user, started by its socket (systemd's `secrets.socket`, launchd's
-  `local.claude-secrets`). It owns the vault file
-  (`$XDG_DATA_HOME/secrets/vault`, else `~/.local/share/secrets/vault`) and each session's access file
-  (`sessions/<session-id>.json` beside it).
+  `local.claude-secrets`), on Windows by the logon task `claude-secrets`. It owns the vault file
+  (`$XDG_DATA_HOME/secrets/vault`, else `~/.local/share/secrets/vault`, on Windows `%LOCALAPPDATA%\secrets\vault`)
+  and each session's access file (`sessions/<session-id>.json` beside it).
 - `secrets-relay attach`: started by the plugin's hooks in each session; the session's Claude Code process is its
   parent, which is how the daemon knows the session. It prints the session's events (asks, signatures, vault
   changes) for the hooks, and gets the session its own sockets (requests, ssh-agent).
@@ -237,7 +273,8 @@ cd claude-code && claude plugin test && claude plugin validate .
 ```
 
 On macOS, `cargo test -- --test-threads=4`: each test's daemon copies its helpers, macOS checks a new executable at
-its first run (about 0.3 s), and with a test on every core the timing tests run out of time.
+its first run (about 0.3 s), and with a test on every core the timing tests run out of time. On Windows `cargo test`
+runs the unit tests only; the end-to-end tests in `tests/` drive Unix sockets, file modes and signals.
 
 ## Licence
 

@@ -1,7 +1,6 @@
 //! One HTTP/1.0 request to the relay at `$SECRETS_RELAY`, for the helpers commands run.
 
 use std::io::{Read as _, Write as _};
-use std::os::unix::net::UnixStream;
 
 pub struct Reply {
     pub status: String,
@@ -27,7 +26,7 @@ pub fn post(path: &str, body: &serde_json::Value) -> Result<Reply, String> {
     let body = body.to_string();
     let request = format!("POST {path} HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     let mut reply = Vec::new();
-    UnixStream::connect(&relay)
+    crate::local::connect_blocking(std::path::Path::new(&relay))
         .and_then(|mut stream| {
             stream.write_all(request.as_bytes())?;
             stream.read_to_end(&mut reply)

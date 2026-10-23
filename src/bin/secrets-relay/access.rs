@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -102,14 +103,18 @@ impl Access {
         let text = serde_json::to_vec(&stored).map_err(|e| e.to_string())?;
         let failed = |e: std::io::Error| format!("can't save {}: {e}", file.display());
         if let Some(dir) = file.parent() {
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(failed)?;
+            let mut dirs = std::fs::DirBuilder::new();
+            dirs.recursive(true);
+            #[cfg(unix)]
+            dirs.mode(0o700);
+            dirs.create(dir).map_err(failed)?;
         }
         let temporary = file.with_extension("json.new");
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let written = options
             .open(&temporary)
             .and_then(|mut f| f.write_all(&text).and_then(|()| f.sync_all()))
             .and_then(|()| std::fs::rename(&temporary, file));
@@ -158,6 +163,7 @@ pub fn sweep(dir: &Path, projects: &Path, running: &[String]) -> Result<Vec<Stri
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
@@ -176,8 +182,8 @@ mod tests {
         assert!(first.set("e1", Grant::Allowed).unwrap());
         assert!(first.set("e2", Grant::Refused).unwrap());
         assert!(!first.set("e2", Grant::Refused).unwrap());
-        let mode = std::fs::metadata(dir.join("s-1.json")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        assert_eq!(std::fs::metadata(dir.join("s-1.json")).unwrap().permissions().mode() & 0o777, 0o600);
         let again = Access::load(&dir, "s-1").unwrap();
         assert_eq!((again.of("e1"), again.of("e2"), again.of("e3")), (Grant::Allowed, Grant::Refused, Grant::Ask));
         assert_eq!(Access::load(&dir, "s-2").unwrap().of("e1"), Grant::Ask);

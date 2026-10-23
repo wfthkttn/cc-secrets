@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 use serde_json::json;
-use tokio::net::UnixStream;
+use secrets::local::Stream;
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
@@ -43,7 +43,7 @@ struct Ask {
 }
 
 /// `POST /ask {prompt, tag?}`: 200 with the value once answered, 403 when cancelled or the session ended.
-pub async fn ask(stream: &mut UnixStream, ctx: &Context, session: Id, body: &[u8]) {
+pub async fn ask(stream: &mut Stream, ctx: &Context, session: Id, body: &[u8]) {
     let Ok(ask) = serde_json::from_slice::<Ask>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let Ok(id) = secrets::vault::random_hex::<16>() else { return respond(stream, "500 Internal Server Error", b"").await };
     let (tx, rx) = oneshot::channel();
@@ -51,7 +51,7 @@ pub async fn ask(stream: &mut UnixStream, ctx: &Context, session: Id, body: &[u8
         let mut guard = lock(ctx);
         let state = &mut *guard;
         state.sessions.get_mut(&session).map(|open| {
-            let by = peer::requester(peer::peer_pid(stream), &ctx.mask_run, open.claude_code);
+            let by = peer::requester(peer::peer_pid(stream), &ctx.mask_run, open.claude_code, &state.filter);
             let tagged = ask.tag.as_deref().and_then(|tag| state.vault.tagged(tag));
             let entry = tagged.map(|e| json!({ "id": e.id, "name": e.name, "tag": e.tag, "kind": e.kind, "access": open.access.of(&e.id) }));
             let live = state.filter.live(open.claude_code);
@@ -92,7 +92,7 @@ struct Answer {
 
 /// `POST /answer` from the hooks: 204 taken, 410 no such ask, 409 with the reason when a picked entry can't be
 /// handed out (the ask keeps waiting).
-pub async fn answer(stream: &mut UnixStream, ctx: &Context, session: Id, body: &[u8]) {
+pub async fn answer(stream: &mut Stream, ctx: &Context, session: Id, body: &[u8]) {
     let (status, reason) = match serde_json::from_slice::<Answer>(body) {
         Ok(answer) => take(ctx, session, answer),
         Err(_) => ("400 Bad Request", ""),

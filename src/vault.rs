@@ -5,6 +5,7 @@
 //! or salt fails to open like a wrong passphrase does.
 
 use std::io::{Read as _, Write as _};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
@@ -87,9 +88,24 @@ pub struct Vault {
     pub entries: Vec<Entry>,
 }
 
+#[cfg(unix)]
 pub fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
     let mut bytes = [0u8; N];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+pub fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+    use windows_sys::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+
+    let mut bytes = [0u8; N];
+    let size = u32::try_from(N).map_err(std::io::Error::other)?;
+    // SAFETY: `bytes` holds `size` writable bytes; the system RNG needs no algorithm handle.
+    let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), size, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status != 0 {
+        return Err(std::io::Error::other(format!("BCryptGenRandom failed with status {status:#x}")));
+    }
     Ok(bytes)
 }
 
@@ -185,7 +201,8 @@ impl Vault {
         Ok(())
     }
 
-    /// Writes the vault under a fresh nonce: a 0600 temporary file beside `path`, synced, then renamed over it.
+    /// Writes the vault under a fresh nonce: a temporary file beside `path`, synced, then renamed over it. On Unix the
+    /// file is 0600 and a missing folder 0700; on Windows both take the access of the folder they are made in.
     pub fn save(&self, path: &Path) -> Result<(), Error> {
         let aad = header(self.costs, &self.salt);
         let nonce = random_bytes::<NONCE_LEN>()?;
@@ -193,10 +210,18 @@ impl Vault {
         let plain = Zeroizing::new(serde_json::to_vec(&self.entries).map_err(|_| Error::Unreadable("entries"))?);
         let sealed = cipher.encrypt(&XNonce::from(nonce), Payload { msg: &plain, aad: &aad }).map_err(|_| Error::Unreadable("sealing failed"))?;
         if let Some(dir) = path.parent() {
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+            let mut dirs = std::fs::DirBuilder::new();
+            dirs.recursive(true);
+            #[cfg(unix)]
+            dirs.mode(0o700);
+            dirs.create(dir)?;
         }
         let temporary = path.with_extension(format!("new-{}", random_hex::<4>()?));
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         let written = file.write_all(&aad).and_then(|()| file.write_all(&nonce)).and_then(|()| file.write_all(&sealed)).and_then(|()| file.sync_all());
         if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, path)) {
             let _ = std::fs::remove_file(&temporary);
@@ -208,6 +233,7 @@ impl Vault {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
@@ -230,6 +256,7 @@ mod tests {
         vault.save(&path).unwrap();
         let raw = std::fs::read(&path).unwrap();
         assert!(memchr::memmem::find(&raw, b"hunter22").is_none());
+        #[cfg(unix)]
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let opened = Vault::open(&path, b"correct horse").unwrap();
         assert_eq!(opened.entries, vault.entries);

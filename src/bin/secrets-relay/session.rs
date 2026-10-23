@@ -5,14 +5,14 @@
 //! its Claude Code process.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use secrets::vault::random_hex;
 use serde::Deserialize;
 use serde_json::json;
+use secrets::local::{Listener, Stream};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -88,13 +88,26 @@ struct Attach {
     upstream: String,
 }
 
-/// Binds the session's two sockets beside the daemon's, mode 0600, and serves them.
+const ID_BYTES: usize = 8;
+
+/// A session's two sockets beside the daemon's: its own and its ssh-agent.
+fn sockets(daemon: &Path, id: &str) -> (PathBuf, PathBuf) {
+    (PathBuf::from(format!("{}-{id}", daemon.display())), PathBuf::from(format!("{}-{id}.agent", daemon.display())))
+}
+
+/// The longer of the two socket paths a session gets beside `daemon`.
+pub fn longest_socket(daemon: &Path) -> PathBuf {
+    sockets(daemon, &"0".repeat(2 * ID_BYTES)).1
+}
+
+/// Binds the session's two sockets beside the daemon's, mode 0600 on Unix, and serves them.
 fn open(ctx: &Shared, state: &mut State, claude_code: i32, started: u64) -> Result<Id, String> {
-    let hex = random_hex::<8>().map_err(|e| e.to_string())?;
-    let socket = PathBuf::from(format!("{}-{hex}", ctx.socket.display()));
-    let agent = PathBuf::from(format!("{}-{hex}.agent", ctx.socket.display()));
+    let hex = random_hex::<ID_BYTES>().map_err(|e| e.to_string())?;
+    let (socket, agent) = sockets(&ctx.socket, &hex);
+    #[cfg(unix)]
     let old = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o177));
-    let bound = [&socket, &agent].map(|p| UnixListener::bind(p).map_err(|error| format!("can't listen on {}: {error}", p.display())));
+    let bound = [&socket, &agent].map(|p| Listener::bind(p).map_err(|error| format!("can't listen on {}: {error}", p.display())));
+    #[cfg(unix)]
     rustix::process::umask(old);
     let (listener, agent_listener) = match bound {
         [Ok(listener), Ok(agent_listener)] => (listener, agent_listener),
@@ -128,7 +141,7 @@ fn open(ctx: &Shared, state: &mut State, claude_code: i32, started: u64) -> Resu
 /// `POST /attach {upstream}` on the daemon's socket: the session of the peer's parent, Claude Code, made at its first
 /// attach; 200, then its events as JSON lines until either side hangs up, the first `{"ready": socket, "agent",
 /// "vault", "bin"}`, then whether `/mask` has values and the requests still waiting.
-pub async fn attach(mut stream: UnixStream, ctx: Shared, body: &[u8]) {
+pub async fn attach(mut stream: Stream, ctx: Shared, body: &[u8]) {
     let Some(peer) = peer::peer_pid(&stream) else { return respond(&mut stream, "403 Forbidden", b"").await };
     // Only the hooks' attach reads the events: any other child of Claude Code (an MCP server, a settings hook) would
     // take the session's requests over.

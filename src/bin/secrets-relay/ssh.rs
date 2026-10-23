@@ -5,16 +5,16 @@
 use std::path::Path;
 
 use secrets::agent;
+use secrets::local::{self, Listener, Stream};
 use secrets::vault::Entry;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{UnixListener, UnixStream};
 
 use crate::access::Grant;
 use crate::session::Id;
 use crate::{Context, Decision, Shared, decide, emit, lock, locker, note, peer};
 
-async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+async fn read_frame(stream: &mut Stream) -> Option<Vec<u8>> {
     let mut length = [0u8; 4];
     stream.read_exact(&mut length).await.ok()?;
     let length = usize::try_from(u32::from_be_bytes(length)).ok().filter(|n| (1..=agent::FRAME_MAX).contains(n))?;
@@ -25,7 +25,7 @@ async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
 
 /// One request to the user's own agent; its reply's body, or None when it can't be reached.
 async fn ask_upstream(path: &Path, body: &[u8]) -> Option<Vec<u8>> {
-    let mut stream = UnixStream::connect(path).await.ok()?;
+    let mut stream = local::connect(path).await.ok()?;
     stream.write_all(&agent::frame(body)).await.ok()?;
     read_frame(&mut stream).await
 }
@@ -44,13 +44,13 @@ fn vault_keys(ctx: &Context) -> Vec<(Entry, ssh_key::PrivateKey, Vec<u8>)> {
 }
 
 /// Serves the session's agent socket until the session ends.
-pub async fn accept(listener: UnixListener, ctx: Shared, session: Id) {
-    while let Ok((stream, _)) = listener.accept().await {
+pub async fn accept(mut listener: Listener, ctx: Shared, session: Id) {
+    while let Ok(stream) = listener.accept().await {
         tokio::spawn(serve(stream, ctx.clone(), session));
     }
 }
 
-async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
+async fn serve(mut stream: Stream, ctx: Shared, session: Id) {
     let peer = peer::peer_pid(&stream);
     while let Some(body) = read_frame(&mut stream).await {
         let reply = reply(&mut stream, &ctx, session, peer, &body).await;
@@ -60,7 +60,7 @@ async fn serve(mut stream: UnixStream, ctx: Shared, session: Id) {
     }
 }
 
-async fn reply(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option<i32>, body: &[u8]) -> Vec<u8> {
+async fn reply(stream: &mut Stream, ctx: &Context, session: Id, peer: Option<i32>, body: &[u8]) -> Vec<u8> {
     let upstream = lock(ctx).sessions.get(&session).and_then(|s| if s.access.forward() { s.upstream.clone() } else { None });
     match agent::parse_request(body) {
         agent::Request::Identities => {
@@ -91,7 +91,7 @@ async fn reply(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option
 fn sign_event(ctx: &Context, session: Id, peer: Option<i32>, entry: Option<&Entry>) -> Option<serde_json::Value> {
     let state = lock(ctx);
     let open = state.sessions.get(&session)?;
-    let by = peer::requester(peer, &ctx.mask_run, open.claude_code);
+    let by = peer::requester(peer, &ctx.mask_run, open.claude_code, &state.filter);
     let live = state.filter.live(open.claude_code);
     Some(match entry {
         Some(entry) => json!({ "forwarded": false, "tag": entry.tag, "name": entry.name, "kind": entry.kind, "access": open.access.of(&entry.id), "pid": by.pid, "cmdline": by.cmdline, "inside": by.inside, "live": live }),
@@ -100,7 +100,7 @@ fn sign_event(ctx: &Context, session: Id, peer: Option<i32>, entry: Option<&Entr
 }
 
 /// Passes a signature request on to the user's own agent once the session's hooks give it.
-async fn forward(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option<i32>, path: &Path, body: &[u8]) -> Vec<u8> {
+async fn forward(stream: &mut Stream, ctx: &Context, session: Id, peer: Option<i32>, path: &Path, body: &[u8]) -> Vec<u8> {
     let Some(event) = sign_event(ctx, session, peer, None) else { return vec![agent::FAILURE] };
     if !matches!(decide(stream, ctx, session, "sign", event).await, Some(Decision::Give | Decision::Session)) {
         return vec![agent::FAILURE];
@@ -110,7 +110,7 @@ async fn forward(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Opti
 
 /// Signs with a vault key once the session's hooks give it.
 #[expect(clippy::too_many_arguments, reason = "the request's parts, as the agent protocol hands them over")]
-async fn sign_with(stream: &mut UnixStream, ctx: &Context, session: Id, peer: Option<i32>, entry: &Entry, key: &ssh_key::PrivateKey, data: &[u8], flags: u32) -> Vec<u8> {
+async fn sign_with(stream: &mut Stream, ctx: &Context, session: Id, peer: Option<i32>, entry: &Entry, key: &ssh_key::PrivateKey, data: &[u8], flags: u32) -> Vec<u8> {
     let Some(event) = sign_event(ctx, session, peer, Some(entry)) else { return vec![agent::FAILURE] };
     let decision = decide(stream, ctx, session, "sign", event).await;
     if decision == Some(Decision::Session)

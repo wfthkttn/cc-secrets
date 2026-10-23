@@ -9,21 +9,41 @@ publish = false
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 base64 = "0.23.1"
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
-listenfd = "1.0.2"
 memchr = "2.8.3"
 rsa = "0.9.10"
-rustix = { version = "1.1.5", features = ["event", "fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
 sha2 = "0.10.9"
-signal-hook = "0.4.5"
 ssh-encoding = { version = "0.2.0", features = ["alloc"] }
 ssh-key = { version = "0.6.7", features = ["ed25519", "rsa", "p256", "p384"] }
 tokio = { version = "1.53.2", features = ["rt", "macros", "net", "io-util", "sync", "signal", "time"] }
 zeroize = "1.9.1"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", features = ["event", "fs", "process"] }
+signal-hook = "0.4.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+listenfd = "1.0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.190"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 
 # Unlocking derives a key with 64 MiB of Argon2; unoptimized, the tests would wait seconds on each one.
 [profile.dev.package.argon2]

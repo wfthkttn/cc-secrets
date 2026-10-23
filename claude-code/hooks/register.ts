@@ -45,7 +45,6 @@ const DRAWER_COLUMNS = 64
 const POPOUT_MS = 15000
 const NOTICE_MS = 10000
 const RELAY_START_MS = 5000
-const MASK_RUN = '/secrets-mask-run'
 /** The waits before attaching again once an attach ended, doubling from the first; past the last it stops trying. */
 const REATTACH_FIRST_MS = 1000
 const REATTACH_LAST_MS = 60000
@@ -149,6 +148,11 @@ let relaySocket: string | null = null
 let relayReady = false
 /** The user's own ssh-agent, which the session's agent may forward to; empty when there is none. */
 let upstream = ''
+/**
+ * Claude Code runs natively on Windows: the helpers end in `.exe`, PATH is `;`-separated, and the session's ssh-agent
+ * stays off (neither Windows' ssh nor Git Bash's is known to reach an AF_UNIX agent).
+ */
+let isWindows = false
 /** Claude Code's transcripts folder, from the last classic session start; unknown before it. */
 let projectsDir: string | null = null
 /** Masking replaced something this session, so `[secret]` in content may be a masked read; kept across reloads in `$.state`. */
@@ -310,16 +314,19 @@ export function register(on: On) {
     unlockAtStart = await option($, 'unlockAtStart', true)
     hasMasked = (await $.state.get({ plugin: 'secrets', key: 'hasMasked' })).value ?? false
 
-    // macOS has no XDG_RUNTIME_DIR; its per-user private directory is TMPDIR, where the daemon there listens.
-    const runtimeDir = ((await $.env.get('XDG_RUNTIME_DIR')) || (await $.env.get('TMPDIR')))?.replace(/\/+$/, '')
-    if (!runtimeDir) {
-      throw new Error("secrets: neither XDG_RUNTIME_DIR nor TMPDIR is set, so the secrets daemon's socket is unknown")
+    isWindows = (await $.env.get('OS')) === 'Windows_NT'
+    if (!isWindows) {
+      // macOS has no XDG_RUNTIME_DIR; its per-user private directory is TMPDIR, where the daemon there listens.
+      const runtimeDir = ((await $.env.get('XDG_RUNTIME_DIR')) || (await $.env.get('TMPDIR')))?.replace(/\/+$/, '')
+      if (!runtimeDir) {
+        throw new Error("secrets: neither XDG_RUNTIME_DIR nor TMPDIR is set, so the secrets daemon's socket is unknown")
+      }
+      const daemon = (await $.env.get('SECRETS_DAEMON')) || `${runtimeDir}/secrets.sock`
+      const agent = await $.env.get('SSH_AUTH_SOCK')
+      // On a reload the agent is this session's own, or an older build's relay's; the one found first is the user's.
+      if (agent && !agent.startsWith(daemon + '-') && !agent.startsWith(`${runtimeDir}/claude-secrets-`)) await $.env.set('SECRETS_ORIG_SSH_AUTH_SOCK', agent)
+      upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
     }
-    const daemon = (await $.env.get('SECRETS_DAEMON')) || `${runtimeDir}/secrets.sock`
-    const agent = await $.env.get('SSH_AUTH_SOCK')
-    // On a reload the agent is this session's own, or an older build's relay's; the one found first is the user's.
-    if (agent && !agent.startsWith(daemon + '-') && !agent.startsWith(`${runtimeDir}/claude-secrets-`)) await $.env.set('SECRETS_ORIG_SSH_AUTH_SOCK', agent)
-    upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
     // Commands see the daemon only once the session is attached: before, secrets-mask-run would let their output
     // through unmasked.
     const relay = await startRelay($)
@@ -330,8 +337,9 @@ export function register(on: On) {
       drawerTab = 'vault'
       await $.sidebar.select({ id: SIDEBAR_ID })
     }
-    const home = await $.env.get('HOME')
-    if (!home) throw new Error('secrets: HOME is not set, so the settings file for the auto-mode line is unknown')
+    // Claude Code finds its settings in the home Node reports, which on Windows is USERPROFILE whatever HOME says.
+    const home = isWindows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
+    if (!home) throw new Error(`secrets: ${isWindows ? 'USERPROFILE' : 'HOME'} is not set, so the settings file for the auto-mode line is unknown`)
     settingsPath = `${home}/.claude/settings.json`
     await readAutoMode($)
     configDraft = configApplied ?? SUGGESTED
@@ -341,7 +349,8 @@ export function register(on: On) {
   // A /clear, a resume or a fork goes on under another session id, whose grants are the relay's now. The first start's
   // id is named at session.start too, whichever of the two comes first.
   on('classic.SessionStart', async ($, e, next) => {
-    projectsDir = e.transcript_path.split('/').slice(0, -2).join('/')
+    // `<projects>/<project>/<session>.jsonl`, with `\` on Windows
+    projectsDir = e.transcript_path.replace(/[\\/][^\\/]*[\\/][^\\/]*$/, '')
     if (relayReady) await nameSession($, e.session_id)
     return next(e)
   })
@@ -721,28 +730,32 @@ async function reattach($: EngineInterface, why: Error, wait: number) {
 /** Points the session's commands at the attached session's sockets and the daemon's helpers, and names the session. */
 async function useRelay($: EngineInterface, relay: Attached) {
   relaySocket = relay.socket
-  await $.env.set('SSH_AUTH_SOCK', relay.agent)
+  if (!isWindows) await $.env.set('SSH_AUTH_SOCK', relay.agent)
   // The daemon's own resolved directory, not the plugin's: the daemon serves only the mask-run beside it.
   const bin = relay.bin
+  const helper = (name: string) => bin + (isWindows ? '\\' : '/') + name + (isWindows ? '.exe' : '')
+  const maskRun = helper('secrets-mask-run')
   await $.env.set('SECRETS_RELAY', relay.socket)
-  await $.env.set('SUDO_ASKPASS', bin + '/secrets-askpass-sudo')
-  await $.env.set('SSH_ASKPASS', bin + '/secrets-askpass-ssh')
+  // Windows' sudo takes no password helper.
+  if (!isWindows) await $.env.set('SUDO_ASKPASS', helper('secrets-askpass-sudo'))
+  await $.env.set('SSH_ASKPASS', helper('secrets-askpass-ssh'))
   await $.env.set('SSH_ASKPASS_REQUIRE', 'force')
-  await $.env.set('GIT_ASKPASS', bin + '/secrets-askpass-git')
+  await $.env.set('GIT_ASKPASS', helper('secrets-askpass-git'))
   const prefix = await $.env.get('CLAUDE_CODE_SHELL_PREFIX')
   // On a reload or a reattach the prefix is a mask-run of ours, maybe from an older build, whose bin is on PATH; the
   // one found first is the user's.
-  const previous = prefix?.endsWith(MASK_RUN) ? prefix.slice(0, -MASK_RUN.length) : null
+  const ours = maskRun.slice(bin.length)
+  const previous = prefix?.endsWith(ours) ? prefix.slice(0, -ours.length) : null
   if (prefix && previous === null) await $.env.set('SECRETS_ORIG_PREFIX', prefix)
-  await $.env.set('PATH', pathWith((await $.env.get('PATH')) ?? '', bin, previous))
-  await $.env.set('CLAUDE_CODE_SHELL_PREFIX', bin + MASK_RUN)
+  await $.env.set('PATH', pathWith((await $.env.get('PATH')) ?? '', bin, previous, isWindows ? ';' : ':'))
+  await $.env.set('CLAUDE_CODE_SHELL_PREFIX', maskRun)
   relayReady = true
   await nameSession($, await $.session.id())
   await sendSettings($)
 }
 
 async function readRelay($: EngineInterface, ready: (started: Attached) => void) {
-  const relay = $.process.spawn({ argv: [$.plugin.root + '/bin/secrets-relay', 'attach'], env: { SECRETS_UPSTREAM_AGENT: upstream } })
+  const relay = $.process.spawn({ argv: [$.plugin.root + '/bin/secrets-relay' + (isWindows ? '.exe' : ''), 'attach'], env: { SECRETS_UPSTREAM_AGENT: upstream } })
   let buffered = ''
   for await (const chunk of relay) {
     if (chunk.stream === 'stderr') {

@@ -11,7 +11,7 @@ use secrets::agent;
 use secrets::vault::{Entry, Kind, Vault, random_hex};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::net::UnixStream;
+use secrets::local::Stream;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::access::Grant;
@@ -135,7 +135,7 @@ fn opened(state: &mut State, vault: Vault) {
 }
 
 /// `POST /lock`: the open vault closes for every session, its suggestions gone; 204, 409 when it isn't open.
-pub async fn close(stream: &mut UnixStream, ctx: &Context) {
+pub async fn close(stream: &mut Stream, ctx: &Context) {
     let shown = {
         let mut state = lock(ctx);
         let shown = state.vault.shown();
@@ -159,7 +159,7 @@ struct Passphrase {
 
 /// `/unlock` or, with `create`, `/create`: 204 once open, 403 for a wrong passphrase, 409 when the vault isn't in
 /// a state to do it, 500 with the reason when the file can't be read or written.
-pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bool) {
+pub async fn open(stream: &mut Stream, ctx: &Shared, body: &[u8], create: bool) {
     let Ok(Passphrase { passphrase }) = serde_json::from_slice::<Passphrase>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let passphrase = Zeroizing::new(passphrase);
     let expected = if create { "absent" } else { "locked" };
@@ -199,7 +199,7 @@ pub async fn open(stream: &mut UnixStream, ctx: &Shared, body: &[u8], create: bo
 
 /// `POST /passphrase {passphrase}`: the open vault sealed under a new passphrase, its entries kept; 204 once saved,
 /// 409 when it isn't open, 400 for an empty passphrase, 500 with the reason when it can't be saved.
-pub async fn rekey(stream: &mut UnixStream, ctx: &Shared, body: &[u8]) {
+pub async fn rekey(stream: &mut Stream, ctx: &Shared, body: &[u8]) {
     let Ok(Passphrase { passphrase }) = serde_json::from_slice::<Passphrase>(body) else { return respond(stream, "400 Bad Request", b"").await };
     let passphrase = Zeroizing::new(passphrase);
     if passphrase.is_empty() {
@@ -262,11 +262,22 @@ enum Change {
     Forward { on: bool },
 }
 
+#[cfg(unix)]
+fn home() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME")
+}
+
+/// The home Windows programs use: a `HOME` set for Git Bash may be an MSYS path (`/c/Users/…`).
+#[cfg(windows)]
+fn home() -> Option<std::ffi::OsString> {
+    std::env::var_os("USERPROFILE")
+}
+
 /// An ssh key entry's value: the text of the unencrypted OpenSSH key file at `path` (`~/` is the home dir).
 fn key_text(path: &str) -> Result<String, String> {
     let path = path.trim();
     let file = match path.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set, so ~/ can't be read")?).join(rest),
+        Some(rest) => PathBuf::from(home().ok_or("the home folder isn't set (HOME, on Windows USERPROFILE), so ~/ can't be read")?).join(rest),
         None => PathBuf::from(path),
     };
     // The path is the form's value field, which may hold a secret typed there, so the reason leaves it out.
@@ -401,7 +412,7 @@ fn apply(ctx: &Context, session: Id, parsed: Change) -> Result<String, String> {
 }
 
 /// `POST /vault`: 200 `{id}` once applied (and saved, for a change to the entries); 400 with the reason.
-pub async fn change_vault(stream: &mut UnixStream, ctx: &Context, session: Id, body: &[u8]) {
+pub async fn change_vault(stream: &mut Stream, ctx: &Context, session: Id, body: &[u8]) {
     let result = match serde_json::from_slice::<Change>(body) {
         Ok(parsed) => apply(ctx, session, parsed),
         Err(e) => Err(format!("not a change: {e}")),

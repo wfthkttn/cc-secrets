@@ -401,22 +401,31 @@ fn pinned(mask_run: &Path, copies: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(copies.join("secrets-mask-run"))
 }
 
-/// The socket systemd passed, else a fresh bind of `path` (mode 0600); true when bound here, so the file is ours to
-/// remove.
-fn listener(path: &Path) -> Result<(UnixListener, bool), String> {
+/// A socket file this daemon bound, removed when it ends.
+struct Bound(Option<PathBuf>);
+
+impl Drop for Bound {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The socket systemd passed, else a fresh bind of `path` (mode 0600).
+fn listener(path: &Path) -> Result<(std::os::unix::net::UnixListener, Bound), String> {
     let mut passed = listenfd::ListenFd::from_env();
     if let Some(listener) = passed.take_unix_listener(0).map_err(|e| format!("can't take the socket systemd passed: {e}"))? {
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        return UnixListener::from_std(listener).map(|l| (l, false)).map_err(|e| e.to_string());
+        return Ok((listener, Bound(None)));
     }
     if std::os::unix::net::UnixStream::connect(path).is_ok() {
         return Err(format!("another daemon answers on {}", path.display()));
     }
     let _ = std::fs::remove_file(path);
     let old = rustix::process::umask(Mode::from_raw_mode(0o177));
-    let bound = UnixListener::bind(path).map_err(|error| format!("can't listen on {}: {error}", path.display()));
+    let bound = std::os::unix::net::UnixListener::bind(path).map_err(|error| format!("can't listen on {}: {error}", path.display()));
     rustix::process::umask(old);
-    bound.map(|l| (l, true))
+    bound.map(|l| (l, Bound(Some(path.to_owned()))))
 }
 
 fn daemon(socket: Option<PathBuf>) -> ExitCode {
@@ -435,6 +444,14 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
         Ok(path) => path,
         Err(error) => {
             note(error);
+            return ExitCode::FAILURE;
+        }
+    };
+    // first: until this daemon holds the socket, the helpers beside it may be a running daemon's
+    let (listener, _bound) = match listener(&socket) {
+        Ok(bound) => bound,
+        Err(error) => {
+            note(&error);
             return ExitCode::FAILURE;
         }
     };
@@ -459,10 +476,10 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
         }
     };
     runtime.block_on(async move {
-        let (listener, is_ours) = match listener(&socket) {
-            Ok(bound) => bound,
+        let listener = match listener.set_nonblocking(true).and_then(|()| UnixListener::from_std(listener)) {
+            Ok(listener) => listener,
             Err(error) => {
-                note(&error);
+                note(&format!("can't listen on {}: {error}", socket.display()));
                 return ExitCode::FAILURE;
             }
         };
@@ -487,9 +504,6 @@ fn daemon(socket: Option<PathBuf>) -> ExitCode {
             }
         }
         lock(&ctx).sessions.clear();
-        if is_ours {
-            let _ = std::fs::remove_file(&socket);
-        }
         ExitCode::SUCCESS
     })
 }

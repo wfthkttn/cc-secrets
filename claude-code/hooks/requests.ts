@@ -428,7 +428,8 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   const entry = entries.find(e => e.id === row.id)!
   const isField = row.kind === 'fieldTop' || row.kind === 'field' || row.kind === 'fieldBottom'
   if (isField && onButton) return withEdit(state, current, { id: row.id, kind: 'cancel' })
-  const showStart = FIELD_TEXT_START + fieldRoom(frame.columns, offerOf(entry).length > 0)
+  const room = fieldRoom(frame.columns, offerOf(entry).length > 0)
+  const showStart = FIELD_TEXT_START + room
   if (row.kind === 'field' && x >= showStart && x < showStart + SHOW_COLUMNS && takesTyping(entry, state.pending, frame)) {
     return withEdit(state, row.id, { id: row.id, kind: 'peek' })
   }
@@ -437,7 +438,7 @@ export function onClick(state: ListState, entries: RequestEntry[], frame: Frame,
   if (isField && offerOf(entry).length > 0 && (x >= showStart + SHOW_COLUMNS || !typing)) return openMenu(state, entries, frame, entry)
   if (isField && x >= FIELD_TEXT_START && x < showStart && typing) {
     const drawnCaret = row.id === current && state.isFocused ? state.caret : null
-    const caret = caretAt(valueOf(entry, state.pending), drawnCaret, fieldRoom(frame.columns, false), x - FIELD_TEXT_START)
+    const caret = caretAt(valueOf(entry, state.pending), drawnCaret, room, x - FIELD_TEXT_START)
     const placed = { ...focused, selected: row.id, caret }
     return { state: placed, post: postOf(placed, row.id) }
   }
@@ -468,8 +469,13 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
   const tabRows = props.tabs === null ? 0 : TAB_ROWS
   // A copy over a held instance keeps no state of its own and posts nothing until a click or a key claims it.
   const isCopy = props.mirror && surface.state === undefined
-  const begin = () =>
-    surface.state ?? (props.resume === null ? initialState(props.focusEpoch, Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
+  let state = surface.state ?? (props.resume === null ? initialState(props.focusEpoch, Math.random().toString(36).slice(2)) : { ...props.resume, pending: [] })
+  const confirmed = confirm(state, props.applied[state.instance])
+  if (confirmed !== null) state = confirmed
+  if (state.epoch !== props.focusEpoch) state = { ...state, isFocused: false, isMenuOpen: false, epoch: props.focusEpoch }
+  // A copy's click or key acts on what it draws.
+  const drawn = state
+  const begin = () => surface.state ?? drawn
   const post = (result: Result) => surface.post(isCopy ? { ...sent(result, props.entries), claimed: true } : sent(result, props.entries))
   surface.onPointer(p => {
     if (p.type !== 'down') return
@@ -490,10 +496,6 @@ const Requests: ClientModule<RequestsProps, ListState> = (props, surface) => {
     surface.setState(result.state)
     post(result)
   })
-  let state = begin()
-  const confirmed = confirm(state, props.applied[state.instance])
-  if (confirmed !== null) state = confirmed
-  if (state.epoch !== props.focusEpoch) state = { ...state, isFocused: false, isMenuOpen: false, epoch: props.focusEpoch }
   if (!isCopy) {
     const pasted = withPastes(state, props)
     if (state !== surface.state || pasted !== state) surface.setState(pasted)

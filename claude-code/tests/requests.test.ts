@@ -21,7 +21,7 @@ import {
   view,
   withPastes,
 } from '../hooks/requests'
-import { END_CARET } from '../hooks/controls'
+import { caretAt, END_CARET } from '../hooks/controls'
 import type { RequestEntry } from '../hooks/requests-props'
 
 const entry = (id: string, prompt: string, length = 0): RequestEntry => ({ id, kind: 'secret', prompt, source: 'echo', since: '04:00:00', length, text: null, offer: null, chosen: null })
@@ -120,6 +120,16 @@ test('a click on a typing card\'s value puts the caret there; the hooks\' paste 
   expect([taken.caret, taken.pasted]).toEqual([5, 9])
   expect(withPastes(taken, { pastes, entries: [typed] })).toBe(taken)
   expect(withPastes(placed.state, { pastes: [{ ...pastes[0]!, id: 'b' }], entries: [typed] }).caret).toBe(2)
+})
+
+test('a click on a scrolled value in a card that offers vault entries lands on the character drawn there', async () => {
+  const value = 'x'.repeat(50) + 'abcdefghij'
+  const offered = { ...entry('a', 'db', 60), text: value, offer: [{ id: 'e1', label: 'Prod DB · db' }] }
+  const field = layout([offered], 60, null).findIndex(r => r.kind === 'field')
+  const focused = { ...START, isFocused: true, selected: 'a', caret: 60 }
+  const caret = onClick(focused, [offered], FRAME, field, 4).state.caret
+  expect(caret).toBe(caretAt(value, 60, fieldRoom(60, true), 0))
+  expect(caret).not.toBe(caretAt(value, 60, fieldRoom(60, false), 0))
 })
 
 test('every request is a card: what, where from, then its field and Cancel', async () => {

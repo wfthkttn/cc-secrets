@@ -475,12 +475,12 @@ fn pinned(mask_run: &Path, copies: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(copies.join(executable_name("secrets-mask-run")))
 }
 
-/// A socket file this daemon bound, removed when it ends.
-struct Bound(Option<PathBuf>);
+/// A socket file this daemon bound, removed when it ends, and the start lock it holds till then (`start_lock`).
+struct Bound(Option<(PathBuf, std::fs::File)>);
 
 impl Drop for Bound {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
+        if let Some((path, _lock)) = &self.0 {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -605,12 +605,30 @@ fn passed_listener() -> Result<Option<std::os::unix::net::UnixListener>, String>
     }
 }
 
+/// `<socket>.lock`, held from before the connect check to the end: without it, two daemons started at once could both
+/// find nothing answering, and the later one would remove the earlier one's socket. The file stays; removed, a
+/// third daemon could lock a new one beside a held one.
+fn start_lock(socket: &Path) -> Result<std::fs::File, String> {
+    let path = PathBuf::from(format!("{}.lock", socket.display()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&path).map_err(|error| format!("can't open {}: {error}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!("another daemon is starting or running on {} (it holds {})", socket.display(), path.display())),
+        Err(std::fs::TryLockError::Error(error)) => Err(format!("can't lock {}: {error}", path.display())),
+    }
+}
+
 /// The socket the service manager passed, else a fresh bind of `path` (mode 0600 on Unix). Inside the tokio runtime.
 fn listener(path: &Path) -> Result<(Listener, Bound), String> {
     #[cfg(unix)]
     if let Some(listener) = passed_listener()? {
         return Listener::from_std(listener).map(|l| (l, Bound(None))).map_err(|e| e.to_string());
     }
+    let lock = start_lock(path)?;
     if secrets::local::connect_blocking(path).is_ok() {
         return Err(format!("another daemon answers on {}", path.display()));
     }
@@ -620,7 +638,7 @@ fn listener(path: &Path) -> Result<(Listener, Bound), String> {
     let bound = Listener::bind(path).map_err(|error| format!("can't listen on {}: {error}", path.display()));
     #[cfg(unix)]
     rustix::process::umask(old);
-    bound.map(|l| (l, Bound(Some(path.to_owned()))))
+    bound.map(|l| (l, Bound(Some((path.to_owned(), lock)))))
 }
 
 /// No other process of the user, nor a core dump, can read this one's memory.

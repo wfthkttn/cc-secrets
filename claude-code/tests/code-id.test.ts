@@ -75,6 +75,63 @@ test('a folder linked back into itself is walked once, and a link leading nowher
   expect(await codeIdentity('/p', fakeFs(under('/p', PLUGIN), { '/p/dangling': '/nowhere' }))).not.toBe(id)
 })
 
+test('a link re-pointed to another folder the plugin holds gives another identity', async () => {
+  const two = under('/p', { ...PLUGIN, 'a/impl.ts': 'one', 'b/impl.ts': 'two' })
+  const toA = await codeIdentity('/p', fakeFs(two, { '/p/z': '/p/a' }))
+  expect(await codeIdentity('/p', fakeFs(two, { '/p/z': '/p/b' }))).not.toBe(toA)
+  expect(await codeIdentity('/p', fakeFs(two))).not.toBe(toA)
+})
+
+test('a file link re-pointed to a file with the same bytes gives another identity', async () => {
+  const twins = under('/p', { ...PLUGIN, 'a/entry.ts': 'same', 'b/entry.ts': 'same' })
+  const toA = await codeIdentity('/p', fakeFs(twins, { '/p/active.ts': '/p/a/entry.ts' }))
+  expect(await codeIdentity('/p', fakeFs(twins, { '/p/active.ts': '/p/b/entry.ts' }))).not.toBe(toA)
+})
+
+test("the engine's types don't count through a link to the folder that holds them either", async () => {
+  const typed = (text: string) => fakeFs(under('/p', { ...PLUGIN, '.claude-plugin/types/claude-code/index.d.ts': text }), { '/p/z': '/p/.claude-plugin' })
+  expect(await codeIdentity('/p', typed('one'))).toBe(await codeIdentity('/p', typed('two')))
+})
+
+test('a link put in place of the types counts, so code it leads to still does', async () => {
+  const changed = (text: string) => fakeFs(under('/p', { ...PLUGIN, 'hooks/register.ts': text }), { '/p/.claude-plugin/types': '/p' })
+  expect(await codeIdentity('/p', changed('one'))).not.toBe(await codeIdentity('/p', changed('two')))
+})
+
+test('a backslash in a name is part of it outside Windows', async () => {
+  const named = (text: string) => fakeFs(under('/p', { ...PLUGIN, '.claude-plugin/types/claude-code/index.d.ts': 'x', '.claude-plugin\\types/payload.js': text }))
+  expect(await codeIdentity('/p', named('one'))).not.toBe(await codeIdentity('/p', named('two')))
+})
+
+test('a link inside a folder installed as a link into a store counts as in the copy', async () => {
+  const hooks = { 'hooks/hooks.json': PLUGIN['hooks/hooks.json']!, 'hooks/register.ts': PLUGIN['hooks/register.ts']!, 'hooks/impl.ts': 'impl' }
+  const copy = fakeFs(under('/p', { ...PLUGIN, ...hooks }), { '/p/hooks/active.ts': '/p/hooks/impl.ts' })
+  const store = fakeFs(
+    { '/p/.claude-plugin/plugin.json': PLUGIN['.claude-plugin/plugin.json']!, ...under('/store', hooks) },
+    { '/p/hooks': '/store/hooks', '/store/hooks/active.ts': '/store/hooks/impl.ts' },
+  )
+  expect(await codeIdentity('/p', store)).toBe(await codeIdentity('/p', copy))
+})
+
+test('a link back into the plugin counts by which folder it leads to', async () => {
+  const files = under('/p', PLUGIN)
+  const toRoot = await codeIdentity('/p', fakeFs(files, { '/p/hooks/up': '/p' }))
+  expect(await codeIdentity('/p', fakeFs(files, { '/p/hooks/up': '/p/hooks' }))).not.toBe(toRoot)
+  expect(await codeIdentity('/p', fakeFs(files, { '/p/hooks/up': '/p' }))).toBe(toRoot)
+})
+
+test('folders linked into each other past the limit reject', async () => {
+  const links: Record<string, string> = {}
+  const files: Record<string, string> = {}
+  for (let level = 0; level <= 20; level++) {
+    files[`/p/d${level}/f`] = 'leaf'
+    if (level === 20) continue
+    links[`/p/d${level}/x`] = `/p/d${level + 1}`
+    links[`/p/d${level}/y`] = `/p/d${level + 1}`
+  }
+  await expect(codeIdentity('/p/d0', fakeFs(files, links))).rejects.toThrow('paths')
+})
+
 test("a file that can't be read rejects", async () => {
   const fs = fakeFs(under('/p', PLUGIN))
   const failing: CodeFs = { ...fs, bytes: async path => (path.endsWith('register.ts') ? Promise.reject(new Error('over 4 MiB')) : fs.bytes(path)) }

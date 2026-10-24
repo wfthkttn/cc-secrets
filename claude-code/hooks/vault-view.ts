@@ -694,7 +694,19 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const { columns } = props
   // A copy over a held instance keeps no state of its own and posts nothing until a click or a key claims it.
   const isCopy = props.mirror && surface.state === undefined
-  const begin = () => surface.state ?? startState(props, Math.random().toString(36).slice(2))
+  const isClosed = props.state !== 'open'
+  let state = surface.state ?? startState(props, Math.random().toString(36).slice(2))
+  const confirmed = confirm(state, props.applied[state.instance])
+  if (confirmed !== null) state = confirmed
+  if (state.formEpoch !== props.formEpoch) {
+    // a field of the form the hooks closed can't keep the keys, as after Cancel
+    const focus = state.rekeying ? 'rekey' : state.form === null ? state.focus : state.form.id === null ? 'add' : 'row:' + state.form.id
+    state = { ...state, form: null, rekeying: false, open: null, formEpoch: props.formEpoch, focus }
+  }
+  if (state.isClosed !== isClosed) state = { ...state, isClosed, focus: isClosed ? 'passphrase' : 'add', confirming: null, open: null }
+  // A copy's click or key acts on what it draws.
+  const drawn = state
+  const begin = () => surface.state ?? drawn
   const posted = (result: Result, claimed: boolean): VaultMessage => (claimed ? { ...sent(result), claimed: true } : sent(result))
   surface.onPointer(p => {
     if (isCopy && p.type !== 'down') return
@@ -710,12 +722,6 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
     surface.setState(result.state)
     surface.post(posted(result, isCopy))
   })
-  const isClosed = props.state !== 'open'
-  let state = begin()
-  const confirmed = confirm(state, props.applied[state.instance])
-  if (confirmed !== null) state = confirmed
-  if (state.formEpoch !== props.formEpoch) state = { ...state, form: null, rekeying: false, open: null, formEpoch: props.formEpoch }
-  if (state.isClosed !== isClosed) state = { ...state, isClosed, focus: isClosed ? 'passphrase' : 'add', confirming: null, open: null }
   if (!isCopy) {
     const pasted = withPastes(state, props)
     if (state !== surface.state || pasted !== state) surface.setState(pasted)

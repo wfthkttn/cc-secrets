@@ -401,14 +401,30 @@ fn pinned(mask_run: &Path, copies: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(copies.join("secrets-mask-run"))
 }
 
-/// A socket file this daemon bound, removed when it ends.
-struct Bound(Option<PathBuf>);
+/// A socket file this daemon bound, removed when it ends, and the start lock it holds till then (`start_lock`).
+struct Bound(Option<(PathBuf, std::fs::File)>);
 
 impl Drop for Bound {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
+        if let Some((path, _lock)) = &self.0 {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+/// `<socket>.lock`, held from before the connect check to the end: without it, two daemons started at once could both
+/// find nothing answering, and the later one would remove the earlier one's socket. The file stays; removed, a
+/// third daemon could lock a new one beside a held one.
+fn start_lock(socket: &Path) -> Result<std::fs::File, String> {
+    let path = PathBuf::from(format!("{}.lock", socket.display()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&path).map_err(|error| format!("can't open {}: {error}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!("another daemon is starting or running on {} (it holds {})", socket.display(), path.display())),
+        Err(std::fs::TryLockError::Error(error)) => Err(format!("can't lock {}: {error}", path.display())),
     }
 }
 
@@ -418,6 +434,7 @@ fn listener(path: &Path) -> Result<(std::os::unix::net::UnixListener, Bound), St
     if let Some(listener) = passed.take_unix_listener(0).map_err(|e| format!("can't take the socket systemd passed: {e}"))? {
         return Ok((listener, Bound(None)));
     }
+    let lock = start_lock(path)?;
     if std::os::unix::net::UnixStream::connect(path).is_ok() {
         return Err(format!("another daemon answers on {}", path.display()));
     }
@@ -425,7 +442,7 @@ fn listener(path: &Path) -> Result<(std::os::unix::net::UnixListener, Bound), St
     let old = rustix::process::umask(Mode::from_raw_mode(0o177));
     let bound = std::os::unix::net::UnixListener::bind(path).map_err(|error| format!("can't listen on {}: {error}", path.display()));
     rustix::process::umask(old);
-    bound.map(|l| (l, Bound(Some(path.to_owned()))))
+    bound.map(|l| (l, Bound(Some((path.to_owned(), lock)))))
 }
 
 fn daemon(socket: Option<PathBuf>) -> ExitCode {

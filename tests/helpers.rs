@@ -212,6 +212,7 @@ impl Drop for Relay {
     fn drop(&mut self) {
         self.stop();
         let _ = std::fs::remove_file(&self.daemon_socket);
+        let _ = std::fs::remove_file(format!("{}.lock", self.daemon_socket.display()));
     }
 }
 
@@ -613,11 +614,44 @@ fn a_second_daemon_on_the_socket_refuses_and_leaves_the_running_ones_helpers() {
     let other = data_dir("second-other");
     let second = Command::new(RELAY).args(["daemon", "--socket"]).arg(&relay.daemon_socket).env("XDG_DATA_HOME", &other).output().unwrap();
     assert!(!second.status.success());
-    assert!(String::from_utf8_lossy(&second.stderr).contains("another daemon answers"), "{}", String::from_utf8_lossy(&second.stderr));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("starting or running"), "{}", String::from_utf8_lossy(&second.stderr));
     assert!(relay.bin.join("secrets-mask-run").exists());
     assert_eq!(stdout(&run(relay.mask_run("echo still pinned"))), "still pinned\n");
     relay.stop();
     assert!(!other.exists());
+}
+
+#[test]
+fn a_daemon_started_while_another_starts_refuses_and_leaves_its_socket() {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    let socket = dir.join(format!("secrets-test-starting-{}.sock", std::process::id()));
+    let lock_path = PathBuf::from(format!("{}.lock", socket.display()));
+    // the other daemon: holding the lock, its socket file there but not answering yet
+    std::fs::write(&socket, "").unwrap();
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).unwrap();
+    lock.try_lock().unwrap();
+    let data = data_dir("starting");
+    let mut second = Command::new(RELAY).args(["daemon", "--socket"]).arg(&socket).env("XDG_DATA_HOME", &data).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while second.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ended = second.try_wait().unwrap();
+    if ended.is_none() {
+        let _ = second.kill();
+    }
+    let stderr = String::from_utf8_lossy(&second.wait_with_output().unwrap().stderr).into_owned();
+    let (kept, made) = (socket.exists(), data.exists());
+    drop(lock);
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(&lock_path);
+    let _ = std::fs::remove_dir_all(&data);
+    // what a daemon that took the socket and was killed leaves
+    let _ = std::fs::remove_dir_all(format!("{}.bin", socket.display()));
+    assert!(ended.is_some_and(|status| !status.success()), "it took the socket: {stderr}");
+    assert!(stderr.contains("starting or running"), "{stderr}");
+    assert!(kept);
+    assert!(!made);
 }
 
 #[test]

@@ -708,8 +708,11 @@ const VaultView: ClientModule<VaultProps, ViewState> = (props, surface) => {
   const drawn = state
   const begin = () => surface.state ?? drawn
   const posted = (result: Result, claimed: boolean): VaultMessage => (claimed ? { ...sent(result), claimed: true } : sent(result))
+  // A copy's own press: its moves and release can come before the redraw that makes it an instance of its own.
+  let pressed = false
   surface.onPointer(p => {
-    if (isCopy && p.type !== 'down') return
+    if (isCopy && p.type !== 'down' && !pressed) return
+    if (p.type === 'down') pressed = true
     const current = begin()
     const result =
       p.type === 'down' ? onPress(current, props, p.y, p.x) : p.type === 'move' ? onDrag(current, props, p.y) : p.type === 'up' ? onRelease(current, props) : null

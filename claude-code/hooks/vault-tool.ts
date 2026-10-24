@@ -1,8 +1,8 @@
 import type { Access, EntryKind } from './vault-view-props'
 
-/** The name the tool is registered under; the model calls it `mcp__secrets__vault`. */
+/** The name the tool is registered under; the model calls it `mcp__cc-secrets__vault`. */
 export const VAULT_TOOL_NAME = 'vault'
-export const VAULT_TOOL = 'mcp__secrets__vault'
+export const VAULT_TOOL = 'mcp__cc-secrets__vault'
 export const SUBAGENT_REFUSED = 'secrets: subagents get nothing from the vault.'
 
 export const VAULT_DESCRIPTION = [

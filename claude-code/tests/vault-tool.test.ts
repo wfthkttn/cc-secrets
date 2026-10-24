@@ -25,5 +25,5 @@ test('the description teaches the ask inside the command, where a value may go, 
 test('the main loop calls the vault tool with no dialog; a subagent or a teammate is refused', async () => {
   expect(vaultVerdict(undefined)).toEqual({ decision: 'allow' })
   expect(vaultVerdict('a-1')).toEqual({ decision: 'deny', reason: SUBAGENT_REFUSED })
-  expect(VAULT_TOOL).toBe('mcp__secrets__vault')
+  expect(VAULT_TOOL).toBe('mcp__cc-secrets__vault')
 })

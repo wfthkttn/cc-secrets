@@ -1,4 +1,4 @@
-# secrets
+# cc-secrets
 
 Passwords and keys for the commands Claude Code runs, without the agent ever seeing them.
 
@@ -25,7 +25,7 @@ Linux and macOS, and Windows with a weaker guarantee, provided as is. See [Platf
   prints is masked before Claude Code reads it, with the open vault's values and the value the command was handed.
   Other tool results are masked too. A tool call that carries a vault value is stopped before it runs, and a write of
   `[secret]` over a real value is refused.
-- **The agent's view.** The tool `mcp__secrets__vault` lists the vault's entries (tag, kind, this session's access,
+- **The agent's view.** The tool `mcp__cc-secrets__vault` lists the vault's entries (tag, kind, this session's access,
   name; never a value) and tells the agent how to ask for one.
 - **Collisions.** A plugin loaded after this one whose hooks would see secrets in transit (tool calls, HTTP fetches,
   process spawns, environment changes) is shown in the Vault tab; until you allow it, typing and the vault are off.
@@ -43,7 +43,7 @@ http://localhost:8080/v1/whoami with it as a Bearer token.*
 The agent looks the vault up:
 
 ```
-mcp__secrets__vault {}
+mcp__cc-secrets__vault {}
 ```
 ```
 tag     kind      access  name
@@ -133,33 +133,33 @@ other systems aren't supported.
 - Linux with systemd (user services) and Yama `ptrace_scope` ≥ 1, macOS with Xcode's command line tools
   (`codesign`), or Windows 11 with Git for Windows, whose Git Bash Claude Code runs commands in.
 - Claude Code 2.1.293 or later, in fullscreen rendering.
-- The [sidebar](https://github.com/wfthkttn/sidebar) plugin, which draws the 🔐 drawer.
+- The [cc-sidebar](https://github.com/wfthkttn/cc-sidebar) plugin, which draws the 🔐 drawer.
 
 ## Install
 
 secrets is two parts that must come from the same build: the daemon, a systemd user service, and the plugin, whose
 `bin/` holds the helpers the daemon accepts calls from. Claude Code loads the plugin from a directory listed in
-`CLAUDE_CODE_PLUGIN_DIRS`, with secrets first: it checks only the plugins loaded after it.
+`CLAUDE_CODE_PLUGIN_DIRS`, with cc-secrets first: it checks only the plugins loaded after it.
 
 ### NixOS
 
 ```nix
 # flake.nix
-inputs.claude-secrets.url = "github:wfthkttn/claude-secrets";
-inputs.sidebar.url = "github:wfthkttn/sidebar";
+inputs.cc-secrets.url = "github:wfthkttn/cc-secrets";
+inputs.cc-sidebar.url = "github:wfthkttn/cc-sidebar";
 
 # configuration
-imports = [ inputs.claude-secrets.nixosModules.default ];
-services.claude-secrets.enable = true;
-environment.systemPackages = [ inputs.sidebar.packages.x86_64-linux.default ];
-environment.pathsToLink = [ "/share/sidebar" ];
+imports = [ inputs.cc-secrets.nixosModules.default ];
+services.cc-secrets.enable = true;
+environment.systemPackages = [ inputs.cc-sidebar.packages.x86_64-linux.default ];
+environment.pathsToLink = [ "/share/cc-sidebar" ];
 ```
 
 Then in `~/.claude/settings.json`:
 
 ```json
 "env": {
-  "CLAUDE_CODE_PLUGIN_DIRS": "/run/current-system/sw/share/secrets/claude-code:/run/current-system/sw/share/sidebar/claude-code"
+  "CLAUDE_CODE_PLUGIN_DIRS": "/run/current-system/sw/share/cc-secrets/claude-code:/run/current-system/sw/share/cc-sidebar/claude-code"
 }
 ```
 
@@ -168,9 +168,9 @@ Then in `~/.claude/settings.json`:
 Needs Rust 1.95 or later.
 
 ```sh
-git clone https://github.com/wfthkttn/sidebar
-git clone https://github.com/wfthkttn/claude-secrets
-cd claude-secrets
+git clone https://github.com/wfthkttn/cc-sidebar
+git clone https://github.com/wfthkttn/cc-secrets
+cd cc-secrets
 cargo build --release
 mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/secrets.socket <<EOF
@@ -201,7 +201,7 @@ Then in `~/.claude/settings.json`, with the two clones' paths:
 
 ```json
 "env": {
-  "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-secrets/claude-code:/path/to/sidebar"
+  "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/cc-secrets/claude-code:/path/to/cc-sidebar"
 }
 ```
 

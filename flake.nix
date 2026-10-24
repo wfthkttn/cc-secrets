@@ -1,5 +1,5 @@
 {
-  description = "secrets: passwords typed in Claude Code reach the command, never the agent";
+  description = "cc-secrets: passwords typed in Claude Code reach the command, never the agent";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
@@ -24,21 +24,21 @@
     in {
       # The plugin, with the daemon's programs on PATH and in its bin/, where the working copy points at cargo's target
       # dir instead.
-      packages.${system}.default = pkgs.runCommand "secrets-0.1.0" { passthru = { inherit daemon; }; } ''
-        mkdir -p $out/share/secrets $out/bin
-        cp -r ${./claude-code} $out/share/secrets/claude-code
-        chmod -R u+w $out/share/secrets/claude-code
-        rm $out/share/secrets/claude-code/bin
-        mkdir $out/share/secrets/claude-code/bin
-        ln -s ${daemon}/bin/* $out/share/secrets/claude-code/bin/
+      packages.${system}.default = pkgs.runCommand "cc-secrets-0.1.0" { passthru = { inherit daemon; }; } ''
+        mkdir -p $out/share/cc-secrets $out/bin
+        cp -r ${./claude-code} $out/share/cc-secrets/claude-code
+        chmod -R u+w $out/share/cc-secrets/claude-code
+        rm $out/share/cc-secrets/claude-code/bin
+        mkdir $out/share/cc-secrets/claude-code/bin
+        ln -s ${daemon}/bin/* $out/share/cc-secrets/claude-code/bin/
         ln -s ${daemon}/bin/* $out/bin/
       '';
 
-      # The plugin lands at /run/current-system/sw/share/secrets/claude-code, a path that stays put across rebuilds.
+      # The plugin lands at /run/current-system/sw/share/cc-secrets/claude-code, a path that stays put across rebuilds.
       nixosModules.default = { config, lib, ... }:
-        let cfg = config.services.claude-secrets;
+        let cfg = config.services.cc-secrets;
         in {
-          options.services.claude-secrets = {
+          options.services.cc-secrets = {
             enable = lib.mkEnableOption "the secrets vault daemon for Claude Code";
             package = lib.mkOption {
               type = lib.types.package;
@@ -48,7 +48,7 @@
           };
           config = lib.mkIf cfg.enable {
             environment.systemPackages = [ cfg.package ];
-            environment.pathsToLink = [ "/share/secrets" ];
+            environment.pathsToLink = [ "/share/cc-secrets" ];
             # one vault for every session: the first session's attach starts the daemon; systemd holds the socket
             # across restarts, so attaches made meanwhile queue instead of failing
             systemd.user.sockets.secrets = {

@@ -1,5 +1,5 @@
 import type { EngineInterface, On, Timer } from 'claude-code'
-import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from 'sidebar'
+import type { SidebarDrawerSlot, SidebarPopoutSlot, SidebarRowComponent } from 'cc-sidebar'
 
 import { appliedText, SUGGESTED, withText } from './auto-mode'
 import type { ConfigAction, ConfigMessage, ConfigProps, ConfigResume } from './config-view-props'
@@ -344,7 +344,7 @@ export function register(on: On) {
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
     maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
     unlockAtStart = await option($, 'unlockAtStart', true)
-    hasMasked = (await $.state.get({ plugin: 'secrets', key: 'hasMasked' })).value ?? false
+    hasMasked = (await $.state.get({ plugin: 'cc-secrets', key: 'hasMasked' })).value ?? false
 
     isWindows = (await $.env.get('OS')) === 'Windows_NT'
     if (!isWindows) {
@@ -833,7 +833,7 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
       else if ('masking' in event) masking = event.masking
       else if ('masked' in event) {
         hasMasked = true
-        await $.state.set({ plugin: 'secrets', key: 'hasMasked' }, true)
+        await $.state.set({ plugin: 'cc-secrets', key: 'hasMasked' }, true)
       } else say($, event.trouble, true)
       await syncBadge($)
       trace($, `relay event handled, ${requests.length} waiting`)

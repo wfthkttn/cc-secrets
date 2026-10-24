@@ -2,10 +2,13 @@
 #
 # Installs secrets for this user on Windows: the Claude Code plugin with its binaries in
 # %USERPROFILE%\.local\lib\secrets\claude-code, and a logon task, claude-secrets, that runs the daemon on
-# %LOCALAPPDATA%\secrets.sock with its log in %LOCALAPPDATA%\secrets\daemon.log. Run again to update; the running
-# daemon stops, which locks the vault, and sessions attach again to the new one. The plugin directory to load is
+# %LOCALAPPDATA%\secrets.sock with its log in %LOCALAPPDATA%\secrets\daemon.log. Run again to update; when the
+# binaries changed, the running daemon stops, which locks the vault, and sessions attach again to the new one; an
+# update of the plugin alone leaves the daemon, and the open vault, running. The plugin directory to load is
 # %USERPROFILE%\.local\lib\secrets\claude-code.
 $ErrorActionPreference = 'Stop'
+# robocopy exits 1 to 7 on success; its exit code is checked instead
+$PSNativeCommandUseErrorActionPreference = $false
 
 $repo = Split-Path -Parent $PSScriptRoot
 $plugin = "$env:USERPROFILE\.local\lib\secrets\claude-code"
@@ -15,6 +18,42 @@ $binaries = 'secrets-relay', 'secrets-mask-run', 'secrets', 'secrets-askpass', '
 
 cargo build --release --manifest-path "$repo\Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+
+# Mirrored in place, not replaced: a running session may hold the plugin's folder. Without the binaries, the installed
+# ones in bin stay as they are, running or not.
+function Copy-Plugin([bool] $withBinaries) {
+  $stage = Join-Path ([IO.Path]::GetTempPath()) "claude-secrets-install-$PID"
+  try {
+    # bin is a link to target\release in git, which a checkout on Windows makes a link or a file
+    robocopy "$repo\claude-code" $stage /E /XD "$repo\claude-code\bin" /XF "$repo\claude-code\bin" /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "staging the plugin failed: robocopy exit code $LASTEXITCODE" }
+    if ($withBinaries) {
+      New-Item -ItemType Directory "$stage\bin" | Out-Null
+      foreach ($binary in $binaries) { Copy-Item "$repo\target\release\$binary.exe" "$stage\bin\" }
+      robocopy $stage $plugin /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    } else {
+      robocopy $stage $plugin /MIR /XD "$plugin\bin" /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    }
+    if ($LASTEXITCODE -ge 8) { throw "copying the plugin to $plugin failed: robocopy exit code $LASTEXITCODE" }
+  } finally {
+    Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+  }
+}
+
+$changed = @($binaries | Where-Object {
+  $installed = "$plugin\bin\$_.exe"
+  -not (Test-Path $installed) -or (Get-FileHash $installed).Hash -ne (Get-FileHash "$repo\target\release\$_.exe").Hash
+})
+# Only while the task's daemon runs (a daemon that can't serve ends): after a run that failed half-way, the full
+# install below repairs the task and checks the daemon again.
+$registered = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+# a task disabled while its daemon runs still reports Running
+$serving = $registered -and $registered.Settings.Enabled -and $registered.State -eq 'Running'
+if ($changed.Count -eq 0 -and $serving) {
+  Copy-Plugin $false
+  "updated the plugin in $plugin; the binaries are the same, so the daemon keeps running"
+  exit 0
+}
 
 try {
   # Windows won't replace a running executable: the daemon and the sessions' attaches run the installed one. Disabled
@@ -34,19 +73,7 @@ try {
   # a killed daemon leaves its socket file; gone, it shows when the new daemon listens
   Remove-Item "$env:LOCALAPPDATA\secrets.sock" -ErrorAction SilentlyContinue
 
-  # Mirrored in place, not replaced: a running session may hold the plugin's folder.
-  $stage = Join-Path ([IO.Path]::GetTempPath()) "claude-secrets-install-$PID"
-  try {
-    # bin is a link to target\release in git, which a checkout on Windows makes a link or a file
-    robocopy "$repo\claude-code" $stage /E /XD "$repo\claude-code\bin" /XF "$repo\claude-code\bin" /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "staging the plugin failed: robocopy exit code $LASTEXITCODE" }
-    New-Item -ItemType Directory "$stage\bin" | Out-Null
-    foreach ($binary in $binaries) { Copy-Item "$repo\target\release\$binary.exe" "$stage\bin\" }
-    robocopy $stage $plugin /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "copying the plugin to $plugin failed: robocopy exit code $LASTEXITCODE" }
-  } finally {
-    Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
-  }
+  Copy-Plugin $true
 
   New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
   # not USERDOMAIN, which an ssh logon sets to the workgroup

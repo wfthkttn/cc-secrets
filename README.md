@@ -242,7 +242,8 @@ powershell -ExecutionPolicy Bypass -File claude-secrets\windows\install.ps1
 It builds, installs the plugin with its binaries in `%USERPROFILE%\.local\lib\secrets\claude-code`, and registers
 the logon task `claude-secrets`, which it starts and which starts a daemon that ended again within a minute; the
 daemon's log is `%LOCALAPPDATA%\secrets\daemon.log`. Run it
-again after an update; it stops the running daemon, which locks the vault. Then in `~/.claude/settings.json`, with
+again after an update; when the binaries changed, it stops the running daemon, which locks the vault, and an update
+of the plugin alone leaves the daemon and the open vault running. Then in `~/.claude/settings.json`, with
 your user and the sidebar clone's path, `;`-separated:
 
 ```json

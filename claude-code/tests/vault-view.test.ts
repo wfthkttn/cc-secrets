@@ -128,6 +128,13 @@ function instance(props: VaultProps) {
       const { y, x } = cellOf(props, current as ViewState, hit)
       onPointer({ type: 'down', y: y + TAB_ROWS, x })
     },
+    /** A press and its release, with no redraw between: the engine redraws on the next frame. */
+    tap: (hit: string) => {
+      const { y, x } = cellOf(props, (current ?? START) as ViewState, hit)
+      onPointer({ type: 'down', y: y + TAB_ROWS, x, button: 'left' })
+      onPointer({ type: 'up', y: y + TAB_ROWS, x, button: 'left' })
+    },
+    pointer: (p: object) => onPointer(p),
     key: (key: string) => onKeyFn({ key }),
   }
 }
@@ -171,6 +178,26 @@ test("the sidebar's copy over a held instance draws what the held one posts, pos
   copy.key('!')
   expect(copy.posts.at(-1)!.claimed).toBe(undefined)
   expect(copy.posts.at(-1)!.ui!.form?.name).toBe('Gox!')
+})
+
+test("a copy's quick tap on a row opens it: the release of the press it took reaches it before any redraw", async () => {
+  const held = instance(PROPS)
+  held.key('tab')
+  const copy = instance({ ...PROPS, mirror: true, resume: held.posts.at(-1)!.ui! })
+  copy.tap('row:e1')
+  const ui = copy.posts.at(-1)!.ui!
+  expect([ui.drag, ui.form?.id]).toEqual([null, 'e1'])
+  expect(copy.posts[0]!.claimed).toBe(true)
+})
+
+test('a copy takes no release of a press it never saw: that one belongs to the held instance', async () => {
+  const held = instance(PROPS)
+  held.key('tab')
+  const copy = instance({ ...PROPS, mirror: true, resume: held.posts.at(-1)!.ui! })
+  const { y, x } = cellOf(PROPS, START, 'row:e1')
+  copy.pointer({ type: 'move', y: y + TAB_ROWS, x, button: 'left' })
+  copy.pointer({ type: 'up', y: y + TAB_ROWS, x, button: 'left' })
+  expect(copy.posts).toEqual([])
 })
 
 test('a copy acts on what it draws: a form the hooks closed since takes none of its keys', async () => {

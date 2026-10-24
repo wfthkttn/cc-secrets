@@ -1111,6 +1111,8 @@ async function openVault($: EngineInterface) {
   emptyFields('passphrase', 'again')
   if (reply === null) return
   vaultError = reply.status === 204 ? null : reply.status === 403 ? 'Wrong passphrase.' : reply.text || `The relay answered ${reply.status}.`
+  // open, the view shows the list and moves the focus at its next draw; a paste before it lands in no hidden field
+  if (reply.status === 204) vaultFocused = null
 }
 
 /** Seals the open vault under the new passphrase typed twice; the fields empty either way, the form closes once done. */
@@ -1133,6 +1135,8 @@ async function rekeyVault($: EngineInterface) {
   }
   vaultError = null
   formEpoch += 1
+  // the view moves the focus off the closed form at its next draw; a paste before it lands in no hidden field
+  vaultFocused = null
 }
 
 /** True once the relay saved it; otherwise its reason shows in the form. */

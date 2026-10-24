@@ -12,12 +12,24 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $repo = Split-Path -Parent $PSScriptRoot
 $plugin = "$env:USERPROFILE\.local\lib\secrets\claude-code"
+# the install being replaced, kept until the new one runs
+$previous = "$plugin.previous"
+$kept = $false
+# a daemon or task of the install in place was stopped for the update
+$stopped = $false
 $task = 'claude-secrets'
 $log = "$env:LOCALAPPDATA\secrets\daemon.log"
 $binaries = 'secrets-relay', 'secrets-mask-run', 'secrets', 'secrets-askpass', 'secrets-askpass-sudo', 'secrets-askpass-ssh', 'secrets-askpass-git'
 
-cargo build --release --manifest-path "$repo\Cargo.toml"
+# Where cargo put each binary, as it reports it: a target dir set in the environment or a cargo config moves them.
+$built = @{}
+cargo build --release --manifest-path "$repo\Cargo.toml" --message-format=json-render-diagnostics | ForEach-Object {
+  $message = $_ | ConvertFrom-Json
+  if ($message.reason -eq 'compiler-artifact' -and $message.executable) { $built[$message.target.name] = $message.executable }
+}
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+$missing = @($binaries | Where-Object { -not $built.ContainsKey($_) })
+if ($missing.Count -gt 0) { throw "cargo reported no executable for $($missing -join ', ')" }
 
 # Mirrored in place, not replaced: a running session may hold the plugin's folder. Without the binaries, the installed
 # ones in bin stay as they are, running or not.
@@ -29,7 +41,7 @@ function Copy-Plugin([bool] $withBinaries) {
     if ($LASTEXITCODE -ge 8) { throw "staging the plugin failed: robocopy exit code $LASTEXITCODE" }
     if ($withBinaries) {
       New-Item -ItemType Directory "$stage\bin" | Out-Null
-      foreach ($binary in $binaries) { Copy-Item "$repo\target\release\$binary.exe" "$stage\bin\" }
+      foreach ($binary in $binaries) { Copy-Item $built[$binary] "$stage\bin\" }
       robocopy $stage $plugin /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
     } else {
       robocopy $stage $plugin /MIR /XD "$plugin\bin" /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
@@ -42,15 +54,32 @@ function Copy-Plugin([bool] $withBinaries) {
 
 $changed = @($binaries | Where-Object {
   $installed = "$plugin\bin\$_.exe"
-  -not (Test-Path $installed) -or (Get-FileHash $installed).Hash -ne (Get-FileHash "$repo\target\release\$_.exe").Hash
+  -not (Test-Path $installed) -or (Get-FileHash $installed).Hash -ne (Get-FileHash $built[$_]).Hash
 })
 # Only while the task's daemon runs (a daemon that can't serve ends): after a run that failed half-way, the full
 # install below repairs the task and checks the daemon again.
 $registered = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
 # a task disabled while its daemon runs still reports Running
 $serving = $registered -and $registered.Settings.Enabled -and $registered.State -eq 'Running'
+function Remove-Previous {
+  # the install it kept is in place or back; a copy that won't go only takes room, and the next update mirrors over it
+  try { Remove-Item -Recurse -Force $previous } catch { Write-Warning "couldn't remove $previous fully: $_" }
+}
+
 if ($changed.Count -eq 0 -and $serving) {
-  Copy-Plugin $false
+  # bin stays out of both copies: its files run, and they are the same
+  robocopy $plugin $previous /MIR /XD "$plugin\bin" /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+  if ($LASTEXITCODE -ge 8) { throw "keeping the installed plugin in $previous failed: robocopy exit code $LASTEXITCODE" }
+  try {
+    Copy-Plugin $false
+  } catch {
+    $failure = $_
+    robocopy $previous $plugin /MIR /XD "$plugin\bin" /R:10 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "$failure; putting the earlier plugin back from $previous failed too: robocopy exit code $LASTEXITCODE" }
+    Remove-Previous
+    throw $failure
+  }
+  Remove-Previous
   "updated the plugin in $plugin; the binaries are the same, so the daemon keeps running"
   exit 0
 }
@@ -61,11 +90,13 @@ try {
   if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) {
     Disable-ScheduledTask -TaskName $task | Out-Null
     Stop-ScheduledTask -TaskName $task
+    $stopped = $true
   }
   # also a daemon started by hand on the same socket, which would otherwise keep the vault beside the new one
   $running = @(Get-CimInstance Win32_Process -Filter "Name='secrets-relay.exe'" | Where-Object {
     $_.ExecutablePath -eq "$plugin\bin\secrets-relay.exe" -or ($_.CommandLine -match '\sdaemon(\s|$)' -and $_.CommandLine -notmatch '--socket')
   })
+  if ($running.Count -gt 0) { $stopped = $true }
   # one that can't be stopped (an elevated session's attach) keeps its executable locked, which the copy reports
   $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   # Stop-Process returns before the process is gone, and with it the lock on its executable
@@ -73,6 +104,11 @@ try {
   # a killed daemon leaves its socket file; gone, it shows when the new daemon listens
   Remove-Item "$env:LOCALAPPDATA\secrets.sock" -ErrorAction SilentlyContinue
 
+  if (Test-Path "$plugin\bin\secrets-relay.exe") {
+    robocopy $plugin $previous /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "keeping the installed plugin in $previous failed: robocopy exit code $LASTEXITCODE" }
+    $kept = $true
+  }
   Copy-Plugin $true
 
   New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
@@ -101,9 +137,32 @@ try {
   Start-Sleep 2
   if ((Get-ScheduledTask -TaskName $task).State -ne 'Running') { throw "the daemon ended right after it started; its log is $log" }
 } catch {
+  $failure = $_
+  $registered = [bool](Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue)
+  # registering enabled it: its minute trigger would start the new daemon while the earlier install goes back
+  if ($registered) {
+    Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null
+    Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+  }
+  # The install as it was, so the task starts the daemon that ran before: the new one failed to copy or to start.
+  $restore = $null
+  if ($kept) {
+    $new = @(Get-CimInstance Win32_Process -Filter "Name='secrets-relay.exe'" | Where-Object { $_.ExecutablePath -eq "$plugin\bin\secrets-relay.exe" })
+    $new | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    $new | ForEach-Object { Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue }
+    robocopy $previous $plugin /MIR /R:10 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { $restore = "putting the earlier install back from $previous failed too: robocopy exit code $LASTEXITCODE" }
+    else { Remove-Previous }
+  }
   # disabled, the task would start no daemon at the next logon either
-  if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) { Enable-ScheduledTask -TaskName $task | Out-Null }
-  throw
+  if ($registered) {
+    Enable-ScheduledTask -TaskName $task | Out-Null
+    # what runs now is the earlier install, put back or never touched
+    if ($stopped -and -not $restore) { Start-ScheduledTask -TaskName $task }
+  }
+  if ($restore) { throw "$failure; $restore" }
+  throw $failure
 }
+if ($kept) { Remove-Previous }
 
 "installed: plugin directory $plugin, daemon socket $env:LOCALAPPDATA\secrets.sock, log $log"

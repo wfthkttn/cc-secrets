@@ -88,6 +88,21 @@ test('a new instance, as each new transcript row makes, goes on from the state t
   expect(next.posts.at(-1)!.edits).toEqual([{ seq: 2, id: 'b', kind: 'choose', entry: null }])
 })
 
+test("a copy acts on what it draws: a menu the prompt's key closed stays closed for its keys", async () => {
+  const offer = [{ id: 'e1', label: 'Prod DB · db' }]
+  const entries = [{ id: 'b', kind: 'secret' as const, prompt: 'second', source: '', since: '04:00:01', length: 0, text: null, offer, chosen: null }]
+  const props: RequestsProps = { focusEpoch: 0, tabs: null, applied: {}, columns: 60, rows: 40, message: null, typingOff: null, pastes: [], resume: null, mirror: false, entries }
+  const held = instance(props)
+  held.key('tab')
+  const ui = held.posts.at(-1)!.ui!
+  expect(ui.isMenuOpen).toBe(true)
+  const moved = { ...props, focusEpoch: 1, mirror: true, resume: ui }
+  const copy = instance(moved)
+  expect(copy.draw(moved).some(n => n.position === 'absolute' && text(n).includes('Prod DB · db'))).toBe(false)
+  copy.key('return')
+  expect(copy.posts.flatMap(p => p.edits).some(e => e.kind === 'choose')).toBe(false)
+})
+
 test('a typed value shows as dots with Show, or as text with Hide while the hooks send it', async () => {
   const props = (text: string | null): RequestsProps => ({
     focusEpoch: 0,

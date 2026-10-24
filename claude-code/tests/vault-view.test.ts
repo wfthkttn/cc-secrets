@@ -173,6 +173,30 @@ test("the sidebar's copy over a held instance draws what the held one posts, pos
   expect(copy.posts.at(-1)!.ui!.form?.name).toBe('Gox!')
 })
 
+test('a copy acts on what it draws: a form the hooks closed since takes none of its keys', async () => {
+  const held = instance(PROPS)
+  held.click('add')
+  held.key('G')
+  const saved = { ...PROPS, formEpoch: 1, mirror: true, resume: held.posts.at(-1)!.ui! }
+  const copy = instance(saved)
+  expect(copy.draw(saved)[TAB_ROWS]).not.toMatch(/^ New entry/)
+  copy.key('x')
+  expect(copy.posts.map(p => p.ui?.form?.name ?? null)).not.toContain('Gx')
+})
+
+test("a form the hooks closed leaves none of its fields the keys, as Cancel does: typing reaches no hidden value", async () => {
+  const held = instance(PROPS)
+  held.click('add')
+  for (let i = 0; i < 8 && held.posts.at(-1)!.ui!.focus !== 'value'; i++) held.key('tab')
+  const ui = held.posts.at(-1)!.ui!
+  expect(ui.focus).toBe('value')
+  const saved = { ...PROPS, formEpoch: 1, resume: ui }
+  const next = instance(saved)
+  next.key('x')
+  expect(next.posts.flatMap(p => p.edits).some(e => 'field' in e && e.field === 'value' && e.kind === 'insert')).toBe(false)
+  expect(next.posts.at(-1)?.ui?.focus).toBe('add')
+})
+
 test('a locked vault: one passphrase field with Show, and Unlock; typing fills it, Enter or Unlock opens', async () => {
   const rows = draw(LOCKED, CLOSED)
   expectWidths(rows)

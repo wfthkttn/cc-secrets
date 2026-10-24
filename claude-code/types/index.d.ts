@@ -3,7 +3,7 @@ export type HasMasked = boolean
 
 declare module 'claude-code' {
   interface PluginState {
-    secrets: {
+    'cc-secrets': {
       hasMasked: HasMasked
     }
   }

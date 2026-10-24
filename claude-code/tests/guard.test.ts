@@ -12,7 +12,7 @@ test('a pattern selects by name, by *, by namespace glob, and a negation selects
   expect(selects('env.*', 'environment.set')).toBe(false)
 })
 
-test("a plugin's hooks name where they see secrets: the sidebar's nowhere, talking-bridge's in tool results", async () => {
+test("a plugin's hooks name where they see secrets: the sidebar's nowhere, the conversation mod's in tool results", async () => {
   expect(carriersSeen(['tool.check', 'http.fetch'])).toEqual(['http.fetch'])
   expect(carriersSeen(['*'])).toEqual(['http.fetch', 'process.spawn', 'env.set', 'tool.call', 'classic.PostToolUse', 'classic.PostToolBatch'])
   expect(carriersSeen(['tool.*'])).toEqual(['tool.call'])

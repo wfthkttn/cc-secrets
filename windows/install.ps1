@@ -1,4 +1,5 @@
-# Usage: windows\install.ps1   (from anywhere; builds the checkout it lives in)
+# Usage: windows\install.ps1   (from anywhere; builds the checkout it lives in, or installs the release it was
+# unpacked with, as windows\get.ps1 does)
 #
 # Installs secrets for this user on Windows: the Claude Code plugin with its binaries in
 # %USERPROFILE%\.local\lib\secrets\claude-code, and a logon task, claude-secrets, that runs the daemon on
@@ -21,15 +22,19 @@ $task = 'claude-secrets'
 $log = "$env:LOCALAPPDATA\secrets\daemon.log"
 $binaries = 'secrets-relay', 'secrets-mask-run', 'secrets', 'secrets-askpass', 'secrets-askpass-sudo', 'secrets-askpass-ssh', 'secrets-askpass-git'
 
-# Where cargo put each binary, as it reports it: a target dir set in the environment or a cargo config moves them.
 $built = @{}
-cargo build --release --manifest-path "$repo\Cargo.toml" --message-format=json-render-diagnostics | ForEach-Object {
-  $message = $_ | ConvertFrom-Json
-  if ($message.reason -eq 'compiler-artifact' -and $message.executable) { $built[$message.target.name] = $message.executable }
+if (Test-Path "$repo\Cargo.toml") {
+  # Where cargo put each binary, as it reports it: a target dir set in the environment or a cargo config moves them.
+  cargo build --release --manifest-path "$repo\Cargo.toml" --message-format=json-render-diagnostics | ForEach-Object {
+    $message = $_ | ConvertFrom-Json
+    if ($message.reason -eq 'compiler-artifact' -and $message.executable) { $built[$message.target.name] = $message.executable }
+  }
+  if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+  $missing = @($binaries | Where-Object { -not $built.ContainsKey($_) })
+  if ($missing.Count -gt 0) { throw "cargo reported no executable for $($missing -join ', ')" }
+} else {
+  foreach ($binary in $binaries) { $built[$binary] = "$repo\bin\$binary.exe" }
 }
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
-$missing = @($binaries | Where-Object { -not $built.ContainsKey($_) })
-if ($missing.Count -gt 0) { throw "cargo reported no executable for $($missing -join ', ')" }
 
 # Mirrored in place, not replaced: a running session may hold the plugin's folder. Without the binaries, the installed
 # ones in bin stay as they are, running or not.

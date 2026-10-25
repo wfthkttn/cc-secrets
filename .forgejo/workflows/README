@@ -1,0 +1,2 @@
+Forgejo reads workflows from this folder, which holds none, and so leaves .github/workflows to GitHub: the release
+workflow there needs GitHub's macOS and Windows runners.

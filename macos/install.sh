@@ -1,5 +1,6 @@
 #!/bin/bash
-# Usage: macos/install.sh   (from anywhere; builds the checkout it lives in)
+# Usage: macos/install.sh   (from anywhere; builds the checkout it lives in, or installs the release it was unpacked
+# with, as macos/get.sh does)
 #
 # Installs secrets for the logged-in user on macOS: the binaries and the Claude Code plugin under
 # ~/.local/lib/secrets, the daemon signed with the hardened runtime (it refuses to run otherwise), and a launchd
@@ -16,7 +17,12 @@ domain="gui/$(id -u)"
 socket="$(getconf DARWIN_USER_TEMP_DIR)secrets.sock"
 binaries=(secrets-relay secrets-mask-run secrets secrets-askpass secrets-askpass-sudo secrets-askpass-ssh secrets-askpass-git)
 
-cargo build --release --manifest-path "$repo/Cargo.toml"
+if [ -f "$repo/Cargo.toml" ]; then
+  cargo build --release --manifest-path "$repo/Cargo.toml"
+  built="$repo/target/release"
+else
+  built="$repo/bin"
+fi
 
 if launchctl print "$domain/$label" >/dev/null 2>&1; then
   launchctl bootout "$domain/$label"
@@ -26,7 +32,7 @@ mkdir -p "$prefix/bin"
 for binary in "${binaries[@]}"; do
   # A new file, not one overwritten in place: a running process keeps its pages, and macOS kills one whose signed
   # pages change under it.
-  cp "$repo/target/release/$binary" "$prefix/bin/$binary.new"
+  cp "$built/$binary" "$prefix/bin/$binary.new"
   mv -f "$prefix/bin/$binary.new" "$prefix/bin/$binary"
 done
 codesign -f -s - -o runtime "$prefix/bin/secrets-relay"

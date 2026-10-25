@@ -210,47 +210,63 @@ restart locks the vault.
 
 ### macOS
 
-Needs Rust 1.95 or later.
+The sidebar comes from the marketplace, at a Claude Code prompt:
 
-```sh
-git clone https://github.com/wfthkttn/sidebar
-git clone https://github.com/wfthkttn/claude-secrets
-claude-secrets/macos/install.sh
+```
+/plugin install cc-sidebar --marketplace wfthkttn/cc-mods
 ```
 
-It builds, installs the binaries and the plugin under `~/.local/lib/secrets`, signs the daemon, and loads the launchd
-agent `local.claude-secrets`; its log is `~/Library/Logs/claude-secrets.log`. Run it again after an update; it
-stops the running daemon, which locks the vault. Then in `~/.claude/settings.json`, with your home and the sidebar
-clone's path:
+Then, in a terminal, the latest release:
+
+```sh
+curl -fsSL https://github.com/wfthkttn/cc-secrets/releases/latest/download/get.sh | bash
+```
+
+It downloads the build for your Mac (Apple silicon or Intel), checks it against the release's `SHA256SUMS`, installs
+the binaries and the plugin under `~/.local/lib/secrets`, signs the daemon with the hardened runtime, and loads the
+launchd agent `local.claude-secrets`; its log is `~/Library/Logs/claude-secrets.log`. Download it this way, not
+through a browser: macOS quarantines a browser's downloads and won't run the daemon. Run it again to update; it
+stops the running daemon, which locks the vault. `... | bash -s -- v0.1.0` installs a given release. Then in
+`~/.claude/settings.json`, with your home:
 
 ```json
 "env": {
-  "CLAUDE_CODE_PLUGIN_DIRS": "/Users/you/.local/lib/secrets/claude-code:/path/to/sidebar"
+  "CLAUDE_CODE_PLUGIN_DIRS": "/Users/you/.local/lib/secrets/claude-code"
 }
 ```
+
+To build it yourself instead (Rust 1.95 or later): clone this repository and run `macos/install.sh` from it.
 
 ### Windows
 
-Needs Rust 1.95 or later. In PowerShell:
+The sidebar comes from the marketplace, at a Claude Code prompt:
 
-```powershell
-git clone https://github.com/wfthkttn/sidebar
-git clone https://github.com/wfthkttn/claude-secrets
-powershell -ExecutionPolicy Bypass -File claude-secrets\windows\install.ps1
+```
+/plugin install cc-sidebar --marketplace wfthkttn/cc-mods
 ```
 
-It builds, installs the plugin with its binaries in `%USERPROFILE%\.local\lib\secrets\claude-code`, and registers
-the logon task `claude-secrets`, which it starts and which starts a daemon that ended again within a minute; the
-daemon's log is `%LOCALAPPDATA%\secrets\daemon.log`. Run it
-again after an update; when the binaries changed, it stops the running daemon, which locks the vault, and an update
-of the plugin alone leaves the daemon and the open vault running. Then in `~/.claude/settings.json`, with
-your user and the sidebar clone's path, `;`-separated:
+Then, in PowerShell, the latest release:
+
+```powershell
+irm https://github.com/wfthkttn/cc-secrets/releases/latest/download/get.ps1 | iex
+```
+
+It downloads the build, checks it against the release's `SHA256SUMS`, installs the plugin with its binaries in
+`%USERPROFILE%\.local\lib\secrets\claude-code`, and registers the logon task `claude-secrets`, which it starts and
+which starts a daemon that ended again within a minute; the daemon's log is `%LOCALAPPDATA%\secrets\daemon.log`. The
+binaries aren't signed: where Smart App Control is on, Windows won't run them. Run it again to update; when the
+binaries changed, it stops the running daemon, which locks the vault, and an update of the plugin alone leaves the
+daemon and the open vault running. `$env:CC_SECRETS_RELEASE = 'v0.1.0'` first installs a given release. Then in
+`~/.claude/settings.json`, with your user:
 
 ```json
 "env": {
-  "CLAUDE_CODE_PLUGIN_DIRS": "C:\\Users\\you\\.local\\lib\\secrets\\claude-code;C:\\path\\to\\sidebar"
+  "CLAUDE_CODE_PLUGIN_DIRS": "C:\\Users\\you\\.local\\lib\\secrets\\claude-code"
 }
 ```
+
+To build it yourself instead (Rust 1.95 or later): clone this repository and run
+`powershell -ExecutionPolicy Bypass -File windows\install.ps1` from it.
 
 ## How it works
 

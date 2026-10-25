@@ -36,3 +36,5 @@ try {
 } finally {
   Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 }
+# robocopy's success code would otherwise be the script's: a runner reads it as a failure
+exit 0

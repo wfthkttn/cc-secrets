@@ -61,6 +61,7 @@ const ASKPASS_TAGS: readonly TagChoice[] = [
   { tag: 'git', what: 'a git username or password' },
 ]
 const WRITE_BACK = 'secrets: this would write [secret], a masked value, over the real one; edit around the masked span instead.'
+const INTERRUPTED = { deny: 'secrets: the call was interrupted before its result was masked, so its result is withheld' }
 const ROW_COMPONENTS = [
   'UserMessage',
   'AssistantMessage',
@@ -414,13 +415,17 @@ export function register(on: On) {
       if (masking && collisions.length > 0) {
         return { deny: `secrets: ${e.tool} is off while ${collisions.map(c => c.name).join(', ')} could read its result before masking; see the Vault tab` }
       }
-      return maskResult($, await next(e))
+      const result = await next(e)
+      // an abandoned call's result reaches nobody, and the hook's own calls fail from then on
+      if (next.signal.aborted) return INTERRUPTED
+      return maskResult($, result)
     }
     const call = { id: e.tool_use_id, command: e.command, agentId: e.agentId }
     running.push(call)
     try {
       const result = await next(e)
       if (runsOn(result)) lingering = [...lingering, call]
+      if (next.signal.aborted) return INTERRUPTED
       // secrets-mask-run masked Bash output already; the extra pass through http.fetch waits until no plugin could read it.
       return collisions.length > 0 ? result : maskResult($, result)
     } finally {

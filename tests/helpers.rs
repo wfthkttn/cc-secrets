@@ -646,15 +646,14 @@ fn a_second_daemon_on_the_socket_refuses_and_leaves_the_running_ones_helpers() {
 
 #[test]
 fn a_daemon_started_while_another_starts_refuses_and_leaves_its_socket() {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-    let socket = dir.join(format!("secrets-test-starting-{}.sock", std::process::id()));
+    let socket = socket_dir().join(format!("secrets-test-starting-{}.sock", std::process::id()));
     let lock_path = PathBuf::from(format!("{}.lock", socket.display()));
     // the other daemon: holding the lock, its socket file there but not answering yet
     std::fs::write(&socket, "").unwrap();
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).unwrap();
     lock.try_lock().unwrap();
     let data = data_dir("starting");
-    let mut second = Command::new(RELAY).args(["daemon", "--socket"]).arg(&socket).env("XDG_DATA_HOME", &data).stderr(Stdio::piped()).spawn().unwrap();
+    let mut second = Command::new(signed_relay()).args(["daemon", "--socket"]).arg(&socket).env("XDG_DATA_HOME", &data).stderr(Stdio::piped()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while second.try_wait().unwrap().is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));

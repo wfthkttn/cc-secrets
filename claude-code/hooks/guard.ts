@@ -30,3 +30,8 @@ export function allowedName(key: string): string {
   const cut = key.indexOf('\n')
   return cut < 0 ? key : key.slice(0, cut)
 }
+
+/** The plugins `SECRETS_DEV_PLUGINS`, a comma-separated list, names; none when it is unset. */
+export function devPlugins(listed: string | undefined): string[] {
+  return (listed ?? '').split(',').map(name => name.trim()).filter(name => name !== '')
+}

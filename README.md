@@ -29,6 +29,9 @@ Linux and macOS, and Windows with a weaker guarantee, provided as is. See [Platf
   name; never a value) and tells the agent how to ask for one.
 - **Collisions.** A plugin loaded after this one whose hooks would see secrets in transit (tool calls, HTTP fetches,
   process spawns, environment changes) is shown in the Vault tab; until you allow it, typing and the vault are off.
+  An Allow holds for exactly the code it saw. While you develop a plugin, start the session with
+  `SECRETS_DEV_PLUGINS=name,other`: those plugins load unjudged whatever their code, except one you blocked, and a
+  session start says which. Any process that sets the variable gets this, a command an agent runs included.
 - **Settings tab.** Unlock at session start, the shortest value masked (default 6 characters), and an
   `autoMode.environment` line for the auto-mode classifier, written to `~/.claude/settings.json` when you click Save.
 

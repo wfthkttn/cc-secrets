@@ -5,7 +5,7 @@ import { appliedText, SUGGESTED, withText } from './auto-mode'
 import type { ConfigAction, ConfigMessage, ConfigProps, ConfigResume } from './config-view-props'
 import { editText, END_CARET, type PasteMark } from './controls'
 import { codeIdentity } from './code-id'
-import { allowedName, allowKey, carriersSeen } from './guard'
+import { allowedName, allowKey, carriersSeen, devPlugins } from './guard'
 import { holdsMask, stringsIn, withStrings } from './mask'
 import { Popouts } from './popouts'
 import { listHeight } from './requests'
@@ -225,6 +225,8 @@ let draftAtFocus: string | null = null
 let listSelected: string | null = null
 /** Plugins loaded after this one that hook a call carrying secrets, until allowed; `code` is their code identity. */
 let collisions: readonly (Collision & { code: string })[] = []
+/** Plugins that would have been judged but `SECRETS_DEV_PLUGINS` names; the session start says so, as nothing else shows it. */
+let unjudged: readonly string[] = []
 /** Made at session start, where the hooks first have `$` for its timers. */
 let popouts: Popouts | null = null
 /** Shown above the cards; a sticky one stays until its ✕, any other also goes on the next action or after `NOTICE_MS`. */
@@ -314,6 +316,10 @@ export function register(on: On) {
       if ((await storedList($, 'refusedPlugins')).includes(e.name)) {
         return { refuse: `its hooks on ${carriers.join(', ')} would see the secrets sent through them (blocked in the Vault tab)` }
       }
+      if (devPlugins(await $.env.get('SECRETS_DEV_PLUGINS')).includes(e.name)) {
+        unjudged = [...unjudged.filter(name => name !== e.name), e.name]
+        return next(e)
+      }
       const code = await codeIdentity(e.root, {
         list: dir => $.fs.list(dir),
         stat: path => $.fs.stat(path, { resolve: true }),
@@ -343,6 +349,7 @@ export function register(on: On) {
     // old module set.
     await setBadge($)
     await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
+    if (unjudged.length > 0) await $.ui.toast(`secrets: not checking ${unjudged.join(', ')}: SECRETS_DEV_PLUGINS names them`)
     maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
     unlockAtStart = await option($, 'unlockAtStart', true)
     hasMasked = (await $.state.get({ plugin: 'cc-secrets', key: 'hasMasked' })).value ?? false

@@ -1,6 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 
-import { allowedName, allowKey, carriersSeen, selects } from '../hooks/guard'
+import { allowedName, allowKey, carriersSeen, devPlugins, selects } from '../hooks/guard'
+
+test('SECRETS_DEV_PLUGINS names plugins by comma, and names none when unset or empty', async () => {
+  expect(devPlugins('cc-conversation, cc-crew,,')).toEqual(['cc-conversation', 'cc-crew'])
+  expect(devPlugins('')).toEqual([])
+  expect(devPlugins(undefined)).toEqual([])
+})
 
 test('a pattern selects by name, by *, by namespace glob, and a negation selects everything else', async () => {
   expect(selects('http.fetch', 'http.fetch')).toBe(true)

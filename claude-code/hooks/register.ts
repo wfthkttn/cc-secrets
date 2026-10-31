@@ -113,6 +113,13 @@ const running: Call[] = []
 let lingering: readonly Call[] = []
 /** The relay has values to mask (the open vault's, or one typed for a running call): tool results go through `/mask`. */
 let masking = false
+const WAS_ATTACHED = { plugin: 'cc-secrets', key: 'wasAttached' } as const
+let hasStarted = false
+let startIsDone: () => void
+/** Settles when this load's `session.start` is through, attached or not. */
+const startDone = new Promise<void>(resolve => {
+  startIsDone = resolve
+})
 /** Collision decisions, one at a time: each reads a stored list and writes it back. */
 let deciding: Promise<void> = Promise.resolve()
 /** What the relay last said of the vault; entries and suggestions carry no values. */
@@ -305,6 +312,66 @@ async function option<T extends number | boolean>($: EngineInterface, key: strin
   return stored as T
 }
 
+async function startSession($: EngineInterface): Promise<void> {
+  await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
+  popouts = new Popouts(POPOUT_MS, (ms, fn) => $.clock.after(ms, fn), () => syncPopout($))
+  await $.command.register({ name: 'pass-demo', description: 'Show one sample request of each kind; no program waits on them' })
+  const { tool } = await $.tool.register({ name: VAULT_TOOL_NAME, description: VAULT_DESCRIPTION, inputSchema: { type: 'object', properties: {} }, isDeferred: false })
+  if (tool !== VAULT_TOOL) throw new Error(`secrets: the vault tool registered as ${tool}, not ${VAULT_TOOL}`)
+  // A reload starts with no requests until the daemon sends the waiting ones again; the host still shows what the
+  // old module set.
+  await setBadge($)
+  await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
+  if (unjudged.length > 0) await $.ui.toast(`secrets: not checking ${unjudged.join(', ')}: SECRETS_DEV_PLUGINS names them`)
+  maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
+  unlockAtStart = await option($, 'unlockAtStart', true)
+  hasMasked = (await $.state.get({ plugin: 'cc-secrets', key: 'hasMasked' })).value ?? false
+
+  isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  if (!isWindows) {
+    // macOS has no XDG_RUNTIME_DIR; its per-user private directory is TMPDIR, where the daemon there listens.
+    const runtimeDir = ((await $.env.get('XDG_RUNTIME_DIR')) || (await $.env.get('TMPDIR')))?.replace(/\/+$/, '')
+    if (!runtimeDir) {
+      throw new Error("secrets: neither XDG_RUNTIME_DIR nor TMPDIR is set, so the secrets daemon's socket is unknown")
+    }
+    const daemon = (await $.env.get('SECRETS_DAEMON')) || `${runtimeDir}/secrets.sock`
+    const agent = await $.env.get('SSH_AUTH_SOCK')
+    // On a reload the agent is this session's own, or an older build's relay's; the one found first is the user's.
+    if (agent && !agent.startsWith(daemon + '-') && !agent.startsWith(`${runtimeDir}/claude-secrets-`)) await $.env.set('SECRETS_ORIG_SSH_AUTH_SOCK', agent)
+    upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
+  }
+  // Commands see the daemon only once the session is attached: before, secrets-mask-run would let their output
+  // through unmasked.
+  const relay = await startRelay($)
+  await useRelay($, relay)
+  // An open vault sends no event at the attach: its entries are fetched here, or the session lists none.
+  await refreshVault($)
+  await $.state.set(WAS_ATTACHED, true)
+  hasStarted = true
+  startIsDone()
+  if (unlockAtStart && vault.state === 'locked') {
+    drawerTab = 'vault'
+    await $.sidebar.select({ id: SIDEBAR_ID })
+  }
+  // Claude Code finds its settings in the home Node reports, which on Windows is USERPROFILE whatever HOME says.
+  const home = isWindows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
+  if (!home) throw new Error(`secrets: ${isWindows ? 'USERPROFILE' : 'HOME'} is not set, so the settings file for the auto-mode line is unknown`)
+  settingsPath = `${home}/.claude/settings.json`
+  await readAutoMode($)
+  configDraft = configApplied ?? SUGGESTED
+}
+
+/**
+ * A background subagent runs on through a reload, so its calls can land before this load's guards are up, where every
+ * one of them reads as off. Those wait for the attach; if it fails they throw, and the call is withheld.
+ */
+async function throughReload($: EngineInterface): Promise<void> {
+  if (hasStarted) return
+  if ((await $.state.get(WAS_ATTACHED)).value !== true) return
+  await startDone
+  if (!hasStarted) throw new Error('secrets: the guards did not come back after the reload')
+}
+
 export function register(on: On) {
   // Judges the plugins loaded after this one (those before it are out of reach): one whose hooks see a call that
   // carries secrets loads, but shows as a collision until allowed, and is refused from the next start once refused.
@@ -339,51 +406,13 @@ export function register(on: On) {
   }).catch(($, e, next) => (next.called ? next(e) : { refuse: "secrets couldn't check what it hooks" }))
 
   on('session.start', async ($, e, next) => {
-    const started = await next(e)
-    await $.sidebar.register({ id: SIDEBAR_ID, icon: '🔐', short: 'pass', drawerColumns: DRAWER_COLUMNS })
-    popouts = new Popouts(POPOUT_MS, (ms, fn) => $.clock.after(ms, fn), () => syncPopout($))
-    await $.command.register({ name: 'pass-demo', description: 'Show one sample request of each kind; no program waits on them' })
-    const { tool } = await $.tool.register({ name: VAULT_TOOL_NAME, description: VAULT_DESCRIPTION, inputSchema: { type: 'object', properties: {} }, isDeferred: false })
-    if (tool !== VAULT_TOOL) throw new Error(`secrets: the vault tool registered as ${tool}, not ${VAULT_TOOL}`)
-    // A reload starts with no requests until the daemon sends the waiting ones again; the host still shows what the
-    // old module set.
-    await setBadge($)
-    await $.sidebar.popout({ id: SIDEBAR_ID, isShown: false })
-    if (unjudged.length > 0) await $.ui.toast(`secrets: not checking ${unjudged.join(', ')}: SECRETS_DEV_PLUGINS names them`)
-    maskMinLength = await option($, 'maskMinLength', DEFAULT_MASK_MIN)
-    unlockAtStart = await option($, 'unlockAtStart', true)
-    hasMasked = (await $.state.get({ plugin: 'cc-secrets', key: 'hasMasked' })).value ?? false
-
-    isWindows = (await $.env.get('OS')) === 'Windows_NT'
-    if (!isWindows) {
-      // macOS has no XDG_RUNTIME_DIR; its per-user private directory is TMPDIR, where the daemon there listens.
-      const runtimeDir = ((await $.env.get('XDG_RUNTIME_DIR')) || (await $.env.get('TMPDIR')))?.replace(/\/+$/, '')
-      if (!runtimeDir) {
-        throw new Error("secrets: neither XDG_RUNTIME_DIR nor TMPDIR is set, so the secrets daemon's socket is unknown")
-      }
-      const daemon = (await $.env.get('SECRETS_DAEMON')) || `${runtimeDir}/secrets.sock`
-      const agent = await $.env.get('SSH_AUTH_SOCK')
-      // On a reload the agent is this session's own, or an older build's relay's; the one found first is the user's.
-      if (agent && !agent.startsWith(daemon + '-') && !agent.startsWith(`${runtimeDir}/claude-secrets-`)) await $.env.set('SECRETS_ORIG_SSH_AUTH_SOCK', agent)
-      upstream = (await $.env.get('SECRETS_ORIG_SSH_AUTH_SOCK')) ?? ''
+    try {
+      const started = await next(e)
+      await startSession($)
+      return started
+    } finally {
+      startIsDone()
     }
-    // Commands see the daemon only once the session is attached: before, secrets-mask-run would let their output
-    // through unmasked.
-    const relay = await startRelay($)
-    await useRelay($, relay)
-    // An open vault sends no event at the attach: its entries are fetched here, or the session lists none.
-    await refreshVault($)
-    if (unlockAtStart && vault.state === 'locked') {
-      drawerTab = 'vault'
-      await $.sidebar.select({ id: SIDEBAR_ID })
-    }
-    // Claude Code finds its settings in the home Node reports, which on Windows is USERPROFILE whatever HOME says.
-    const home = isWindows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
-    if (!home) throw new Error(`secrets: ${isWindows ? 'USERPROFILE' : 'HOME'} is not set, so the settings file for the auto-mode line is unknown`)
-    settingsPath = `${home}/.claude/settings.json`
-    await readAutoMode($)
-    configDraft = configApplied ?? SUGGESTED
-    return started
   })
 
   // A /clear, a resume or a fork goes on under another session id, whose grants are the relay's now. The first start's
@@ -399,6 +428,7 @@ export function register(on: On) {
   on('tool.check', { tool: VAULT_TOOL }, async ($, e) => vaultVerdict(e.agentId))
 
   on('tool.call', async ($, e, next) => {
+    await throughReload($)
     // The plugin's own tool is not among the tool names the types know.
     const name: string = e.tool
     if (name === VAULT_TOOL) {
@@ -819,6 +849,8 @@ async function useRelay($: EngineInterface, relay: Attached) {
 async function readRelay($: EngineInterface, ready: (started: Attached) => void) {
   const relay = $.process.spawn({ argv: [$.plugin.root + '/bin/secrets-relay' + (isWindows ? '.exe' : ''), 'attach'], env: { SECRETS_UPSTREAM_AGENT: upstream } })
   let buffered = ''
+  // Held for the `masking` event right behind it: the guards read that, and the attach counts once they can.
+  let attached: Attached | null = null
   for await (const chunk of relay) {
     if (chunk.stream === 'stderr') {
       $.ui.log('relay: ' + chunk.text.trimEnd(), { to: 'debug' })
@@ -833,7 +865,7 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
       trace($, `relay ${Object.keys(event)[0]}${'ask' in event ? ' ' + event.ask.id : 'gone' in event ? ' ' + event.gone : ''}`)
       if ('ready' in event) {
         if (typeof event.bin !== 'string') throw new Error("secrets: the daemon's ready event has no bin, the directory of the helpers it serves")
-        ready({ state: event.vault, socket: event.ready, agent: event.agent, bin: event.bin })
+        attached = { state: event.vault, socket: event.ready, agent: event.agent, bin: event.bin }
       } else if ('ask' in event) await onAsk($, event.ask)
       else if ('gone' in event) dropRequest(event.gone)
       else if ('sign' in event) await onSign($, event.sign)
@@ -842,8 +874,11 @@ async function readRelay($: EngineInterface, ready: (started: Attached) => void)
         await refreshVault($)
         if (!wasOpen && vault.state === 'open') await giveCarded($)
       }
-      else if ('masking' in event) masking = event.masking
-      else if ('masked' in event) {
+      else if ('masking' in event) {
+        masking = event.masking
+        if (attached !== null) ready(attached)
+        attached = null
+      } else if ('masked' in event) {
         hasMasked = true
         await $.state.set({ plugin: 'cc-secrets', key: 'hasMasked' }, true)
       } else say($, event.trouble, true)
